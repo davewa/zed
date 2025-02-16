@@ -39,6 +39,7 @@ use mappings::mouse::{
 use collections::{HashMap, VecDeque};
 use futures::StreamExt;
 use pty_info::PtyProcessInfo;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use smol::channel::{Receiver, Sender};
@@ -314,6 +315,7 @@ const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|http
 // https://learn.microsoft.com/en-us/visualstudio/msbuild/msbuild-diagnostic-format-for-tasks
 const WORD_REGEX: &str =
     r#"[\$\+\w.\[\]:/\\@\-~()]+(?:\((?:\d+|\d+,\d+)\))|[\$\+\w.\[\]:/\\@\-~()]+"#;
+const CUSTOM_PATH_HYPERLINK_REGEX_CAPTURE_NAME: &str = "path";
 
 pub struct TerminalBuilder {
     terminal: Terminal,
@@ -471,6 +473,7 @@ impl TerminalBuilder {
             hovered_word: false,
             url_regex: RegexSearch::new(URL_REGEX).unwrap(),
             word_regex: RegexSearch::new(WORD_REGEX).unwrap(),
+            custom_path_hyperlink_regexes: Self::init_custom_path_hyperlink_regexes(cx),
             vi_mode_enabled: false,
             is_ssh_terminal,
             python_venv_directory,
@@ -480,6 +483,74 @@ impl TerminalBuilder {
             terminal,
             events_rx,
         })
+    }
+
+    /// Load setting from [TerminalSettingsContent::custom_path_hyperlink_regexes
+    /// ](terminal_settings::TerminalSettingsContent::custom_path_hyperlink_regexes).
+    /// Note: Because these are loaded from user settings, it is important
+    /// to 1) never fail, and 2) log helpful messages when errors are
+    /// encountered 3) degrade gracefully when errors are present,
+    /// specifically: work as well as possible given the errors.
+    ///
+    // TODO: It is unclear how to reload on settings changes, or if that
+    // is necessary for this feature.
+    // TODO: We have both RegexSearch and Regex because I couldn't find
+    // a capture group api in alacritty_terminal's RegexSearch? If there is
+    // one, we could just have RegexSearch.
+    // TODO: Decide on and document the match precedence. Currenly, regexes
+    // are processed in the order they
+    fn init_custom_path_hyperlink_regexes(cx: &App) -> Vec<(RegexSearch, Regex)> {
+        use log::info;
+
+        // Common prefix for diagnostic log messages
+        macro_rules! error_prefix {
+            () => {
+                "Terminal: Failed to load a path hyperlink regex, {:?}
+, specified in 'terminal.custom_path_hyperlink_regexes' settings, "
+            };
+        }
+
+        let settings_regexes = &TerminalSettings::get_global(cx).custom_path_hyperlink_regexes;
+        let load_regex = |regex: &str| -> Result<(RegexSearch, Regex)> {
+            Ok((RegexSearch::new(regex)?, Regex::new(regex)?))
+        };
+        let mut loaded_regexes = Vec::<(RegexSearch, Regex)>::with_capacity(settings_regexes.len());
+
+        for settings_regex in settings_regexes {
+            // If any errors are encountered loading the RegexSearch or Regex, log an info
+            // message, with the failed regex from settings and the error, then continue.
+            let Ok((regex_search, regex)) = load_regex(settings_regex).inspect_err(|err| {
+                info!(
+                    concat!(error_prefix!(), "error was: {:?}"),
+                    settings_regex, err
+                )
+            }) else {
+                continue;
+            };
+
+            // It is possible for the above to succeed, but for the the settings_regex to be
+            // missing the required `path` named capture group, if so, log an info message
+            // and continue.
+            if regex
+                .capture_names()
+                .flatten()
+                .find(|&name| name == CUSTOM_PATH_HYPERLINK_REGEX_CAPTURE_NAME)
+                .is_none()
+            {
+                info!(
+                    concat!(
+                        error_prefix!(),
+                        "missing required `{}` named capture group."
+                    ),
+                    settings_regex, CUSTOM_PATH_HYPERLINK_REGEX_CAPTURE_NAME
+                );
+                continue;
+            }
+
+            loaded_regexes.push((regex_search, regex));
+        }
+
+        loaded_regexes
     }
 
     pub fn subscribe(mut self, cx: &Context<Terminal>) -> Terminal {
@@ -630,6 +701,7 @@ pub struct Terminal {
     hovered_word: bool,
     url_regex: RegexSearch,
     word_regex: RegexSearch,
+    custom_path_hyperlink_regexes: Vec<(RegexSearch, Regex)>,
     task: Option<TaskState>,
     vi_mode_enabled: bool,
     is_ssh_terminal: bool,
@@ -741,6 +813,54 @@ impl Terminal {
 
     pub fn selection_started(&self) -> bool {
         self.selection_phase == SelectionPhase::Selecting
+    }
+
+    /// Looks for a custom path hyperlink regex match using each element in
+    /// `self.custom_path_hyperlink_regexes`, and returns the first match found.
+    fn find_custom_path_hyperlink(
+        &mut self,
+        term: &mut Term<ZedListener>,
+        point: AlacPoint,
+    ) -> Option<(String, RangeInclusive<AlacPoint>)> {
+        use log::debug;
+
+        for (ref mut search_regex, ref regex) in &mut self.custom_path_hyperlink_regexes {
+            let Some(path_match) = regex_match_at(term, point, search_regex) else {
+                continue;
+            };
+
+            // If we have a match from regex_match_at, it will be the full match. To find
+            // the path capture group, we need to search again, but only within the match
+            // we already have. We must do this to be able to use Regex's capture group api
+            let path_line = term.bounds_to_string(*path_match.start(), *path_match.end());
+            let Some(captures) = regex.captures(&path_line) else {
+                debug!("Regex should succeed if RegexSearch succeeded already");
+                continue;
+            };
+            // Note: Do NOT use captures[CUSTOM_PATH_HYPERLINK_REGEX_CAPTURE_NAME] here because
+            // it can panic. This is extra paranoid because we don't load path regexes that do not
+            // contain a path named capture group in the first place (see [init_path_regexes]).
+            let Some(path_capture) = captures.name(CUSTOM_PATH_HYPERLINK_REGEX_CAPTURE_NAME) else {
+                debug!("'path' capture not matched in regex");
+                continue;
+            };
+
+            // Adjust the start of the original full match to just the `path`
+            // named capture group. Since we only searched within the original match
+            // simply add the start offset to the original match's start offset.
+            let start = path_match
+                .start()
+                .add(term, Boundary::Grid, path_capture.start());
+
+            // Adjust the end of the original full match to just the `path`
+            // named capture group. This is only required because we are using
+            // [RangeInclusive<>]
+            let end = path_match.end().sub(term, Boundary::Grid, 1);
+
+            return Some((path_capture.as_str().to_string(), start..=end));
+        }
+
+        None
     }
 
     fn process_terminal_event(
@@ -926,6 +1046,10 @@ impl Terminal {
                 } else if let Some(url_match) = regex_match_at(term, point, &mut self.url_regex) {
                     let url = term.bounds_to_string(*url_match.start(), *url_match.end());
                     Some((url, true, url_match))
+                } else if let Some((path, path_match)) =
+                    self.find_custom_path_hyperlink(term, point)
+                {
+                    Some((path, false, path_match))
                 } else if let Some(word_match) = regex_match_at(term, point, &mut self.word_regex) {
                     let file_path = term.bounds_to_string(*word_match.start(), *word_match.end());
 

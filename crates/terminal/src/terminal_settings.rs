@@ -48,6 +48,7 @@ pub struct TerminalSettings {
     pub max_scroll_history_lines: Option<usize>,
     pub toolbar: Toolbar,
     pub scrollbar: ScrollbarSettings,
+    pub custom_path_hyperlink_regexes: Vec<String>,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -223,6 +224,13 @@ pub struct TerminalSettingsContent {
     pub toolbar: Option<ToolbarContent>,
     /// Scrollbar-related settings
     pub scrollbar: Option<ScrollbarSettingsContent>,
+    /// Custom path hyperlink regexes. Useful for defining path hyperlinks
+    /// for paths containing spaces. Processed in the order they appear.
+    /// Each regex must define a `path` named capture group, e.g.,
+    /// for Rust compiler diagnostic output: `"\\s+(at|:::|-->) (?<path>.+)$"`
+    ///
+    /// Default: []
+    pub custom_path_hyperlink_regexes: Option<Vec<String>>,
 }
 
 impl settings::Settings for TerminalSettings {
