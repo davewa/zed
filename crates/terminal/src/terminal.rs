@@ -38,20 +38,23 @@ use mappings::mouse::{
 
 use collections::{HashMap, VecDeque};
 use futures::StreamExt;
+use log::{debug, trace};
 use pty_info::PtyProcessInfo;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use smol::channel::{Receiver, Sender};
 use task::{HideStrategy, Shell, TaskId};
 use terminal_settings::{AlternateScroll, CursorShape, TerminalSettings};
 use theme::{ActiveTheme, Theme};
-use util::{paths::home_dir, truncate_and_trailoff};
+use util::{paths::home_dir, truncate_and_trailoff, RangeExt};
 
 use std::{
-    cmp::{self, min},
+    cmp::{self, min, Ordering},
     fmt::Display,
+    fs,
     ops::{Deref, Index, RangeInclusive},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -314,6 +317,8 @@ const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|http
 // https://learn.microsoft.com/en-us/visualstudio/msbuild/msbuild-diagnostic-format-for-tasks
 const WORD_REGEX: &str =
     r#"[\$\+\w.\[\]:/\\@\-~()]+(?:\((?:\d+|\d+,\d+)\))|[\$\+\w.\[\]:/\\@\-~()]+"#;
+const LINE_COLUMN_REGEX: &str =
+    r#"[\$\+\w.\[\]:/\\@\-~()]+(?<line_column>(:\((?:\d+|\d+,\d+)\))|(:\d+:\d+))"#;
 
 pub struct TerminalBuilder {
     terminal: Terminal,
@@ -470,6 +475,7 @@ impl TerminalBuilder {
             hovered_word: false,
             url_regex: RegexSearch::new(URL_REGEX).unwrap(),
             word_regex: RegexSearch::new(WORD_REGEX).unwrap(),
+            line_column_regex: Regex::new(LINE_COLUMN_REGEX).unwrap(),
             vi_mode_enabled: false,
             is_ssh_terminal,
             python_venv_directory,
@@ -629,6 +635,7 @@ pub struct Terminal {
     hovered_word: bool,
     url_regex: RegexSearch,
     word_regex: RegexSearch,
+    line_column_regex: Regex,
     task: Option<TaskState>,
     vi_mode_enabled: bool,
     is_ssh_terminal: bool,
@@ -740,6 +747,86 @@ impl Terminal {
 
     pub fn selection_started(&self) -> bool {
         self.selection_phase == SelectionPhase::Selecting
+    }
+
+    /// Looks for a path under `cursor`
+    // Note: Does not handle paths that start or end in space(s) or that do not start
+    // or end on a word match boundary--except for those ending with a line and column
+    // TODO: paths with surrounding ' " ( ) [ ]
+    // Note: Once we handle the surrounding delimiter cases, paths that start or end in
+    // space(s) _will_ be handled.
+    fn find_path_hyperlink(
+        &mut self,
+        term: &mut Term<ZedListener>,
+        cursor: AlacPoint,
+    ) -> Option<RangeInclusive<AlacPoint>> {
+        let line_start = term.line_search_left(cursor);
+        let line_end = term.line_search_right(cursor);
+
+        let line_words = RegexIter::new(
+            line_start,
+            line_end,
+            AlacDirection::Right,
+            term,
+            &mut self.word_regex,
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+
+        let mut longest_path_found = cursor..=cursor.sub(term, Boundary::Grid, 1);
+
+        for start_word in &line_words {
+            if start_word.start().cmp(&cursor) == Ordering::Greater {
+                // we are past the word under the cursor, stop.
+                break;
+            }
+
+            for end_word in line_words.iter().rev() {
+                if end_word.end().cmp(&cursor) == Ordering::Less {
+                    // we are past the word under the cursor, stop.
+                    break;
+                }
+
+                if longest_path_found.contains_inclusive(&(*start_word.start()..*end_word.end())) {
+                    // We have already found a path that is longer than any
+                    // path starting with the current start_word, so we are done.
+                    return Some(*longest_path_found.start()..=*longest_path_found.end());
+                }
+
+                // Otherwise, we have a potential path that is longer than the current longest_path_found,
+                // Check if it exists, and if it does, make it the new longest_path_found.
+
+                // Check for potential :<line>:<column> endings before fs::exists()
+                let maybe_path = term.bounds_to_string(*start_word.start(), *end_word.end());
+                let maybe_path_no_line_column =
+                    if let Some(captures) = self.line_column_regex.captures(&maybe_path) {
+                        &maybe_path[0..maybe_path.len() - captures["line_column"].len()]
+                    } else {
+                        &maybe_path[0..]
+                    };
+
+                match fs::exists(Path::new(&maybe_path_no_line_column)) {
+                    Ok(true) => {
+                        longest_path_found = *start_word.start()..=*end_word.end();
+                        debug!("Updated longest path found to: {}", maybe_path);
+                        // The rest can only be shorter.
+                        break;
+                    }
+                    _ => {
+                        trace!(
+                            "Not an error, no file found for path: {}",
+                            maybe_path_no_line_column
+                        )
+                    }
+                }
+            }
+        }
+
+        if !longest_path_found.is_empty() {
+            return Some(*longest_path_found.start()..=*longest_path_found.end());
+        }
+
+        None
     }
 
     fn process_terminal_event(
@@ -925,6 +1012,9 @@ impl Terminal {
                 } else if let Some(url_match) = regex_match_at(term, point, &mut self.url_regex) {
                     let url = term.bounds_to_string(*url_match.start(), *url_match.end());
                     Some((url, true, url_match))
+                } else if let Some(path_match) = self.find_path_hyperlink(term, point) {
+                    let maybe_path = term.bounds_to_string(*path_match.start(), *path_match.end());
+                    Some((maybe_path, false, path_match))
                 } else if let Some(word_match) = regex_match_at(term, point, &mut self.word_regex) {
                     let file_path = term.bounds_to_string(*word_match.start(), *word_match.end());
 
