@@ -21,8 +21,9 @@ use crate::{
     GutterDimensions, HalfPageDown, HalfPageUp, HandleInput, HoveredCursor, InlineCompletion,
     JumpData, LineDown, LineUp, OpenExcerpts, PageDown, PageUp, Point, RevertSelectedHunks, RowExt,
     RowRangeExt, SelectPhase, SelectedTextHighlight, Selection, SoftWrap, StickyHeaderExcerpt,
-    ToPoint, ToggleFold, ToggleStagedSelectedDiffHunks, CURSORS_VISIBLE_FOR, FILE_HEADER_HEIGHT,
-    GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED, MAX_LINE_LEN, MULTI_BUFFER_EXCERPT_HEADER_HEIGHT,
+    ToPoint, ToggleFold, ToggleStagedSelectedDiffHunks, COLUMNAR_SELECTION_MODIFIERS,
+    CURSORS_VISIBLE_FOR, FILE_HEADER_HEIGHT, GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED, MAX_LINE_LEN,
+    MULTI_BUFFER_EXCERPT_HEADER_HEIGHT,
 };
 use buffer_diff::{DiffHunkSecondaryStatus, DiffHunkStatus};
 use client::ParticipantIndex;
@@ -31,7 +32,7 @@ use file_icons::FileIcons;
 use git::{blame::BlameEntry, Oid};
 use gpui::{
     anchored, deferred, div, fill, linear_color_stop, linear_gradient, outline, pattern_slash,
-    point, px, quad, relative, size, solid_color, svg, transparent_black, Action, AnyElement, App,
+    point, px, quad, relative, size, svg, transparent_black, Action, AnyElement, App,
     AvailableSpace, Axis, Bounds, ClickEvent, ClipboardItem, ContentMask, Context, Corner, Corners,
     CursorStyle, DispatchPhase, Edges, Element, ElementInputHandler, Entity, Focusable, FontId,
     GlobalElementId, Hitbox, Hsla, InteractiveElement, IntoElement, Keystroke, Length,
@@ -89,7 +90,6 @@ enum DisplayDiffHunk {
         display_row_range: Range<DisplayRow>,
         multi_buffer_range: Range<Anchor>,
         status: DiffHunkStatus,
-        contains_expanded: bool,
     },
 }
 
@@ -515,6 +515,7 @@ impl EditorElement {
                     if editor.hover_state.focused(window, cx) {
                         return;
                     }
+
                     editor.handle_modifiers_changed(event.modifiers, &position_map, window, cx);
                 })
             }
@@ -594,7 +595,7 @@ impl EditorElement {
 
         let point_for_position = position_map.point_for_position(event.position);
         let position = point_for_position.previous_valid;
-        if modifiers.shift && modifiers.alt {
+        if modifiers == COLUMNAR_SELECTION_MODIFIERS {
             editor.select(
                 SelectPhase::BeginColumnar {
                     position,
@@ -1567,11 +1568,6 @@ impl EditorElement {
                 if hunk_display_end.column() > 0 {
                     end_row.0 += 1;
                 }
-                let start_row = hunk_display_start.row();
-                let contains_expanded = snapshot
-                    .row_infos(start_row)
-                    .take(end_row.0 as usize - start_row.0 as usize)
-                    .any(|row_info| row_info.diff_status.is_some());
                 DisplayDiffHunk::Unfolded {
                     status: hunk.status(),
                     diff_base_byte_range: hunk.diff_base_byte_range,
@@ -1581,7 +1577,6 @@ impl EditorElement {
                         hunk.buffer_id,
                         hunk.buffer_range,
                     ),
-                    contains_expanded,
                 }
             };
 
@@ -3431,9 +3426,11 @@ impl EditorElement {
                 available_within_viewport.right - px(1.),
                 MENU_ASIDE_MAX_WIDTH,
             );
-            let Some(mut aside) =
-                self.render_context_menu_aside(size(max_width, max_height - POPOVER_Y_PADDING), cx)
-            else {
+            let Some(mut aside) = self.render_context_menu_aside(
+                size(max_width, max_height - POPOVER_Y_PADDING),
+                window,
+                cx,
+            ) else {
                 return;
             };
             aside.layout_as_root(AvailableSpace::min_size(), window, cx);
@@ -3455,7 +3452,7 @@ impl EditorElement {
                     ),
                 ) - POPOVER_Y_PADDING,
             );
-            let Some(mut aside) = self.render_context_menu_aside(max_size, cx) else {
+            let Some(mut aside) = self.render_context_menu_aside(max_size, window, cx) else {
                 return;
             };
             let actual_size = aside.layout_as_root(AvailableSpace::min_size(), window, cx);
@@ -3496,7 +3493,7 @@ impl EditorElement {
 
         // Skip drawing if it doesn't fit anywhere.
         if let Some((aside, position)) = positioned_aside {
-            window.defer_draw(aside, position, 1);
+            window.defer_draw(aside, position, 2);
         }
     }
 
@@ -3517,14 +3514,14 @@ impl EditorElement {
     fn render_context_menu_aside(
         &self,
         max_size: Size<Pixels>,
-
+        window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
         if max_size.width < px(100.) || max_size.height < px(12.) {
             None
         } else {
             self.editor.update(cx, |editor, cx| {
-                editor.render_context_menu_aside(&self.style, max_size, cx)
+                editor.render_context_menu_aside(max_size, window, cx)
             })
         }
     }
@@ -4329,7 +4326,7 @@ impl EditorElement {
                         window.paint_quad(fill(Bounds { origin, size }, color));
                     };
 
-                let mut current_paint: Option<(Hsla, Range<DisplayRow>)> = None;
+                let mut current_paint: Option<(gpui::Background, Range<DisplayRow>)> = None;
                 for (&new_row, &new_background) in &layout.highlighted_rows {
                     match &mut current_paint {
                         Some((current_background, current_range)) => {
@@ -4527,16 +4524,10 @@ impl EditorElement {
         }
     }
 
-    fn paint_diff_hunk_gutter_indicators(
-        layout: &mut EditorLayout,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
+    fn paint_diff_hunks(layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         if layout.display_hunks.is_empty() {
             return;
         }
-
-        let corners = Corners::all(px(0.));
 
         let line_height = layout.position_map.line_height;
         window.paint_layer(layout.gutter_hitbox.bounds, |window| {
@@ -4551,41 +4542,36 @@ impl EditorElement {
                         );
                         Some((
                             hunk_bounds,
-                            cx.theme().colors().version_control_modified.opacity(0.7),
-                            corners,
+                            cx.theme().status().modified,
+                            Corners::all(px(0.)),
                             &DiffHunkSecondaryStatus::None,
-                            false,
                         ))
                     }
                     DisplayDiffHunk::Unfolded {
                         status,
                         display_row_range,
-                        contains_expanded,
                         ..
                     } => hitbox.as_ref().map(|hunk_hitbox| match status {
                         DiffHunkStatus::Added(secondary_status) => (
                             hunk_hitbox.bounds,
-                            cx.theme().colors().version_control_added.opacity(0.7),
-                            corners,
+                            cx.theme().status().created,
+                            Corners::all(px(0.)),
                             secondary_status,
-                            *contains_expanded,
                         ),
                         DiffHunkStatus::Modified(secondary_status) => (
                             hunk_hitbox.bounds,
-                            cx.theme().colors().version_control_modified.opacity(0.7),
-                            corners,
+                            cx.theme().status().modified,
+                            Corners::all(px(0.)),
                             secondary_status,
-                            *contains_expanded,
                         ),
                         DiffHunkStatus::Removed(secondary_status)
                             if !display_row_range.is_empty() =>
                         {
                             (
                                 hunk_hitbox.bounds,
-                                cx.theme().colors().version_control_deleted.opacity(0.7),
-                                corners,
+                                cx.theme().status().deleted,
+                                Corners::all(px(0.)),
                                 secondary_status,
-                                *contains_expanded,
                             )
                         }
                         DiffHunkStatus::Removed(secondary_status) => (
@@ -4596,34 +4582,23 @@ impl EditorElement {
                                 ),
                                 size(hunk_hitbox.size.width * px(2.), hunk_hitbox.size.height),
                             ),
-                            cx.theme().colors().version_control_deleted.opacity(0.7),
+                            cx.theme().status().deleted,
                             Corners::all(1. * line_height),
                             secondary_status,
-                            *contains_expanded,
                         ),
                     }),
                 };
 
-                if let Some((
-                    hunk_bounds,
-                    background_color,
-                    corner_radii,
-                    secondary_status,
-                    contains_expanded,
-                )) = hunk_to_paint
+                if let Some((hunk_bounds, mut background_color, corner_radii, secondary_status)) =
+                    hunk_to_paint
                 {
-                    let background = if *secondary_status != DiffHunkSecondaryStatus::None
-                        && contains_expanded
-                    {
-                        pattern_slash(background_color, line_height.0 / 2.5)
-                    } else {
-                        solid_color(background_color)
-                    };
-
+                    if *secondary_status != DiffHunkSecondaryStatus::None {
+                        background_color.a *= 0.6;
+                    }
                     window.paint_quad(quad(
                         hunk_bounds,
                         corner_radii,
-                        background,
+                        background_color,
                         Edges::default(),
                         transparent_black(),
                     ));
@@ -4751,7 +4726,7 @@ impl EditorElement {
                 )
             });
         if show_git_gutter {
-            Self::paint_diff_hunk_gutter_indicators(layout, window, cx)
+            Self::paint_diff_hunks(layout, window, cx)
         }
 
         let highlight_width = 0.275 * layout.position_map.line_height;
@@ -5291,8 +5266,7 @@ impl EditorElement {
                 Some(cx.spawn_in(window, |editor, mut cx| async move {
                     let scrollbar_size = scrollbar_layout.hitbox.size;
                     let scrollbar_markers = cx
-                        .background_executor()
-                        .spawn(async move {
+                        .background_spawn(async move {
                             let max_point = snapshot.display_snapshot.buffer_snapshot.max_point();
                             let mut marker_quads = Vec::new();
                             if scrollbar_settings.git_diff {
@@ -5310,15 +5284,9 @@ impl EditorElement {
                                             end_display_row.0 -= 1;
                                         }
                                         let color = match &hunk.status() {
-                                            DiffHunkStatus::Added(_) => {
-                                                theme.colors().version_control_added
-                                            }
-                                            DiffHunkStatus::Modified(_) => {
-                                                theme.colors().version_control_modified
-                                            }
-                                            DiffHunkStatus::Removed(_) => {
-                                                theme.colors().version_control_deleted
-                                            }
+                                            DiffHunkStatus::Added(_) => theme.status().created,
+                                            DiffHunkStatus::Modified(_) => theme.status().modified,
+                                            DiffHunkStatus::Removed(_) => theme.status().deleted,
                                         };
                                         ColoredRange {
                                             start: start_display_row,
@@ -6896,17 +6864,39 @@ impl Element for EditorElement {
                         )
                     };
 
-                    let mut highlighted_rows = self
-                        .editor
-                        .update(cx, |editor, cx| editor.highlighted_display_rows(window, cx));
+                    let (mut highlighted_rows, distinguish_unstaged_hunks) =
+                        self.editor.update(cx, |editor, cx| {
+                            (
+                                editor.highlighted_display_rows(window, cx),
+                                editor.distinguish_unstaged_diff_hunks,
+                            )
+                        });
 
                     for (ix, row_info) in row_infos.iter().enumerate() {
                         let background = match row_info.diff_status {
-                            Some(DiffHunkStatus::Added(_)) => {
-                                cx.theme().colors().version_control_added_background
+                            Some(DiffHunkStatus::Added(secondary_status)) => {
+                                let color = style.status.created_background;
+                                match secondary_status {
+                                    DiffHunkSecondaryStatus::HasSecondaryHunk
+                                    | DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk
+                                        if distinguish_unstaged_hunks =>
+                                    {
+                                        pattern_slash(color, line_height.0 / 4.0)
+                                    }
+                                    _ => color.into(),
+                                }
                             }
-                            Some(DiffHunkStatus::Removed(_)) => {
-                                cx.theme().colors().version_control_deleted_background
+                            Some(DiffHunkStatus::Removed(secondary_status)) => {
+                                let color = style.status.deleted_background;
+                                match secondary_status {
+                                    DiffHunkSecondaryStatus::HasSecondaryHunk
+                                    | DiffHunkSecondaryStatus::OverlapsWithSecondaryHunk
+                                        if distinguish_unstaged_hunks =>
+                                    {
+                                        pattern_slash(color, line_height.0 / 4.0)
+                                    }
+                                    _ => color.into(),
+                                }
                             }
                             _ => continue,
                         };
@@ -7753,7 +7743,7 @@ pub struct EditorLayout {
     indent_guides: Option<Vec<IndentGuideLayout>>,
     visible_display_row_range: Range<DisplayRow>,
     active_rows: BTreeMap<DisplayRow, bool>,
-    highlighted_rows: BTreeMap<DisplayRow, Hsla>,
+    highlighted_rows: BTreeMap<DisplayRow, gpui::Background>,
     line_elements: SmallVec<[AnyElement; 1]>,
     line_numbers: Arc<HashMap<MultiBufferRow, LineNumberLayout>>,
     display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
