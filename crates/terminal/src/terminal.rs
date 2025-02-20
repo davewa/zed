@@ -313,7 +313,7 @@ impl Display for TerminalError {
 // https://github.com/alacritty/alacritty/blob/cb3a79dbf6472740daca8440d5166c1d4af5029e/extra/man/alacritty.5.scd?plain=1#L207-L213
 const DEFAULT_SCROLL_HISTORY_LINES: usize = 10_000;
 const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
-const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
+const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file:|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
 // Optional suffix matches MSBuild diagnostic suffixes for path parsing in PathLikeWithPosition
 // https://learn.microsoft.com/en-us/visualstudio/msbuild/msbuild-diagnostic-format-for-tasks
 const WORD_REGEX: &str =
@@ -740,6 +740,46 @@ impl Terminal {
         self.selection_phase == SelectionPhase::Selecting
     }
 
+    // Treat "file:" URLs like file paths to ensure
+    // that line numbers at the end of the path are
+    // handled correctly
+    fn path_from_url(maybe_file_url: &str) -> Option<String> {
+        if !maybe_file_url.starts_with("file:") {
+            return None;
+        }
+
+        let Ok(file_url) = url::Url::parse(&maybe_file_url) else {
+            return None;
+        };
+
+        let Ok(mut pathbuf) = file_url.to_file_path() else {
+            return None;
+        };
+
+        if !maybe_file_url.starts_with("file:/") {
+            // If it doesn't have a / at the start of the path,
+            // it is a relative file Url, but to_file_path() always
+            // returns an absolute path, unfortunately.
+            let mut components = pathbuf.components();
+            if let Some(std::path::Component::RootDir) = components.next() {
+                pathbuf = PathBuf::from(components.as_path());
+            } else {
+                // TODO: Should assert here to be notified if
+                // to_file_url() starts producing relative paths
+                // for relative file Urls...
+            }
+        }
+
+        pathbuf.to_str().map(|path_str| {
+            let mut path = path_str.to_string();
+            if let Some(fragment) = file_url.fragment() {
+                path.push_str(":");
+                path.push_str(fragment);
+            }
+            path
+        })
+    }
+
     fn process_terminal_event(
         &mut self,
         event: &InternalEvent,
@@ -949,12 +989,12 @@ impl Terminal {
                 match found_word {
                     Some((maybe_url_or_path, is_url, url_match)) => {
                         let target = if is_url {
-                            // Treat "file://" URLs like file paths to ensure
+                            // Treat "file:" URLs like file paths to ensure
                             // that line numbers at the end of the path are
                             // handled correctly
-                            if let Some(path) = maybe_url_or_path.strip_prefix("file://") {
+                            if let Some(maybe_path) = Self::path_from_url(&maybe_url_or_path) {
                                 MaybeNavigationTarget::PathLike(PathLikeTarget {
-                                    maybe_path: path.to_string(),
+                                    maybe_path,
                                     terminal_dir: self.working_directory(),
                                 })
                             } else {

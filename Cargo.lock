@@ -13389,6 +13389,7 @@ dependencies = [
  "task",
  "theme",
  "thiserror 1.0.69",
+ "url",
  "util",
  "windows 0.58.0",
 ]

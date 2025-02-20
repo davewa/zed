@@ -30,6 +30,7 @@ smol.workspace = true
 task.workspace = true
 theme.workspace = true
 thiserror.workspace = true
+url.workspace = true
 util.workspace = true
 
 [target.'cfg(windows)'.dependencies]
