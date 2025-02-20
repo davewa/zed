@@ -81,11 +81,11 @@ use git::blame::GitBlame;
 use gpui::{
     div, impl_actions, point, prelude::*, pulsating_between, px, relative, size, Action, Animation,
     AnimationExt, AnyElement, App, AsyncWindowContext, AvailableSpace, Background, Bounds,
-    ClipboardEntry, ClipboardItem, Context, DispatchPhase, ElementId, Entity, EntityInputHandler,
+    ClipboardEntry, ClipboardItem, Context, DispatchPhase, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, FocusOutEvent, Focusable, FontId, FontWeight, Global,
-    HighlightStyle, Hsla, InteractiveText, KeyContext, Modifiers, MouseButton, MouseDownEvent,
-    PaintQuad, ParentElement, Pixels, Render, SharedString, Size, Styled, StyledText, Subscription,
-    Task, TextStyle, TextStyleRefinement, UTF16Selection, UnderlineStyle, UniformListScrollHandle,
+    HighlightStyle, Hsla, KeyContext, Modifiers, MouseButton, MouseDownEvent, PaintQuad,
+    ParentElement, Pixels, Render, SharedString, Size, Styled, StyledText, Subscription, Task,
+    TextStyle, TextStyleRefinement, UTF16Selection, UnderlineStyle, UniformListScrollHandle,
     WeakEntity, WeakFocusHandle, Window,
 };
 use highlight_matching_bracket::refresh_matching_bracket_highlights;
@@ -97,11 +97,13 @@ use inline_completion::{EditPredictionProvider, InlineCompletionProviderHandle};
 pub use items::MAX_TAB_TITLE_LEN;
 use itertools::Itertools;
 use language::{
-    language_settings::{self, all_language_settings, language_settings, InlayHintSettings},
-    markdown, point_from_lsp, AutoindentMode, BracketPair, Buffer, Capability, CharKind, CodeLabel,
-    CursorShape, Diagnostic, DiskState, EditPredictionsMode, EditPreview, HighlightedText,
-    IndentKind, IndentSize, Language, OffsetRangeExt, Point, Selection, SelectionGoal, TextObject,
-    TransactionId, TreeSitterOptions,
+    language_settings::{
+        self, all_language_settings, language_settings, InlayHintSettings, RewrapBehavior,
+    },
+    point_from_lsp, text_diff_with_options, AutoindentMode, BracketPair, Buffer, Capability,
+    CharKind, CodeLabel, CursorShape, Diagnostic, DiffOptions, DiskState, EditPredictionsMode,
+    EditPreview, HighlightedText, IndentKind, IndentSize, Language, OffsetRangeExt, Point,
+    Selection, SelectionGoal, TextObject, TransactionId, TreeSitterOptions,
 };
 use language::{point_to_lsp, BufferRow, CharClassifier, Runnable, RunnableRange};
 use linked_editing_ranges::refresh_linked_ranges;
@@ -110,7 +112,6 @@ use persistence::DB;
 pub use proposed_changes_editor::{
     ProposedChangeLocation, ProposedChangesEditor, ProposedChangesEditorToolbar,
 };
-use similar::{ChangeTag, TextDiff};
 use std::iter::Peekable;
 use task::{ResolvedTask, TaskTemplate, TaskVariables};
 
@@ -200,7 +201,7 @@ pub(crate) const CURSORS_VISIBLE_FOR: Duration = Duration::from_millis(2000);
 #[doc(hidden)]
 pub const CODE_ACTIONS_DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(250);
 
-pub(crate) const FORMAT_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const SCROLL_CENTER_TOP_BOTTOM_DEBOUNCE_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub(crate) const EDIT_PREDICTION_KEY_CONTEXT: &str = "edit_prediction";
@@ -213,72 +214,6 @@ const COLUMNAR_SELECTION_MODIFIERS: Modifiers = Modifiers {
     platform: false,
     function: false,
 };
-
-pub fn render_parsed_markdown(
-    element_id: impl Into<ElementId>,
-    parsed: &language::ParsedMarkdown,
-    editor_style: &EditorStyle,
-    workspace: Option<WeakEntity<Workspace>>,
-    cx: &mut App,
-) -> InteractiveText {
-    let code_span_background_color = cx
-        .theme()
-        .colors()
-        .editor_document_highlight_read_background;
-
-    let highlights = gpui::combine_highlights(
-        parsed.highlights.iter().filter_map(|(range, highlight)| {
-            let highlight = highlight.to_highlight_style(&editor_style.syntax)?;
-            Some((range.clone(), highlight))
-        }),
-        parsed
-            .regions
-            .iter()
-            .zip(&parsed.region_ranges)
-            .filter_map(|(region, range)| {
-                if region.code {
-                    Some((
-                        range.clone(),
-                        HighlightStyle {
-                            background_color: Some(code_span_background_color),
-                            ..Default::default()
-                        },
-                    ))
-                } else {
-                    None
-                }
-            }),
-    );
-
-    let mut links = Vec::new();
-    let mut link_ranges = Vec::new();
-    for (range, region) in parsed.region_ranges.iter().zip(&parsed.regions) {
-        if let Some(link) = region.link.clone() {
-            links.push(link);
-            link_ranges.push(range.clone());
-        }
-    }
-
-    InteractiveText::new(
-        element_id,
-        StyledText::new(parsed.text.clone()).with_highlights(&editor_style.text, highlights),
-    )
-    .on_click(
-        link_ranges,
-        move |clicked_range_ix, window, cx| match &links[clicked_range_ix] {
-            markdown::Link::Web { url } => cx.open_url(url),
-            markdown::Link::Path { path } => {
-                if let Some(workspace) = &workspace {
-                    _ = workspace.update(cx, |workspace, cx| {
-                        workspace
-                            .open_abs_path(path.clone(), false, window, cx)
-                            .detach();
-                    });
-                }
-            }
-        },
-    )
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum InlayId {
@@ -745,6 +680,7 @@ pub struct Editor {
     show_git_blame_gutter: bool,
     show_git_blame_inline: bool,
     show_git_blame_inline_delay_task: Option<Task<()>>,
+    git_blame_inline_tooltip: Option<WeakEntity<crate::commit_tooltip::CommitTooltip>>,
     distinguish_unstaged_diff_hunks: bool,
     git_blame_inline_enabled: bool,
     serialize_dirty_buffers: bool,
@@ -1454,6 +1390,7 @@ impl Editor {
             distinguish_unstaged_diff_hunks: false,
             show_selection_menu: None,
             show_git_blame_inline_delay_task: None,
+            git_blame_inline_tooltip: None,
             git_blame_inline_enabled: ProjectSettings::get_global(cx).git.inline_blame_enabled(),
             serialize_dirty_buffers: ProjectSettings::get_global(cx)
                 .session
@@ -5901,20 +5838,18 @@ impl Editor {
         window: &mut Window,
         cx: &App,
     ) -> Option<Div> {
-        let bg_color = Self::edit_prediction_line_popover_bg_color(cx);
-
         let padding_right = if icon.is_some() { px(4.) } else { px(8.) };
 
         let result = h_flex()
-            .gap_1()
-            .border_1()
-            .rounded_lg()
-            .shadow_sm()
-            .bg(bg_color)
-            .border_color(cx.theme().colors().text_accent.opacity(0.4))
             .py_0p5()
             .pl_1()
             .pr(padding_right)
+            .gap_1()
+            .rounded(px(6.))
+            .border_1()
+            .bg(Self::edit_prediction_line_popover_bg_color(cx))
+            .border_color(Self::edit_prediction_callout_popover_border_color(cx))
+            .shadow_sm()
             .children(self.render_edit_prediction_accept_keybind(window, cx))
             .child(Label::new(label).size(LabelSize::Small))
             .when_some(icon, |element, icon| {
@@ -5934,6 +5869,13 @@ impl Editor {
         editor_bg_color.blend(accent_color.opacity(0.1))
     }
 
+    fn edit_prediction_callout_popover_border_color(cx: &App) -> Hsla {
+        let accent_color = cx.theme().colors().text_accent;
+        let editor_bg_color = cx.theme().colors().editor_background;
+        editor_bg_color.blend(accent_color.opacity(0.6))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn render_edit_prediction_cursor_popover(
         &self,
         min_width: Pixels,
@@ -6006,10 +5948,11 @@ impl Editor {
                         h_flex()
                             .px_2()
                             .py_1()
+                            .gap_2()
                             .elevation_2(cx)
                             .border_color(cx.theme().colors().border)
+                            .rounded(px(6.))
                             .rounded_tl(px(0.))
-                            .gap_2()
                             .child(
                                 if target.text_anchor.to_point(&snapshot).row > cursor_point.row {
                                     Icon::new(IconName::ZedPredictDown)
@@ -7112,10 +7055,10 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let selections = self.selections.all(cx).into_iter().map(|s| s.range());
-        self.discard_hunks_in_ranges(selections, window, cx);
+        self.revert_hunks_in_ranges(selections, window, cx);
     }
 
-    fn discard_hunks_in_ranges(
+    fn revert_hunks_in_ranges(
         &mut self,
         ranges: impl Iterator<Item = Range<Point>>,
         window: &mut Window,
@@ -7802,17 +7745,6 @@ impl Editor {
                 continue;
             }
 
-            let mut should_rewrap = is_vim_mode == IsVimMode::Yes;
-
-            if let Some(language_scope) = buffer.language_scope_at(selection.head()) {
-                match language_scope.language_name().as_ref() {
-                    "Markdown" | "Plain Text" => {
-                        should_rewrap = true;
-                    }
-                    _ => {}
-                }
-            }
-
             let tab_size = buffer.settings_at(selection.head(), cx).tab_size;
 
             // Since not all lines in the selection may be at the same indent
@@ -7843,6 +7775,7 @@ impl Editor {
 
             let mut line_prefix = indent_size.chars().collect::<String>();
 
+            let mut inside_comment = false;
             if let Some(comment_prefix) =
                 buffer
                     .language_scope_at(selection.head())
@@ -7855,9 +7788,17 @@ impl Editor {
                     })
             {
                 line_prefix.push_str(&comment_prefix);
-                should_rewrap = true;
+                inside_comment = true;
             }
 
+            let language_settings = buffer.settings_at(selection.head(), cx);
+            let allow_rewrap_based_on_language = match language_settings.allow_rewrap {
+                RewrapBehavior::InComments => inside_comment,
+                RewrapBehavior::InSelections => !selection.is_empty(),
+                RewrapBehavior::Anywhere => true,
+            };
+
+            let should_rewrap = is_vim_mode == IsVimMode::Yes || allow_rewrap_based_on_language;
             if !should_rewrap {
                 continue;
             }
@@ -7887,6 +7828,7 @@ impl Editor {
             }
 
             let start = Point::new(start_row, 0);
+            let start_offset = start.to_offset(&buffer);
             let end = Point::new(end_row, buffer.line_len(MultiBufferRow(end_row)));
             let selection_text = buffer.text_for_range(start..end).collect::<String>();
             let Some(lines_without_prefixes) = selection_text
@@ -7916,44 +7858,21 @@ impl Editor {
 
             // TODO: should always use char-based diff while still supporting cursor behavior that
             // matches vim.
-            let diff = match is_vim_mode {
-                IsVimMode::Yes => TextDiff::from_lines(&selection_text, &wrapped_text),
-                IsVimMode::No => TextDiff::from_chars(&selection_text, &wrapped_text),
-            };
-            let mut offset = start.to_offset(&buffer);
-            let mut moved_since_edit = true;
+            let mut diff_options = DiffOptions::default();
+            if is_vim_mode == IsVimMode::Yes {
+                diff_options.max_word_diff_len = 0;
+                diff_options.max_word_diff_line_count = 0;
+            } else {
+                diff_options.max_word_diff_len = usize::MAX;
+                diff_options.max_word_diff_line_count = usize::MAX;
+            }
 
-            for change in diff.iter_all_changes() {
-                let value = change.value();
-                match change.tag() {
-                    ChangeTag::Equal => {
-                        offset += value.len();
-                        moved_since_edit = true;
-                    }
-                    ChangeTag::Delete => {
-                        let start = buffer.anchor_after(offset);
-                        let end = buffer.anchor_before(offset + value.len());
-
-                        if moved_since_edit {
-                            edits.push((start..end, String::new()));
-                        } else {
-                            edits.last_mut().unwrap().0.end = end;
-                        }
-
-                        offset += value.len();
-                        moved_since_edit = false;
-                    }
-                    ChangeTag::Insert => {
-                        if moved_since_edit {
-                            let anchor = buffer.anchor_after(offset);
-                            edits.push((anchor..anchor, value.to_string()));
-                        } else {
-                            edits.last_mut().unwrap().1.push_str(value);
-                        }
-
-                        moved_since_edit = false;
-                    }
-                }
+            for (old_range, new_text) in
+                text_diff_with_options(&selection_text, &wrapped_text, diff_options)
+            {
+                let edit_start = buffer.anchor_after(start_offset + old_range.start);
+                let edit_end = buffer.anchor_after(start_offset + old_range.end);
+                edits.push((edit_start..edit_end, new_text));
             }
 
             rewrapped_row_ranges.push(start_row..=end_row);
@@ -13428,7 +13347,12 @@ impl Editor {
 
     pub fn render_git_blame_inline(&self, window: &Window, cx: &App) -> bool {
         self.show_git_blame_inline
-            && self.focus_handle.is_focused(window)
+            && (self.focus_handle.is_focused(window)
+                || self
+                    .git_blame_inline_tooltip
+                    .as_ref()
+                    .and_then(|t| t.upgrade())
+                    .is_some())
             && !self.newest_selection_head_on_empty_line(cx)
             && self.has_blame_entries(cx)
     }
@@ -16009,7 +15933,7 @@ impl EditorSnapshot {
             ) {
                 // Deleted hunk is an empty row range, no caret can be placed there and Zed allows to revert it
                 // when the caret is just above or just below the deleted hunk.
-                let allow_adjacent = hunk.status().is_removed();
+                let allow_adjacent = hunk.status().is_deleted();
                 let related_to_selection = if allow_adjacent {
                     hunk.row_range.overlaps(&query_rows)
                         || hunk.row_range.start == query_rows.end
