@@ -3,6 +3,7 @@ pub mod mappings;
 pub use alacritty_terminal;
 
 mod pty_info;
+pub mod terminal_path_hyperlinks;
 pub mod terminal_settings;
 
 use alacritty_terminal::{
@@ -38,23 +39,21 @@ use mappings::mouse::{
 
 use collections::{HashMap, VecDeque};
 use futures::StreamExt;
-use log::{debug, trace};
 use pty_info::PtyProcessInfo;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use smol::channel::{Receiver, Sender};
 use task::{HideStrategy, Shell, TaskId};
+use terminal_path_hyperlinks::{MaybePath, MaybePathMode};
 use terminal_settings::{AlternateScroll, CursorShape, TerminalSettings};
 use theme::{ActiveTheme, Theme};
-use util::{paths::home_dir, truncate_and_trailoff, RangeExt};
+use util::{paths::home_dir, truncate_and_trailoff};
 
 use std::{
-    cmp::{self, min, Ordering},
+    cmp::{self, min},
     fmt::Display,
-    fs,
     ops::{Deref, Index, RangeInclusive},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -118,7 +117,8 @@ pub enum Event {
 pub struct PathLikeTarget {
     /// File system path, absolute or relative, existing or not.
     /// Might have line and column number(s) attached as `file.rs:1:23`
-    pub maybe_path: String,
+    /// or `file.rs(1,23)`
+    pub maybe_paths: MaybePath,
     /// Current working directory of the terminal
     pub terminal_dir: Option<PathBuf>,
 }
@@ -317,12 +317,11 @@ impl Display for TerminalError {
 const DEFAULT_SCROLL_HISTORY_LINES: usize = 10_000;
 const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
-// Optional suffix matches MSBuild diagnostic suffixes for path parsing in PathLikeWithPosition
-// https://learn.microsoft.com/en-us/visualstudio/msbuild/msbuild-diagnostic-format-for-tasks
-const WORD_REGEX: &str =
-    r#"[\$\+\w.\[\]:/\\@\-~()]+(?:\((?:\d+|\d+,\d+)\))|[\$\+\w.\[\]:/\\@\-~()]+"#;
-const LINE_COLUMN_REGEX: &str =
-    r#"[\$\+\w.\[\]:/\\@\-~()]+(?<line_column>(:\((?:\d+|\d+,\d+)\))|(:\d+:\d+))"#;
+/// Paths can contain almost any unicode characters. Here we use whitespace to separate paths
+/// into "words" so that the common case of paths without spaces can be processed more efficiently.
+/// Use terminal.[enable_enhanced_path_hyperlinks](TerminalSettingsContent::enable_enhanced_path_hyperlinks) = true
+/// to enable paths containing spaces.
+const WORD_REGEX: &str = r#"[^\s]+"#;
 
 pub struct TerminalBuilder {
     terminal: Terminal,
@@ -478,7 +477,6 @@ impl TerminalBuilder {
             // hovered_word: false,
             url_regex: RegexSearch::new(URL_REGEX).unwrap(),
             word_regex: RegexSearch::new(WORD_REGEX).unwrap(),
-            line_column_regex: Regex::new(LINE_COLUMN_REGEX).unwrap(),
             vi_mode_enabled: false,
             is_ssh_terminal,
             python_venv_directory,
@@ -634,7 +632,6 @@ pub struct Terminal {
     selection_phase: SelectionPhase,
     url_regex: RegexSearch,
     word_regex: RegexSearch,
-    line_column_regex: Regex,
     task: Option<TaskState>,
     vi_mode_enabled: bool,
     is_ssh_terminal: bool,
@@ -748,84 +745,33 @@ impl Terminal {
         self.selection_phase == SelectionPhase::Selecting
     }
 
-    /// Looks for a path under `cursor`
-    // Note: Does not handle paths that start or end in space(s) or that do not start
-    // or end on a word match boundary--except for those ending with a line and column
-    // TODO: paths with surrounding ' " ( ) [ ]
-    // Note: Once we handle the surrounding delimiter cases, paths that start or end in
-    // space(s) _will_ be handled.
-    fn find_path_hyperlink(
+    fn maybe_path_from_word_match(
         &mut self,
         term: &mut Term<ZedListener>,
-        cursor: AlacPoint,
-    ) -> Option<RangeInclusive<AlacPoint>> {
-        let line_start = term.line_search_left(cursor);
-        let line_end = term.line_search_right(cursor);
+        word_match: &Match,
+        cx: &mut Context<Self>,
+    ) -> MaybePath {
+        let maybe_path = term.bounds_to_string(*word_match.start(), *word_match.end());
+        if !TerminalSettings::get_global(cx).enable_enhanced_path_hyperlinks {
+            return MaybePath::new(maybe_path, MaybePathMode::Default);
+        }
 
-        let line_words = RegexIter::new(
-            line_start,
-            line_end,
-            AlacDirection::Right,
-            term,
-            &mut self.word_regex,
+        let line_start = term.line_search_left(*word_match.start());
+        // TODO(davewa): Test if line_start == word_match.start()
+        let mut maybe_path_line =
+            term.bounds_to_string(line_start, word_match.start().sub(term, Boundary::Grid, 1));
+        let match_start_offset = maybe_path_line.len();
+        maybe_path_line.push_str(&maybe_path);
+        let match_end_offset = maybe_path_line.len();
+        let line_end = term.line_search_right(*word_match.end());
+        // TODO(davewa): Test if line_end == word_match.end()
+        maybe_path_line.push_str(
+            &term.bounds_to_string(word_match.end().add(term, Boundary::Grid, 1), line_end),
+        );
+        MaybePath::new(
+            maybe_path_line,
+            MaybePathMode::Advanced(match_start_offset..match_end_offset),
         )
-        .into_iter()
-        .collect::<Vec<_>>();
-
-        let mut longest_path_found = cursor..=cursor.sub(term, Boundary::Grid, 1);
-
-        for start_word in &line_words {
-            if start_word.start().cmp(&cursor) == Ordering::Greater {
-                // we are past the word under the cursor, stop.
-                break;
-            }
-
-            for end_word in line_words.iter().rev() {
-                if end_word.end().cmp(&cursor) == Ordering::Less {
-                    // we are past the word under the cursor, stop.
-                    break;
-                }
-
-                if longest_path_found.contains_inclusive(&(*start_word.start()..*end_word.end())) {
-                    // We have already found a path that is longer than any
-                    // path starting with the current start_word, so we are done.
-                    return Some(*longest_path_found.start()..=*longest_path_found.end());
-                }
-
-                // Otherwise, we have a potential path that is longer than the current longest_path_found,
-                // Check if it exists, and if it does, make it the new longest_path_found.
-
-                // Check for potential :<line>:<column> endings before fs::exists()
-                let maybe_path = term.bounds_to_string(*start_word.start(), *end_word.end());
-                let maybe_path_no_line_column =
-                    if let Some(captures) = self.line_column_regex.captures(&maybe_path) {
-                        &maybe_path[0..maybe_path.len() - captures["line_column"].len()]
-                    } else {
-                        &maybe_path[0..]
-                    };
-
-                match fs::exists(Path::new(&maybe_path_no_line_column)) {
-                    Ok(true) => {
-                        longest_path_found = *start_word.start()..=*end_word.end();
-                        debug!("Updated longest path found to: {}", maybe_path);
-                        // The rest can only be shorter.
-                        break;
-                    }
-                    _ => {
-                        trace!(
-                            "Not an error, no file found for path: {}",
-                            maybe_path_no_line_column
-                        )
-                    }
-                }
-            }
-        }
-
-        if !longest_path_found.is_empty() {
-            return Some(*longest_path_found.start()..=*longest_path_found.end());
-        }
-
-        None
     }
 
     fn process_terminal_event(
@@ -1009,43 +955,35 @@ impl Terminal {
                     let url = link.unwrap().uri().to_owned();
                     let url_match = min_index..=max_index;
 
-                    Some((url, true, url_match))
+                    Some((url, true, url_match, None))
                 } else if let Some(url_match) = regex_match_at(term, point, &mut self.url_regex) {
                     let url = term.bounds_to_string(*url_match.start(), *url_match.end());
-                    Some((url, true, url_match))
-                } else if let Some(path_match) = self.find_path_hyperlink(term, point) {
-                    let maybe_path = term.bounds_to_string(*path_match.start(), *path_match.end());
-                    Some((maybe_path, false, path_match))
+                    Some((url, true, url_match, None))
                 } else if let Some(word_match) = regex_match_at(term, point, &mut self.word_regex) {
-                    let file_path = term.bounds_to_string(*word_match.start(), *word_match.end());
-
-                    let (sanitized_match, sanitized_word) =
-                        if is_path_surrounded_by_common_symbols(&file_path) {
-                            (
-                                Match::new(
-                                    word_match.start().add(term, Boundary::Cursor, 1),
-                                    word_match.end().sub(term, Boundary::Cursor, 1),
-                                ),
-                                file_path[1..file_path.len() - 1].to_owned(),
-                            )
-                        } else {
-                            (word_match, file_path)
-                        };
-
-                    Some((sanitized_word, false, sanitized_match))
+                    let maybe_paths = self.maybe_path_from_word_match(term, &word_match, cx);
+                    Some((
+                        maybe_paths.maybe_path_word().to_string(),
+                        false,
+                        word_match,
+                        Some(maybe_paths),
+                    ))
                 } else {
                     None
                 };
 
                 match found_word {
-                    Some((maybe_url_or_path, is_url, url_match)) => {
+                    Some((maybe_url_or_path, is_url, url_match, maybe_paths)) => {
                         let target = if is_url {
                             // Treat "file://" URLs like file paths to ensure
                             // that line numbers at the end of the path are
                             // handled correctly
                             if let Some(path) = maybe_url_or_path.strip_prefix("file://") {
                                 MaybeNavigationTarget::PathLike(PathLikeTarget {
-                                    maybe_path: path.to_string(),
+                                    maybe_paths: MaybePath::new(
+                                        path.to_string(),
+                                        // Never use enhanced for file URLs
+                                        MaybePathMode::Default,
+                                    ),
                                     terminal_dir: self.working_directory(),
                                 })
                             } else {
@@ -1053,7 +991,8 @@ impl Terminal {
                             }
                         } else {
                             MaybeNavigationTarget::PathLike(PathLikeTarget {
-                                maybe_path: maybe_url_or_path.clone(),
+                                maybe_paths: maybe_paths
+                                    .expect("File matches must have a MaybePath"),
                                 terminal_dir: self.working_directory(),
                             })
                         };
@@ -1888,14 +1827,6 @@ impl Terminal {
     }
 }
 
-fn is_path_surrounded_by_common_symbols(path: &str) -> bool {
-    // Avoid detecting `[]` or `()` strings as paths, surrounded by common symbols
-    path.len() > 2
-        // The rest of the brackets and various quotes cannot be matched by the [`WORD_REGEX`] hence not checked for.
-        && (path.starts_with('[') && path.ends_with(']')
-            || path.starts_with('(') && path.ends_with(')'))
-}
-
 const TASK_DELIMITER: &str = "⏵ ";
 fn task_summary(task: &TaskState, error_code: Option<i32>) -> (bool, String, String) {
     let escaped_full_label = task.full_label.replace("\r\n", "\r").replace('\n', "\r");
@@ -2257,7 +2188,7 @@ mod tests {
         re_test(
             crate::WORD_REGEX,
             "hello, world! \"What\" is this?",
-            vec!["hello", "world", "What", "is", "this"],
+            vec!["hello,", "world!", "\"What\"", "is", "this?"],
         );
     }
     #[test]

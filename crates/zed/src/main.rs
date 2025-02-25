@@ -919,7 +919,8 @@ fn init_paths() -> HashMap<io::ErrorKind, Vec<&'static Path>> {
 }
 
 fn init_logger() {
-    if stdout_is_a_pty() {
+    if false {
+        //stdout_is_a_pty() {
         init_stdout_logger();
     } else {
         let level = LevelFilter::Info;

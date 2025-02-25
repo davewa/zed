@@ -48,6 +48,8 @@ pub struct TerminalSettings {
     pub max_scroll_history_lines: Option<usize>,
     pub toolbar: Toolbar,
     pub scrollbar: ScrollbarSettings,
+    pub enable_enhanced_path_hyperlinks: bool,
+    pub enhanced_path_hyperlink_timeout: usize,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -223,6 +225,17 @@ pub struct TerminalSettingsContent {
     pub toolbar: Option<ToolbarContent>,
     /// Scrollbar-related settings
     pub scrollbar: Option<ScrollbarSettingsContent>,
+    /// Enables enhanced path hyperlink support. This enables hover and cmd-click navigation
+    /// for paths containing spaces.
+    ///
+    /// Default: false
+    // TODO(davewa): Default, Advanced, Exhaustive
+    pub enable_enhanced_path_hyperlinks: Option<bool>,
+    /// Timeout for enhanced path hyperlink support in milliseconds.
+    /// This limits the maximum time to search for an enhanced path hyperlink.
+    ///
+    /// Default: 250
+    pub enhanced_path_hyperlink_timeout: Option<usize>,
 }
 
 impl settings::Settings for TerminalSettings {

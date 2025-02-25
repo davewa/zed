@@ -4,7 +4,7 @@ pub mod terminal_panel;
 pub mod terminal_scrollbar;
 pub mod terminal_tab_tooltip;
 
-use collections::HashSet;
+use collections::{HashMap, HashSet};
 use editor::{actions::SelectAll, scroll::ScrollbarAutoHide, Editor, EditorSettings};
 use futures::{stream::FuturesUnordered, StreamExt};
 use gpui::{
@@ -12,9 +12,12 @@ use gpui::{
     FocusHandle, Focusable, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
     Pixels, Render, ScrollWheelEvent, Stateful, Styled, Subscription, Task, WeakEntity,
 };
+use log::info;
 use persistence::TERMINAL_DB;
+use project::Entry;
 use project::{search::SearchQuery, terminals::TerminalKind, Fs, Metadata, Project};
 use schemars::JsonSchema;
+use terminal::terminal_path_hyperlinks::{LineColumn, MaybePathVariations, MaybePath};
 use terminal::{
     alacritty_terminal::{
         index::Point,
@@ -67,7 +70,7 @@ const REGEX_SPECIAL_CHARS: &[char] = &[
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
-const GIT_DIFF_PATH_PREFIXES: &[char] = &['a', 'b'];
+const _DEFAULT_ENHANCED_PATH_HYPERLINK_TIMEOUT: usize = 250;
 
 /// Event to transmit the scroll from the element to the view
 #[derive(Clone, Debug, PartialEq)]
@@ -856,7 +859,7 @@ fn subscribe_for_terminal_events(
                                 fs,
                                 &workspace,
                                 &path_like_target.terminal_dir,
-                                &path_like_target.maybe_path,
+                                &path_like_target.maybe_paths,
                                 cx,
                             );
                             !smol::block_on(valid_files_to_open_task).is_empty()
@@ -873,6 +876,7 @@ fn subscribe_for_terminal_events(
                 MaybeNavigationTarget::Url(url) => cx.open_url(url),
 
                 MaybeNavigationTarget::PathLike(path_like_target) => {
+                    // TODO(davewa): make this paths_to_open, and remember the results from Event::NewNavigationTarget
                     if !this.can_navigate_to_selected_word {
                         return;
                     }
@@ -894,7 +898,7 @@ fn subscribe_for_terminal_events(
                                     fs,
                                     &task_workspace,
                                     &path_like_target.terminal_dir,
-                                    &path_like_target.maybe_path,
+                                    &path_like_target.maybe_paths,
                                     cx,
                                 )
                             })?
@@ -971,36 +975,59 @@ fn subscribe_for_terminal_events(
 
 fn possible_open_paths_metadata(
     fs: Arc<dyn Fs>,
-    row: Option<u32>,
-    column: Option<u32>,
-    potential_paths: HashSet<PathBuf>,
+    cwd: Option<PathBuf>,
+    maybe_paths: MaybePath,
+    maybe_paths_variations: Vec<MaybePathVariations>,
+    canonical_worktree_path_sets: HashMap<Arc<Path>, Vec<(Box<Path>, Option<LineColumn>)>>,
     cx: &mut Context<TerminalView>,
 ) -> Task<Vec<(PathWithPosition, Metadata)>> {
     cx.background_spawn(async move {
-        let mut canonical_paths = HashSet::default();
-        for path in potential_paths {
-            if let Ok(canonical) = fs.canonicalize(&path).await {
-                let sanitized = SanitizedPath::from(canonical);
-                canonical_paths.insert(sanitized.as_path().to_path_buf());
+        let mut paths_with_metadata = Vec::new();
+
+        // TODO(davewa): Better capacity calculation...
+        let mut canonical_paths =
+            HashSet::<PathWithPosition>::with_capacity(canonical_worktree_path_sets.len());
+
+        let mut insert_canonical = |canonical: PathBuf, position: Option<LineColumn>| {
+            let (row, column) = if let Some(ref position) = position {
+                (Some(position.line), position.column)
             } else {
-                canonical_paths.insert(path);
+                (None, None)
+            };
+            canonical_paths.insert(PathWithPosition {
+                // TODO(davewa): Shouldn't abs_root in the worktree always already be sanitized?
+                path: SanitizedPath::from(canonical).as_path().to_path_buf(),
+                row,
+                column,
+            });
+        };
+
+        for (abs_root, canonical_paths_with_positions) in &canonical_worktree_path_sets {
+            for canonical_path_with_position in canonical_paths_with_positions {
+                let canonical = abs_root.join(&canonical_path_with_position.0);
+                info!("Terminal: MaybePath worktree variation: {:?}", canonical);
+                insert_canonical(canonical, canonical_path_with_position.1);
             }
         }
 
-        let mut paths_with_metadata = Vec::with_capacity(canonical_paths.len());
+        // TODO(davewa): Do this less often...
+        let home_dir = dirs::home_dir();
+        for maybe_path_variations in &maybe_paths_variations {
+            for (absolute, position) in
+                maybe_path_variations.absolutized_variations(&maybe_paths, &cwd, &home_dir)
+            {
+                info!("Terminal: MaybePath absolutized variation: {:?}", absolute);
+                if let Ok(canonical) = fs.canonicalize(&absolute).await {
+                    insert_canonical(canonical, position);
+                }
+            }
+        }
 
         let mut fetch_metadata_tasks = canonical_paths
             .into_iter()
-            .map(|potential_path| async {
-                let metadata = fs.metadata(&potential_path).await.ok().flatten();
-                (
-                    PathWithPosition {
-                        path: potential_path,
-                        row,
-                        column,
-                    },
-                    metadata,
-                )
+            .map(|path_with_position| async {
+                let metadata = fs.metadata(&path_with_position.path).await.ok().flatten();
+                (path_with_position, metadata)
             })
             .collect::<FuturesUnordered<_>>();
 
@@ -1018,56 +1045,64 @@ fn possible_open_targets(
     fs: Arc<dyn Fs>,
     workspace: &WeakEntity<Workspace>,
     cwd: &Option<PathBuf>,
-    maybe_path: &String,
-
+    maybe_paths: &MaybePath,
     cx: &mut Context<TerminalView>,
 ) -> Task<Vec<(PathWithPosition, Metadata)>> {
-    let path_position = PathWithPosition::parse_str(maybe_path.as_str());
-    let row = path_position.row;
-    let column = path_position.column;
-    let maybe_path = path_position.path;
+    info!("Terminal: {:?}", maybe_paths);
 
-    let potential_paths = if maybe_path.is_absolute() {
-        HashSet::from_iter([maybe_path])
-    } else if maybe_path.starts_with("~") {
-        maybe_path
-            .strip_prefix("~")
-            .ok()
-            .and_then(|maybe_path| Some(dirs::home_dir()?.join(maybe_path)))
-            .map_or_else(HashSet::default, |p| HashSet::from_iter([p]))
-    } else {
-        let mut potential_cwd_and_workspace_paths = HashSet::default();
-        if let Some(cwd) = cwd {
-            let abs_path = Path::join(cwd, &maybe_path);
-            potential_cwd_and_workspace_paths.insert(abs_path);
-        }
-        if let Some(workspace) = workspace.upgrade() {
-            workspace.update(cx, |workspace, cx| {
-                for potential_worktree_path in workspace
-                    .worktrees(cx)
-                    .map(|worktree| worktree.read(cx).abs_path().join(&maybe_path))
-                {
-                    potential_cwd_and_workspace_paths.insert(potential_worktree_path);
-                }
+    // TOOD termain.path_hyperlink_navigation = Default, Advanced, Exhaustive
+    let _enhanced_terminal_path_hyperlinks =
+        TerminalSettings::get_global(cx).enable_enhanced_path_hyperlinks;
+    let maybe_paths_variations = maybe_paths.compute_maybe_paths_variations();
+    let mut canonical_worktree_paths =
+        HashMap::<Arc<Path>, Vec<(Box<Path>, Option<LineColumn>)>>::new();
 
-                for prefix in GIT_DIFF_PATH_PREFIXES {
-                    let prefix_str = &prefix.to_string();
-                    if maybe_path.starts_with(prefix_str) {
-                        let stripped = maybe_path.strip_prefix(prefix_str).unwrap_or(&maybe_path);
-                        for potential_worktree_path in workspace
-                            .worktrees(cx)
-                            .map(|worktree| worktree.read(cx).abs_path().join(&stripped))
-                        {
-                            potential_cwd_and_workspace_paths.insert(potential_worktree_path);
+    // The only work we can not do in the background is read the worktrees, if any.
+    // When we get a hit, do the minimal amount of work here for the hit as well, the
+    // rest can be done in the background.
+    if let Some(workspace) = workspace.upgrade() {
+        canonical_worktree_paths = workspace.update(cx, |workspace, cx| {
+            workspace
+                .worktrees(cx)
+                .map(|worktree| {
+                    let worktree = worktree.read(cx);
+                    (worktree.abs_path(), {
+                        info!(
+                            "Terminal: Checking {:?} for MaybePath variations",
+                            worktree.abs_path()
+                        );
+                        let mut entry_paths = Vec::new();
+                        for maybe_path_variations in &maybe_paths_variations {
+                            for (maybe_path, position) in
+                                maybe_path_variations.variations(maybe_paths)
+                            {
+                                if maybe_path.is_relative() {
+                                    if let Some(Entry {
+                                        canonical_path: Some(canonical_path),
+                                        ..
+                                    }) = worktree.entry_for_path(&maybe_path)
+                                    {
+                                        info!("Terminal: Matched MaybePath {:?}", canonical_path);
+                                        entry_paths.push((canonical_path.clone(), position))
+                                    }
+                                }
+                            }
                         }
-                    }
-                }
-            });
-        }
-        potential_cwd_and_workspace_paths
-    };
+                        entry_paths
+                    })
+                })
+                .collect()
+        });
+    }
 
-    possible_open_paths_metadata(fs, row, column, potential_paths, cx)
+    possible_open_paths_metadata(
+        fs,
+        cwd.clone(),
+        maybe_paths.clone(),
+        maybe_paths_variations,
+        canonical_worktree_paths,
+        cx,
+    )
 }
 
 fn regex_to_literal(regex: &str) -> String {
