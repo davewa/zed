@@ -17,7 +17,9 @@ use persistence::TERMINAL_DB;
 use project::Entry;
 use project::{search::SearchQuery, terminals::TerminalKind, Fs, Metadata, Project};
 use schemars::JsonSchema;
-use terminal::terminal_path_hyperlinks::{LineColumn, MaybePathVariations, MaybePath};
+use terminal::terminal_path_hyperlinks::{
+    MaybePath, MaybePathMode, MaybePathVariations, RowColumn,
+};
 use terminal::{
     alacritty_terminal::{
         index::Point,
@@ -129,6 +131,7 @@ pub struct TerminalView {
     scrollbar_state: ScrollbarState,
     scroll_handle: TerminalScrollHandle,
     show_scrollbar: bool,
+    home_dir: Option<PathBuf>,
     hide_scrollbar_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
@@ -211,6 +214,7 @@ impl TerminalView {
             scrollbar_state: ScrollbarState::new(scroll_handle.clone()),
             scroll_handle,
             show_scrollbar: !Self::should_autohide_scrollbar(cx),
+            home_dir: dirs::home_dir(),
             hide_scrollbar_task: None,
             _subscriptions: vec![
                 focus_in,
@@ -855,11 +859,13 @@ fn subscribe_for_terminal_events(
                         if let Ok(fs) = workspace.update(cx, |workspace, cx| {
                             workspace.project().read(cx).fs().clone()
                         }) {
+                            let home_dir = this.home_dir.clone();
                             let valid_files_to_open_task = possible_open_targets(
                                 fs,
                                 &workspace,
+                                home_dir,
                                 &path_like_target.terminal_dir,
-                                &path_like_target.maybe_paths,
+                                &path_like_target.maybe_path,
                                 cx,
                             );
                             !smol::block_on(valid_files_to_open_task).is_empty()
@@ -891,14 +897,16 @@ fn subscribe_for_terminal_events(
                     };
 
                     let path_like_target = path_like_target.clone();
+                    let home_dir = this.home_dir.clone();
                     cx.spawn_in(window, |terminal_view, mut cx| async move {
                         let valid_files_to_open = terminal_view
                             .update(&mut cx, |_, cx| {
                                 possible_open_targets(
                                     fs,
                                     &task_workspace,
+                                    home_dir,
                                     &path_like_target.terminal_dir,
-                                    &path_like_target.maybe_paths,
+                                    &path_like_target.maybe_path,
                                     cx,
                                 )
                             })?
@@ -975,22 +983,22 @@ fn subscribe_for_terminal_events(
 
 fn possible_open_paths_metadata(
     fs: Arc<dyn Fs>,
+    home_dir: Option<PathBuf>,
     cwd: Option<PathBuf>,
-    maybe_paths: MaybePath,
+    maybe_path: MaybePath,
     maybe_paths_variations: Vec<MaybePathVariations>,
-    canonical_worktree_path_sets: HashMap<Arc<Path>, Vec<(Box<Path>, Option<LineColumn>)>>,
+    canonical_worktree_path_sets: HashMap<Arc<Path>, Vec<(Box<Path>, Option<RowColumn>)>>,
     cx: &mut Context<TerminalView>,
 ) -> Task<Vec<(PathWithPosition, Metadata)>> {
     cx.background_spawn(async move {
         let mut paths_with_metadata = Vec::new();
 
         // TODO(davewa): Better capacity calculation...
-        let mut canonical_paths =
-            HashSet::<PathWithPosition>::with_capacity(canonical_worktree_path_sets.len());
+        let mut canonical_paths = HashSet::<PathWithPosition>::from_iter([]);
 
-        let mut insert_canonical = |canonical: PathBuf, position: Option<LineColumn>| {
+        let mut insert_canonical = |canonical: PathBuf, position: Option<RowColumn>| {
             let (row, column) = if let Some(ref position) = position {
-                (Some(position.line), position.column)
+                (Some(position.row), position.column)
             } else {
                 (None, None)
             };
@@ -1010,11 +1018,9 @@ fn possible_open_paths_metadata(
             }
         }
 
-        // TODO(davewa): Do this less often...
-        let home_dir = dirs::home_dir();
         for maybe_path_variations in &maybe_paths_variations {
             for (absolute, position) in
-                maybe_path_variations.absolutized_variations(&maybe_paths, &cwd, &home_dir)
+                maybe_path_variations.absolutized_variations(&maybe_path, &cwd, &home_dir)
             {
                 info!("Terminal: MaybePath absolutized variation: {:?}", absolute);
                 if let Ok(canonical) = fs.canonicalize(&absolute).await {
@@ -1044,18 +1050,15 @@ fn possible_open_paths_metadata(
 fn possible_open_targets(
     fs: Arc<dyn Fs>,
     workspace: &WeakEntity<Workspace>,
+    home_dir: Option<PathBuf>,
     cwd: &Option<PathBuf>,
-    maybe_paths: &MaybePath,
+    maybe_path: &MaybePath,
     cx: &mut Context<TerminalView>,
 ) -> Task<Vec<(PathWithPosition, Metadata)>> {
-    info!("Terminal: {:?}", maybe_paths);
-
-    // TOOD termain.path_hyperlink_navigation = Default, Advanced, Exhaustive
-    let _enhanced_terminal_path_hyperlinks =
-        TerminalSettings::get_global(cx).enable_enhanced_path_hyperlinks;
-    let maybe_paths_variations = maybe_paths.compute_maybe_paths_variations();
+    info!("Terminal: {:?}", maybe_path);
+    let maybe_paths_variations = maybe_path.compute_maybe_path_variations(MaybePathMode::Advanced);
     let mut canonical_worktree_paths =
-        HashMap::<Arc<Path>, Vec<(Box<Path>, Option<LineColumn>)>>::new();
+        HashMap::<Arc<Path>, Vec<(Box<Path>, Option<RowColumn>)>>::from_iter([]);
 
     // The only work we can not do in the background is read the worktrees, if any.
     // When we get a hit, do the minimal amount of work here for the hit as well, the
@@ -1074,7 +1077,7 @@ fn possible_open_targets(
                         let mut entry_paths = Vec::new();
                         for maybe_path_variations in &maybe_paths_variations {
                             for (maybe_path, position) in
-                                maybe_path_variations.variations(maybe_paths)
+                                maybe_path_variations.variations(maybe_path)
                             {
                                 if maybe_path.is_relative() {
                                     if let Some(Entry {
@@ -1097,8 +1100,9 @@ fn possible_open_targets(
 
     possible_open_paths_metadata(
         fs,
+        home_dir,
         cwd.clone(),
-        maybe_paths.clone(),
+        maybe_path.clone(),
         maybe_paths_variations,
         canonical_worktree_paths,
         cx,

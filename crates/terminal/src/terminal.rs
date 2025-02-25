@@ -44,8 +44,8 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use smol::channel::{Receiver, Sender};
 use task::{HideStrategy, Shell, TaskId};
-use terminal_path_hyperlinks::{MaybePath, MaybePathMode};
-use terminal_settings::{AlternateScroll, CursorShape, TerminalSettings};
+use terminal_path_hyperlinks::MaybePath;
+use terminal_settings::{AlternateScroll, CursorShape, PathHyperlinkNavigation, TerminalSettings};
 use theme::{ActiveTheme, Theme};
 use util::{paths::home_dir, truncate_and_trailoff};
 
@@ -118,7 +118,7 @@ pub struct PathLikeTarget {
     /// File system path, absolute or relative, existing or not.
     /// Might have line and column number(s) attached as `file.rs:1:23`
     /// or `file.rs(1,23)`
-    pub maybe_paths: MaybePath,
+    pub maybe_path: MaybePath,
     /// Current working directory of the terminal
     pub terminal_dir: Option<PathBuf>,
 }
@@ -750,10 +750,18 @@ impl Terminal {
         term: &mut Term<ZedListener>,
         word_match: &Match,
         cx: &mut Context<Self>,
-    ) -> MaybePath {
-        let maybe_path = term.bounds_to_string(*word_match.start(), *word_match.end());
-        if !TerminalSettings::get_global(cx).enable_enhanced_path_hyperlinks {
-            return MaybePath::new(maybe_path, MaybePathMode::Default);
+    ) -> Option<MaybePath> {
+        let path_hyperlink_navigation = TerminalSettings::get_global(cx).path_hyperlink_navigation;
+        if path_hyperlink_navigation == PathHyperlinkNavigation::None {
+            return None;
+        }
+
+        let maybe_path_word = term.bounds_to_string(*word_match.start(), *word_match.end());
+        if path_hyperlink_navigation == PathHyperlinkNavigation::Word {
+            return Some(MaybePath::from_word(
+                maybe_path_word,
+                path_hyperlink_navigation,
+            ));
         }
 
         let line_start = term.line_search_left(*word_match.start());
@@ -761,17 +769,18 @@ impl Terminal {
         let mut maybe_path_line =
             term.bounds_to_string(line_start, word_match.start().sub(term, Boundary::Grid, 1));
         let match_start_offset = maybe_path_line.len();
-        maybe_path_line.push_str(&maybe_path);
+        maybe_path_line.push_str(&maybe_path_word);
         let match_end_offset = maybe_path_line.len();
         let line_end = term.line_search_right(*word_match.end());
         // TODO(davewa): Test if line_end == word_match.end()
         maybe_path_line.push_str(
             &term.bounds_to_string(word_match.end().add(term, Boundary::Grid, 1), line_end),
         );
-        MaybePath::new(
+        Some(MaybePath::from_line(
             maybe_path_line,
-            MaybePathMode::Advanced(match_start_offset..match_end_offset),
-        )
+            match_start_offset..match_end_offset,
+            path_hyperlink_navigation,
+        ))
     }
 
     fn process_terminal_event(
@@ -960,39 +969,50 @@ impl Terminal {
                     let url = term.bounds_to_string(*url_match.start(), *url_match.end());
                     Some((url, true, url_match, None))
                 } else if let Some(word_match) = regex_match_at(term, point, &mut self.word_regex) {
-                    let maybe_paths = self.maybe_path_from_word_match(term, &word_match, cx);
-                    Some((
-                        maybe_paths.maybe_path_word().to_string(),
-                        false,
-                        word_match,
-                        Some(maybe_paths),
-                    ))
+                    self.maybe_path_from_word_match(term, &word_match, cx)
+                        .map(|maybe_path| {
+                            (
+                                maybe_path.cursor_word().to_string(),
+                                false,
+                                word_match,
+                                Some(maybe_path),
+                            )
+                        })
                 } else {
                     None
                 };
 
                 match found_word {
-                    Some((maybe_url_or_path, is_url, url_match, maybe_paths)) => {
+                    Some((maybe_url_or_path, is_url, url_match, maybe_path)) => {
                         let target = if is_url {
                             // Treat "file://" URLs like file paths to ensure
                             // that line numbers at the end of the path are
                             // handled correctly
-                            if let Some(path) = maybe_url_or_path.strip_prefix("file://") {
-                                MaybeNavigationTarget::PathLike(PathLikeTarget {
-                                    maybe_paths: MaybePath::new(
-                                        path.to_string(),
-                                        // Never use enhanced for file URLs
-                                        MaybePathMode::Default,
-                                    ),
-                                    terminal_dir: self.working_directory(),
-                                })
+                            let path_hyperlink_navigation =
+                                TerminalSettings::get_global(cx).path_hyperlink_navigation;
+                            if let Some(file_url_as_path) =
+                                if path_hyperlink_navigation != PathHyperlinkNavigation::None {
+                                    None
+                                } else {
+                                    maybe_url_or_path.strip_prefix("file://")
+                                }
+                            {
+                                {
+                                    MaybeNavigationTarget::PathLike(PathLikeTarget {
+                                        maybe_path: MaybePath::from_word(
+                                            file_url_as_path.to_string(),
+                                            path_hyperlink_navigation,
+                                        ),
+                                        terminal_dir: self.working_directory(),
+                                    })
+                                }
                             } else {
                                 MaybeNavigationTarget::Url(maybe_url_or_path.clone())
                             }
                         } else {
                             MaybeNavigationTarget::PathLike(PathLikeTarget {
-                                maybe_paths: maybe_paths
-                                    .expect("File matches must have a MaybePath"),
+                                maybe_path: maybe_path
+                                    .expect("PathLike matches must have a MaybePath"),
                                 terminal_dir: self.working_directory(),
                             })
                         };

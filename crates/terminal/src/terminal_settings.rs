@@ -24,6 +24,33 @@ pub struct Toolbar {
     pub breadcrumbs: bool,
 }
 
+#[derive(
+    Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PathHyperlinkNavigation {
+    /// This disables all path hyperlink navigation in the terminal.
+    None,
+    /// Path hyperlink for the word under the cursor for hover and Cmd-click.
+    /// - Common surrounding symbols are stripped, e.g., `"`,`'`, `[`, `]`, `(`, `)`
+    /// - Line and column suffixes, e.g. `foo.rs:4:2`, `foo.rs(4,2)`
+    /// - Relative paths resolve against all open worktree roots and `CWD`
+    /// - _Linux and macOS only_ : `~/` prefix resolves to `$HOME`
+    /// - `git diff` prefixes, e.g., `a/foo.rs`
+    Word,
+    /// Advanced path hyperlink support. All of [Default](PathHyperlinkNavigation::Default),
+    /// plus common paths with spaces scenarios
+    /// - Path with spaces at the end of a line
+    /// - Path with spaces has common surrounding symbols
+    /// - Path with only interior spaces, i.e., no spaces in the first or last components
+    Advanced,
+    /// Exhaustive path hyperlink support. All of [Advanced](PathHyperlinkNavigation::Advanced),
+    /// plus less common paths with spaces scenarios
+    /// - Any contiguous sequence of words on a line which resolve to path with spaces
+    /// (must contain the hovered Cmd-clicked word)
+    Exhaustive,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct TerminalSettings {
     pub shell: Shell,
@@ -48,8 +75,8 @@ pub struct TerminalSettings {
     pub max_scroll_history_lines: Option<usize>,
     pub toolbar: Toolbar,
     pub scrollbar: ScrollbarSettings,
-    pub enable_enhanced_path_hyperlinks: bool,
-    pub enhanced_path_hyperlink_timeout: usize,
+    pub path_hyperlink_navigation: PathHyperlinkNavigation,
+    pub path_hyperlink_timeout: usize,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -225,17 +252,12 @@ pub struct TerminalSettingsContent {
     pub toolbar: Option<ToolbarContent>,
     /// Scrollbar-related settings
     pub scrollbar: Option<ScrollbarSettingsContent>,
-    /// Enables enhanced path hyperlink support. This enables hover and cmd-click navigation
-    /// for paths containing spaces.
-    ///
-    /// Default: false
-    // TODO(davewa): Default, Advanced, Exhaustive
-    pub enable_enhanced_path_hyperlinks: Option<bool>,
-    /// Timeout for enhanced path hyperlink support in milliseconds.
-    /// This limits the maximum time to search for an enhanced path hyperlink.
+    pub path_hyperlink_navigation: Option<PathHyperlinkNavigation>,
+    /// Timeout for path hyperlink navigation in milliseconds.
+    /// This limits the maximum time to search for path hyperlink navigation targets.
     ///
     /// Default: 250
-    pub enhanced_path_hyperlink_timeout: Option<usize>,
+    pub path_hyperlink_timeout: Option<usize>,
 }
 
 impl settings::Settings for TerminalSettings {

@@ -13,12 +13,14 @@ use std::{
 use log::info;
 use util::{paths::PathWithPosition, TakeUntilExt};
 
+use crate::terminal_settings::PathHyperlinkNavigation;
+
 // TODO(davewa): `file:` IRIs
 /// `file:` IRIs are treated as local paths
 const _FILE_IRI_PREFIX: &str = "file:";
 
 /// These are valid in paths and are not matched by [WORD_REGEX](terminal::WORD_REGEX).
-/// We use them to find potential path words with a path line.
+/// We use them to find potential path words within a line.
 ///
 /// - **`\u{c}`** is **`\f`** (form feed - new page)
 /// - **`\u{b}`** is **`\v`** (vertical tab)
@@ -27,54 +29,79 @@ const _FILE_IRI_PREFIX: &str = "file:";
 const PATH_WHITESPACE_CHARS: &str = "\t\u{c}\u{b} ";
 
 #[derive(Clone, Debug)]
-pub enum MaybePathMode {
-    Default,
-    Advanced(Range<usize>),
-    Exhaustive(Range<usize>),
+pub struct MaybePath {
+    /// The terminal word or line containing maybe_path.
+    text: String,
+    /// Iff `text` is a line, the range of the hovered or Cmd-clicked word within the line
+    word: Option<Range<usize>>,
+    path_hyperlik_navigation: PathHyperlinkNavigation,
 }
 
-#[derive(Clone, Debug)]
-pub struct MaybePath {
-    /// The terminal text containing maybe_paths.
-    pub(self) line: String,
-    /// From `terminal.enable_enhanced_path_hyperlinks` setting.
-    pub(self) mode: MaybePathMode,
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub enum MaybePathMode {
+    Word,
+    Advanced,
+    Exhaustive,
 }
 
 impl MaybePath {
-    pub fn new(line: String, mode: MaybePathMode) -> MaybePath {
-        MaybePath { line, mode }
-    }
-
-    pub fn range(&self) -> Range<usize> {
-        match &self.mode {
-            MaybePathMode::Default => 0..self.line.len(),
-            MaybePathMode::Advanced(range) | MaybePathMode::Exhaustive(range) => range.clone(),
+    pub fn from_word(word: String, path_hyperlik_navigation: PathHyperlinkNavigation) -> MaybePath {
+        MaybePath {
+            text: word,
+            word: None,
+            path_hyperlik_navigation,
         }
     }
 
-    pub fn maybe_path_word(&self) -> &str {
-        &self.line[self.range()]
+    pub fn from_line(
+        text: String,
+        word: Range<usize>,
+        path_hyperlik_navigation: PathHyperlinkNavigation,
+    ) -> MaybePath {
+        MaybePath {
+            text,
+            word: Some(word),
+            path_hyperlik_navigation,
+        }
     }
 
-    pub fn enhanced_maybe_path(&self, range: &Range<usize>) -> &str {
-        &self.line[range.clone()]
+    fn range(&self) -> Range<usize> {
+        if let Some(word) = &self.word {
+            word.clone()
+        } else {
+            0..self.text.len()
+        }
     }
 
-    /// Computes all the possible paths in `line`,
-    pub fn compute_maybe_paths_variations(&self) -> Vec<MaybePathVariations> {
-        let mut maybe_paths_variations =
-            vec![MaybePathVariations::new(&self.line, self.range().clone())];
+    pub fn cursor_word(&self) -> &str {
+        &self.text[self.range()]
+    }
 
-        if let MaybePathMode::Advanced(_range) | MaybePathMode::Exhaustive(_range) = &self.mode {
+    pub fn word_at(&self, range: &Range<usize>) -> &str {
+        &self.text[range.clone()]
+    }
+
+    /// Computes all the possible paths in `self.text`,
+    pub fn compute_maybe_path_variations(
+        &self,
+        maybe_path_mode: MaybePathMode,
+    ) -> Vec<MaybePathVariations> {
+        let mut maybe_path_variations =
+            vec![MaybePathVariations::new(&self.text, self.range().clone())];
+
+        if maybe_path_mode > MaybePathMode::Word
+            && self.path_hyperlik_navigation > PathHyperlinkNavigation::Word
+        {
             if let Some(expanded) = self.expanded_maybe_path() {
-                maybe_paths_variations.push(MaybePathVariations::new(&self.line, expanded));
+                maybe_path_variations.push(MaybePathVariations::new(&self.text, expanded));
             }
 
             // TODO(davewa): Advanced expanded_outer_common_surrounding_symbols
         }
 
-        if let MaybePathMode::Exhaustive(_range) = &self.mode {
+        if maybe_path_mode > MaybePathMode::Advanced
+            && self.path_hyperlik_navigation > PathHyperlinkNavigation::Advanced
+        {
             // TODO(davewa): Exhaustive
 
             // /// Looks for a path under `cursor`
@@ -158,12 +185,12 @@ impl MaybePath {
             // }
         }
 
-        maybe_paths_variations
+        maybe_path_variations
     }
 
-    /// Expands the `range` within `line` to the longest potential path.
-    /// The start is expanded to the start of the first word in line which contains a path separator.
-    /// The and is expanded to the end of the last word which contains a path separator.
+    /// Expands the `word` within `text` to the longest potential path.
+    /// The start is expanded to the start of the first word in `text` which contains a path separator.
+    /// The and is expanded to the end of the last word in `text` which contains a path separator.
     ///
     /// # Example
     ///
@@ -174,17 +201,17 @@ impl MaybePath {
     /// _after:_ this **is\ an example\of how\this** works
     fn expanded_maybe_path(&self) -> Option<Range<usize>> {
         let mut range = self.range();
-        if let Some(first_separator) = self.line.find(MAIN_SEPARATOR) {
+        if let Some(first_separator) = self.text.find(MAIN_SEPARATOR) {
             if first_separator < range.start {
                 let word_start = first_separator
-                    - self.line[..first_separator]
+                    - self.text[..first_separator]
                         .chars()
                         .rev()
                         .take_until(|&c| PATH_WHITESPACE_CHARS.contains(c))
                         .count();
 
                 if word_start == 0 {
-                    // We stopped at the start of the line, that is the word_start.
+                    // We stopped at the start of the text, that is the word_start.
                     range.start = word_start;
                 } else {
                     // We stopped at a whitespace character, advance by 1
@@ -193,20 +220,20 @@ impl MaybePath {
 
                 info!(
                     "Terminal: Expanded maybe path left: {}",
-                    self.enhanced_maybe_path(&range)
+                    self.word_at(&range)
                 );
             }
         }
 
-        if let Some(last_separator) = self.line.rfind(MAIN_SEPARATOR) {
+        if let Some(last_separator) = self.text.rfind(MAIN_SEPARATOR) {
             if last_separator >= range.end {
-                let word_end = self.line[last_separator..]
+                let word_end = self.text[last_separator..]
                     .find(PATH_WHITESPACE_CHARS)
-                    .unwrap_or(self.line.len());
+                    .unwrap_or(self.text.len());
                 range.end = word_end;
                 info!(
                     "Terminal: Expanded maybe path right: {}",
-                    self.enhanced_maybe_path(&range)
+                    self.word_at(&range)
                 );
             }
         }
@@ -221,31 +248,32 @@ impl MaybePath {
 
 impl Display for MaybePath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.mode {
-            MaybePathMode::Default => formatter.write_fmt(format_args!("{:?}", self)),
-            _ => formatter.write_fmt(format_args!("{:?} «{}»", self, self.maybe_path_word())),
+        if self.word.is_some() {
+            formatter.write_fmt(format_args!("{:?} «{}»", self, self.cursor_word()))
+        } else {
+            formatter.write_fmt(format_args!("{:?}", self))
         }
     }
 }
 
 // TODO(davewa): Why do these need Eq, PartialEq? ANSWER: Test asserts. Maybe only for cfg!(test)?
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LineColumn {
-    pub line: u32,
+pub struct RowColumn {
+    pub row: u32,
     pub column: Option<u32>,
 }
 
 #[derive(Debug)]
 pub struct MaybePathVariations {
     variations: Vec<Range<usize>>,
-    positioned_variation: Option<(Range<usize>, LineColumn)>,
+    positioned_variation: Option<(Range<usize>, RowColumn)>,
 }
 
 impl MaybePathVariations {
-    pub fn new(line: &str, mut range: Range<usize>) -> Self {
+    pub fn new(text: &str, mut range: Range<usize>) -> Self {
         // We add variation longest to shortest
-        let mut maybe_path = &line[range.clone()];
-        let mut positioned_variation = None::<(Range<usize>, LineColumn)>;
+        let mut maybe_path = &text[range.clone()];
+        let mut positioned_variation = None::<(Range<usize>, RowColumn)>;
 
         // Start with full range
         let mut variations = vec![range.clone()];
@@ -266,20 +294,20 @@ impl MaybePathVariations {
             {
                 range = range.start + 1..range.end - 1;
                 variations.push(range.clone());
-                maybe_path = &line[range.clone()];
+                maybe_path = &text[range.clone()];
             }
 
-            // Git diff and line column, mutually exclusive
+            // Git diff and row column, mutually exclusive
             if (maybe_path.starts_with('a') || maybe_path.starts_with('b'))
                 && maybe_path[1..].starts_with(MAIN_SEPARATOR)
             {
                 variations.push(range.start + 2..range.end);
-            } else if let (suffix_start, Some(line), column) =
+            } else if let (suffix_start, Some(row), column) =
                 PathWithPosition::parse_row_column(maybe_path)
             {
                 positioned_variation = Some((
                     range.start..range.end - (maybe_path.len() - suffix_start),
-                    LineColumn { line, column },
+                    RowColumn { row, column },
                 ));
             }
         }
@@ -292,16 +320,16 @@ impl MaybePathVariations {
 
     pub fn variations<'a>(
         &'a self,
-        maybe_paths: &'a MaybePath,
-    ) -> Box<dyn Iterator<Item = (&'a Path, Option<LineColumn>)> + 'a> {
+        maybe_path: &'a MaybePath,
+    ) -> Box<dyn Iterator<Item = (&'a Path, Option<RowColumn>)> + 'a> {
         let variations = self
             .variations
             .iter()
             .cloned()
-            .map(|range| (Path::new(maybe_paths.enhanced_maybe_path(&range)), None));
+            .map(|range| (Path::new(maybe_path.word_at(&range)), None));
         if let Some((ref range, position)) = self.positioned_variation {
             Box::new(variations.chain(iter::once((
-                Path::new(maybe_paths.enhanced_maybe_path(range)),
+                Path::new(maybe_path.word_at(range)),
                 Some(position),
             ))))
         } else {
@@ -310,13 +338,13 @@ impl MaybePathVariations {
     }
 
     fn absolutize<'a>(
-        maybe_paths: &'a MaybePath,
+        maybe_path: &'a MaybePath,
         cwd: &Option<PathBuf>,
         home_dir: &Option<PathBuf>,
         range: &Range<usize>,
-        position: Option<LineColumn>,
-    ) -> Vec<(Cow<'a, Path>, Option<LineColumn>)> {
-        let maybe_path = Path::new(maybe_paths.enhanced_maybe_path(&range));
+        position: Option<RowColumn>,
+    ) -> Vec<(Cow<'a, Path>, Option<RowColumn>)> {
+        let maybe_path = Path::new(maybe_path.word_at(&range));
         let mut absolutized = Vec::new();
         if maybe_path.is_absolute() {
             absolutized.push((Cow::Borrowed(maybe_path), position));
@@ -338,24 +366,20 @@ impl MaybePathVariations {
 
     pub fn absolutized_variations<'a>(
         &'a self,
-        maybe_paths: &'a MaybePath,
+        maybe_path: &'a MaybePath,
         cwd: &Option<PathBuf>,
         home_dir: &Option<PathBuf>,
-    ) -> Vec<(Cow<'a, Path>, Option<LineColumn>)> {
+    ) -> Vec<(Cow<'a, Path>, Option<RowColumn>)> {
         let mut variations = Vec::new();
         for range in &self.variations {
             variations.append(&mut Self::absolutize(
-                maybe_paths,
-                cwd,
-                home_dir,
-                &range,
-                None,
+                maybe_path, cwd, home_dir, &range, None,
             ));
         }
 
         if let Some((ref range, position)) = self.positioned_variation {
             variations.append(&mut Self::absolutize(
-                maybe_paths,
+                maybe_path,
                 cwd,
                 home_dir,
                 range,
@@ -409,14 +433,15 @@ mod tests {
         .map(|str| (Path::new(str), None))
         .collect::<Vec<_>>();
 
-        let maybe_paths = MaybePath::new(line, MaybePathMode::Advanced(path_match.clone()));
-        let maybe_paths_variations = maybe_paths.compute_maybe_paths_variations();
+        let maybe_path = MaybePath::from_line(line, path_match, PathHyperlinkNavigation::Advanced);
+        let maybe_path_variations =
+            maybe_path.compute_maybe_path_variations(MaybePathMode::Advanced);
 
-        let actual = maybe_paths_variations
+        let actual = maybe_path_variations
             .iter()
             .map(|maybe_path_variations| {
                 maybe_path_variations
-                    .variations(&maybe_paths)
+                    .variations(&maybe_path)
                     .collect::<Vec<_>>()
             })
             .flatten();
