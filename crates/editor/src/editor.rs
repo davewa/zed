@@ -132,7 +132,7 @@ pub use multi_buffer::{
 };
 use multi_buffer::{
     ExcerptInfo, ExpandExcerptDirection, MultiBufferDiffHunk, MultiBufferPoint, MultiBufferRow,
-    ToOffsetUtf16,
+    MultiOrSingleBufferOffsetRange, ToOffsetUtf16,
 };
 use project::{
     lsp_store::{CompletionDocumentation, FormatTrigger, LspFormatTarget, OpenLspBufferHandle},
@@ -9371,7 +9371,12 @@ impl Editor {
         self.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
             s.move_cursors_with(|map, head, _| {
                 (
-                    movement::indented_line_beginning(map, head, action.stop_at_soft_wraps),
+                    movement::indented_line_beginning(
+                        map,
+                        head,
+                        action.stop_at_soft_wraps,
+                        action.stop_at_indent,
+                    ),
                     SelectionGoal::None,
                 )
             });
@@ -9387,7 +9392,12 @@ impl Editor {
         self.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
             s.move_heads_with(|map, head, _| {
                 (
-                    movement::indented_line_beginning(map, head, action.stop_at_soft_wraps),
+                    movement::indented_line_beginning(
+                        map,
+                        head,
+                        action.stop_at_soft_wraps,
+                        action.stop_at_indent,
+                    ),
                     SelectionGoal::None,
                 )
             });
@@ -9410,6 +9420,7 @@ impl Editor {
             this.select_to_beginning_of_line(
                 &SelectToBeginningOfLine {
                     stop_at_soft_wraps: false,
+                    stop_at_indent: false,
                 },
                 window,
                 cx,
@@ -10727,7 +10738,10 @@ impl Editor {
                 while let Some((node, containing_range)) = buffer.syntax_ancestor(new_range.clone())
                 {
                     new_node = Some(node);
-                    new_range = containing_range;
+                    new_range = match containing_range {
+                        MultiOrSingleBufferOffsetRange::Single(_) => break,
+                        MultiOrSingleBufferOffsetRange::Multi(range) => range,
+                    };
                     if !display_map.intersects_fold(new_range.start)
                         && !display_map.intersects_fold(new_range.end)
                     {
