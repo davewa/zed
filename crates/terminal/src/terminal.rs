@@ -32,6 +32,7 @@ use futures::{
     FutureExt,
 };
 
+use log::debug;
 use mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
@@ -44,15 +45,16 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use smol::channel::{Receiver, Sender};
 use task::{HideStrategy, Shell, TaskId};
-use terminal_path_hyperlinks::MaybePath;
+use terminal_path_hyperlinks::MatchedMaybePath;
 use terminal_settings::{AlternateScroll, CursorShape, PathHyperlinkNavigation, TerminalSettings};
 use theme::{ActiveTheme, Theme};
+use unicode_segmentation::UnicodeSegmentation;
 use util::{paths::home_dir, truncate_and_trailoff};
 
 use std::{
     cmp::{self, min},
     fmt::Display,
-    ops::{Deref, Index, RangeInclusive},
+    ops::{Deref, Index, Range, RangeInclusive},
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -118,7 +120,7 @@ pub struct PathLikeTarget {
     /// File system path, absolute or relative, existing or not.
     /// Might have line and column number(s) attached as `file.rs:1:23`
     /// or `file.rs(1,23)`
-    pub maybe_path: MaybePath,
+    pub matched_maybe_path: MatchedMaybePath,
     /// Current working directory of the terminal
     pub terminal_dir: Option<PathBuf>,
 }
@@ -745,42 +747,123 @@ impl Terminal {
         self.selection_phase == SelectionPhase::Selecting
     }
 
-    fn maybe_path_from_word_match(
-        &mut self,
+    /// Computes the best hueristic word_match for link highlighting in the terminal.
+    fn best_maybe_path_match(
+        maybe_path: &MatchedMaybePath,
+        term: &mut Term<ZedListener>,
+        word_match: &Match,
+        path_hyperlink_navigation: PathHyperlinkNavigation,
+    ) -> Option<Match> {
+        let expanded_match = |expanded: Range<usize>| {
+            let expand_left = maybe_path
+                .text_at(&(expanded.start..maybe_path.matched_range().start))
+                .graphemes(true)
+                .count();
+
+            let expand_right = if expanded.end > maybe_path.matched_range().end {
+                maybe_path
+                    .text_at(&(maybe_path.matched_range().end..expanded.end))
+                    .graphemes(true)
+                    .count()
+            } else {
+                0
+            };
+
+            word_match.start().sub(term, Boundary::Grid, expand_left)
+                ..=word_match.end().add(term, Boundary::Grid, expand_right)
+        };
+
+        let longest_maybe_path_by_surrounding_symbols = || {
+            if let Some(expanded) = maybe_path.longest_maybe_path_by_surrounding_symbols() {
+                debug!(
+                    "Terminal: Longest surrounding symbols: {:?}",
+                    maybe_path.text_at(&expanded)
+                );
+                let expanded_match = expanded_match(expanded);
+                // Strip surrounding symbols
+                Some(
+                    expanded_match.start().add(term, Boundary::Grid, 1)
+                        ..=expanded_match.end().sub(term, Boundary::Grid, 1),
+                )
+            } else {
+                None
+            }
+        };
+
+        longest_maybe_path_by_surrounding_symbols().or_else(|| {
+            if path_hyperlink_navigation > PathHyperlinkNavigation::Word {
+                if let Some(best_match) = maybe_path.expanded_maybe_path_by_interior_spaces() {
+                    debug!(
+                        "Terminal: Longest interior spaces: {:?}",
+                        maybe_path.text_at(&best_match)
+                    );
+                    Some(expanded_match(best_match))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+    }
+
+    fn path_hyperlink(
         term: &mut Term<ZedListener>,
         word_match: &Match,
         cx: &mut Context<Self>,
-    ) -> Option<MaybePath> {
+    ) -> Option<(
+        String,
+        bool,
+        RangeInclusive<AlacPoint>,
+        Option<MatchedMaybePath>,
+    )> {
         let path_hyperlink_navigation = TerminalSettings::get_global(cx).path_hyperlink_navigation;
         if path_hyperlink_navigation == PathHyperlinkNavigation::None {
             return None;
         }
 
         let maybe_path_word = term.bounds_to_string(*word_match.start(), *word_match.end());
-        if path_hyperlink_navigation == PathHyperlinkNavigation::Word {
-            return Some(MaybePath::from_word(
-                maybe_path_word,
-                path_hyperlink_navigation,
-            ));
-        }
+        let maybe_path = if path_hyperlink_navigation == PathHyperlinkNavigation::Word {
+            MatchedMaybePath::from_word(maybe_path_word)
+        } else {
+            let line_start = term.line_search_left(*word_match.start());
+            let mut line = if line_start == *word_match.start() {
+                String::new()
+            } else {
+                term.bounds_to_string(line_start, word_match.start().sub(term, Boundary::Grid, 1))
+            };
+            let word_start = line.len();
+            line.push_str(&maybe_path_word);
+            let word_end = line.len();
+            let line_end = term.line_search_right(*word_match.end());
+            let remainder = if line_end == *word_match.end() {
+                String::new()
+            } else {
+                term.bounds_to_string(word_match.end().add(term, Boundary::Grid, 1), line_end)
+            };
+            line.push_str(&remainder);
+            MatchedMaybePath::from_line(line, word_start..word_end, path_hyperlink_navigation)
+        };
 
-        let line_start = term.line_search_left(*word_match.start());
-        // TODO(davewa): Test if line_start == word_match.start()
-        let mut maybe_path_line =
-            term.bounds_to_string(line_start, word_match.start().sub(term, Boundary::Grid, 1));
-        let match_start_offset = maybe_path_line.len();
-        maybe_path_line.push_str(&maybe_path_word);
-        let match_end_offset = maybe_path_line.len();
-        let line_end = term.line_search_right(*word_match.end());
-        // TODO(davewa): Test if line_end == word_match.end()
-        maybe_path_line.push_str(
-            &term.bounds_to_string(word_match.end().add(term, Boundary::Grid, 1), line_end),
-        );
-        Some(MaybePath::from_line(
-            maybe_path_line,
-            match_start_offset..match_end_offset,
-            path_hyperlink_navigation,
-        ))
+        if let Some(best_maybe_path_match) =
+            Self::best_maybe_path_match(&maybe_path, term, word_match, path_hyperlink_navigation)
+        {
+            let best_maybe_path =
+                term.bounds_to_string(*best_maybe_path_match.start(), *best_maybe_path_match.end());
+            Some((
+                best_maybe_path,
+                false,
+                best_maybe_path_match,
+                Some(maybe_path),
+            ))
+        } else {
+            Some((
+                maybe_path.matched().to_string(),
+                false,
+                word_match.clone(),
+                Some(maybe_path),
+            ))
+        }
     }
 
     fn process_terminal_event(
@@ -969,21 +1052,13 @@ impl Terminal {
                     let url = term.bounds_to_string(*url_match.start(), *url_match.end());
                     Some((url, true, url_match, None))
                 } else if let Some(word_match) = regex_match_at(term, point, &mut self.word_regex) {
-                    self.maybe_path_from_word_match(term, &word_match, cx)
-                        .map(|maybe_path| {
-                            (
-                                maybe_path.cursor_word().to_string(),
-                                false,
-                                word_match,
-                                Some(maybe_path),
-                            )
-                        })
+                    Self::path_hyperlink(term, &word_match, cx)
                 } else {
                     None
                 };
 
                 match found_word {
-                    Some((maybe_url_or_path, is_url, url_match, maybe_path)) => {
+                    Some((maybe_url_or_path, is_url, url_match, matched_maybe_path)) => {
                         let target = if is_url {
                             // Treat "file://" URLs like file paths to ensure
                             // that line numbers at the end of the path are
@@ -999,9 +1074,8 @@ impl Terminal {
                             {
                                 {
                                     MaybeNavigationTarget::PathLike(PathLikeTarget {
-                                        maybe_path: MaybePath::from_word(
+                                        matched_maybe_path: MatchedMaybePath::from_word(
                                             file_url_as_path.to_string(),
-                                            path_hyperlink_navigation,
                                         ),
                                         terminal_dir: self.working_directory(),
                                     })
@@ -1011,7 +1085,7 @@ impl Terminal {
                             }
                         } else {
                             MaybeNavigationTarget::PathLike(PathLikeTarget {
-                                maybe_path: maybe_path
+                                matched_maybe_path: matched_maybe_path
                                     .expect("PathLike matches must have a MaybePath"),
                                 terminal_dir: self.working_directory(),
                             })

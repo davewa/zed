@@ -13478,6 +13478,7 @@ dependencies = [
  "task",
  "theme",
  "thiserror 1.0.69",
+ "unicode-segmentation",
  "util",
  "windows 0.58.0",
 ]
