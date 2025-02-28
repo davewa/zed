@@ -490,6 +490,7 @@ dependencies = [
  "ui",
  "util",
  "uuid",
+ "vim_mode_setting",
  "workspace",
  "zed_actions",
 ]
@@ -3002,7 +3003,6 @@ dependencies = [
  "collections",
  "gpui",
  "linkme",
- "once_cell",
  "parking_lot",
  "theme",
 ]
