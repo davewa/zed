@@ -8,6 +8,29 @@ use std::{
 
 // TODO(davewa): Change most (all?) info! messages into debug! or trace!
 // TODO(davewa): Some APIs may benefit from HashSet for deduplication?
+// TODO(davewa): Bugs found while testing this feature:
+// - Navigation to line and column navigates to the wrong column when line
+// contains unicode. I suspect it is using char's instead of graphemes.
+// TODO(davewa): Some ideas for further improvements
+//
+// - Support navigation to line in git diff output, e.g. `@@ <line>,<lines> @@`
+// and `+ blah`.
+// --- a/TODO.md
+// +++ b/TODO.md
+// @@ -15,7 +15,7 @@
+//   blah
+// + blah
+//   blah
+//
+// - Support navigation to line in rust diagnostic output, e.g. from the 'gutter'
+//    -->
+// 200 |
+// 201 |
+//     |
+// ... |
+// 400 |
+// 401 |
+//
 
 use log::info;
 use regex::Regex;
@@ -27,14 +50,15 @@ const PATH_WHITESPACE_CHARS: &str = "\t\u{c}\u{b} ";
 const COMMON_PATH_SURROUNDING_SYMBOLS: &[(char, char)] =
     &[('"', '"'), ('\'', '\''), ('[', ']'), ('(', ')')];
 
+/// The original matched maybe path from hover or Cmd-click in the terminal.
 #[derive(Clone, Debug)]
 pub struct MatchedMaybePath {
     /// The terminal hovered or Cmd-clicked word or line containing the word.
     text: String,
     /// Iff `text` is a line, the range of the hovered or Cmd-clicked word within the line,
-    /// the full range of `text` otherwise,
+    /// the full range of `text` otherwise.
     word: Range<usize>,
-    /// The user settings `terminal.path_hyperlink_navigation`, see [PathHyperlinkNavigation].
+    /// The user settings `terminal.path_hyperlink_navigation`.
     path_hyperlink_navigation: PathHyperlinkNavigation,
 }
 
@@ -259,6 +283,8 @@ pub struct RowColumn {
     pub column: Option<u32>,
 }
 
+/// Like [PathWithPosition], but doesn't require an allocation, and models row and column
+/// restrictions directly (cannot have a column without a row).
 #[derive(Clone, Debug)]
 #[cfg_attr(test, derive(Eq, PartialEq))]
 pub struct MaybePathWithPosition<'a> {
@@ -272,10 +298,27 @@ impl<'a> MaybePathWithPosition<'a> {
     }
 }
 
-/// Contains well defined sub range variations of a MaybePath
-/// - Line and column suffix
-/// - Stripped common surrounding symbols
-/// - Git diff prefxes
+/// Contains well defined substring variations of a MaybePath
+/// - With and without stripped common surrounding symbols: `"` `'` `(` `)` `[` `]`
+/// - With and without line and column suffix: `:4:2` or `(4,2)`
+/// - With and without git diff prefixes: `a/` or `b/`
+///
+/// # Notes
+/// - Surrounding symbols (if any) are stripped before processing the other variations
+/// - Git diff prefixes are only processed if surrounding symbols are not present
+/// - Row and column are never process on a git diff variation
+///
+/// # Examples
+///
+/// | **original**         | **stripped**       | **git diff**     | **row column**                            |
+/// |----------------------|--------------------|------------------|-------------------------------------------|
+/// | [a/some/path.rs]:4:2 |                    |                  | [a/some/path.rs]<br>*row = 4, column = 2* |
+/// | [a/some/path.rs:4:2] | a/some/path.rs:4:2 |                  | a/some/path.rs<br>*row = 4, column = 2*   |
+/// | a/some/path.rs:4:2   |                    | some/path.rs:4:2 | a/some/path.rs<br>*row = 4, column = 2*   |
+///
+// TODO(davewa): Ideas for improvements
+// - In Advance and Exhaustive, only match git diff if line starts with "+++ a/" and treat the whole line as the path.
+//
 #[derive(Debug)]
 pub struct MaybePath {
     variations: Vec<Range<usize>>,
@@ -288,6 +331,7 @@ impl MaybePath {
         // We add variation longest to shortest
         let mut maybe_path = &text[path.clone()];
         let mut positioned_variation = None::<(Range<usize>, RowColumn)>;
+        let mut common_symbols_stripped = false;
         let mut absolutize_home_dir = true;
 
         // Start with full range
@@ -304,20 +348,34 @@ impl MaybePath {
                 .take(1)
                 .count()
             {
+                common_symbols_stripped = true;
                 path = path.start + 1..path.end - 1;
                 variations.push(path.clone());
                 maybe_path = &text[path.clone()];
             }
 
-            // Git diff and row column, mutually exclusive
-            if (maybe_path.starts_with('a') || maybe_path.starts_with('b'))
+            // Git diff--only if we did not strip common symbols
+            if !common_symbols_stripped
+                && (maybe_path.starts_with('a') || maybe_path.starts_with('b'))
                 && maybe_path[1..].starts_with(MAIN_SEPARATOR)
             {
                 absolutize_home_dir = false;
                 variations.push(path.start + 2..path.end);
-            } else if let (suffix_start, Some(row), column) =
+                // Note: we do not update maybe_path here because row and column
+                // should be processed with the git diff prefixes included, e.g.
+                // `a/some/path:4:2` is never interpreted as `some/path`, row = 4, column = 2
+                // because git diff never adds a row and column suffix
+            }
+
+            // Row and column parsing
+            if let (suffix_start, Some(row), column) =
                 PathWithPosition::parse_row_column(maybe_path)
             {
+                // TODO(davewa): `PathWithPosition::parse_row_column` just uses a regex search
+                // from the start of the path. Since we are only interested in two simple to parse
+                // suffixes, it seems like a custom parser for those would be better. Or, at least
+                // use regex-automata directly to do a reverse match from the end of the path, the
+                // custom parsers would be simple and efficient here.
                 positioned_variation = Some((
                     path.start..path.end - (maybe_path.len() - suffix_start),
                     RowColumn { row, column },
@@ -513,68 +571,70 @@ mod tests {
             expected![
                 relative![
                     "+++";
-                    "+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "+++ a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 absolutized![
                     "/Some/cool/place/+++";
-                    "/Some/cool/place/+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/+++ a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 relative![
                     "a/~/hello";
                     "~/hello";
-                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 absolutized![
                     "/Some/cool/place/a/~/hello";
                     "/Some/cool/place/~/hello";
-                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 relative![
                     "~/super/cool";
-                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 absolutized![
                     "/Some/cool/place/~/super/cool";
                     "/Usors/uzer/super/cool";
-                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 relative![
+                    "b/path:4:2";
                     "path:4:2";
-                    "path", 4, 2;
-                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "b/path", 4, 2;
+                    "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 absolutized![
+                    "/Some/cool/place/b/path:4:2";
                     "/Some/cool/place/path:4:2";
-                    "/Some/cool/place/path", 4, 2;
-                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/b/path", 4, 2;
+                    "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 relative![
                     "(/root";
-                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 absolutized![
                     "/Some/cool/place/(/root";
                     "/root 2/three.txt";
-                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 relative![
                     "2/three.txt)";
-                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ],
                 absolutized![
                     "/Some/cool/place/2/three.txt)";
                     "/root 2/three.txt";
-                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
                 ]
             ],
         )]);
@@ -582,7 +642,7 @@ mod tests {
         test_line_maybe_paths(
             cx,
             &mut trees,
-            "+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+            "+++ a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)",
             &expected,
         )
         .await
@@ -605,8 +665,6 @@ mod tests {
         actual: &Vec<MaybePathWithPosition<'a>>,
         expected: &Vec<MaybePathWithPosition<'a>>,
     ) {
-        assert_eq!(actual.len(), expected.len(), "{:#?}", actual);
-
         let errors: Vec<_> = actual
             .iter()
             .zip(expected.iter())
@@ -617,7 +675,7 @@ mod tests {
             })
             .collect();
 
-        if !errors.is_empty() {
+        if actual.len() != expected.len() || !errors.is_empty() {
             println!("Actual:");
             println!("{:#?}", actual);
             println!("Expected:");
