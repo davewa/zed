@@ -4,11 +4,14 @@ use std::{
     ops::Range,
     path::{Path, PathBuf, MAIN_SEPARATOR},
     str,
+    sync::LazyLock,
 };
 
 // TODO(davewa): Change most (all?) info! messages into debug! or trace!
+// TODO(davewa): Some APIs may benefit from HashSet for deduplication?
 
 use log::info;
+use regex::Regex;
 use util::{paths::PathWithPosition, TakeUntilExt};
 
 use crate::terminal_settings::PathHyperlinkNavigation;
@@ -69,7 +72,6 @@ impl MatchedMaybePath {
     }
 
     /// All possible word and advanced paths
-    /// TODO(davewa): `-> HashSet<MaybePathWithPosition>`
     pub fn maybe_paths(&self) -> Vec<MaybePath> {
         let mut maybe_paths = Vec::new();
         maybe_paths.push(MaybePath::new(&self.text, self.word.clone()));
@@ -92,99 +94,46 @@ impl MatchedMaybePath {
         maybe_paths
     }
 
-    /// All possible exhaustive paths
-    /// TODO(davewa): `-> HashSet<MaybePathWithPosition>`
-    pub fn exhaustive_maybe_paths(&self) -> Vec<MaybePath> {
-        let maybe_path_variations = Vec::new();
+    /// Returns all maybe paths that match the `terminal.path_hyperlink_navigation_regexes` list of path regexes.
+    /// # Notes
+    /// The top level here is an iterator so that we can check for timeout.
+    // TOOD: This is just an stub to show where path regex user settings would go if we decided to support that.
+    pub fn regex_maybe_paths(&self) -> Vec<impl IntoIterator<Item = MaybePath> + '_> {
+        // TODO(davewa): Some way to assert we are not called on the main thread...
+        info!("Terminal: MaybePaths settings path regexes");
+        Vec::<Vec<MaybePath>>::new()
+    }
 
-        // TODO: Some way to assert we are not called on the main thread...
-        if self.path_hyperlink_navigation < PathHyperlinkNavigation::Exhaustive {
-            return maybe_path_variations;
-        }
+    /// Returns all maybe paths that start on `self.matched` or a word before it and end `self.matched` or a word after it.
+    ///
+    /// # Notes
+    /// The top level here is an iterator so that we can check for timeout.
+    pub fn exhaustive_maybe_paths(&self) -> Vec<impl Iterator<Item = MaybePath> + '_> {
+        // TODO(davewa): Some way to assert we are not called on the main thread...
+        info!("Terminal: MaybePaths exhaustive");
 
-        // TODO(davewa): Exhaustive
+        static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(super::WORD_REGEX).unwrap());
 
-        // /// Looks for a path under `cursor`
-        // // Note: Does not handle paths that start or end in space(s) or that do not start
-        // // or end on a word match boundary--except for those ending with a line and column
-        // // TODO: paths with surrounding ' " ( ) [ ]
-        // // Note: Once we handle the surrounding delimiter cases, paths that start or end in
-        // // space(s) _will_ be handled.
-        // fn find_path_hyperlink(
-        //     &mut self,
-        //     term: &mut Term<ZedListener>,
-        //     cursor: AlacPoint,
-        // ) -> Option<RangeInclusive<AlacPoint>> {
-        //     let line_start = term.line_search_left(cursor);
-        //     let line_end = term.line_search_right(cursor);
+        let starts: Vec<_> = WORD_RE
+            .find_iter(
+                if self.path_hyperlink_navigation == PathHyperlinkNavigation::Exhaustive {
+                    &self.text[..self.word.end]
+                } else {
+                    ""
+                },
+            )
+            .map(|match_| match_.start())
+            .collect();
 
-        //     let line_words = RegexIter::new(
-        //         line_start,
-        //         line_end,
-        //         AlacDirection::Right,
-        //         term,
-        //         &mut self.word_regex,
-        //     )
-        //     .into_iter()
-        //     .collect::<Vec<_>>();
-
-        //     let mut longest_path_found = cursor..=cursor.sub(term, Boundary::Grid, 1);
-
-        //     for start_word in &line_words {
-        //         if start_word.start().cmp(&cursor) == Ordering::Greater {
-        //             // we are past the word under the cursor, stop.
-        //             break;
-        //         }
-
-        //         for end_word in line_words.iter().rev() {
-        //             if end_word.end().cmp(&cursor) == Ordering::Less {
-        //                 // we are past the word under the cursor, stop.
-        //                 break;
-        //             }
-
-        //             if longest_path_found.contains_inclusive(&(*start_word.start()..*end_word.end())) {
-        //                 // We have already found a path that is longer than any
-        //                 // path starting with the current start_word, so we are done.
-        //                 return Some(*longest_path_found.start()..=*longest_path_found.end());
-        //             }
-
-        //             // Otherwise, we have a potential path that is longer than the current longest_path_found,
-        //             // Check if it exists, and if it does, make it the new longest_path_found.
-
-        //             // Check for potential :<line>:<column> endings before fs::exists()
-        //             let maybe_path = term.bounds_to_string(*start_word.start(), *end_word.end());
-        //             let maybe_path_no_line_column =
-        //                 if let Some(captures) = self.line_column_regex.captures(&maybe_path) {
-        //                     &maybe_path[0..maybe_path.len() - captures["line_column"].len()]
-        //                 } else {
-        //                     &maybe_path[0..]
-        //                 };
-
-        //             match fs::exists(Path::new(&maybe_path_no_line_column)) {
-        //                 Ok(true) => {
-        //                     longest_path_found = *start_word.start()..=*end_word.end();
-        //                     debug!("Updated longest path found to: {}", maybe_path);
-        //                     // The rest can only be shorter.
-        //                     break;
-        //                 }
-        //                 _ => {
-        //                     trace!(
-        //                         "Not an error, no file found for path: {}",
-        //                         maybe_path_no_line_column
-        //                     )
-        //                 }
-        //             }
-        //         }
-        //     }
-
-        //     if !longest_path_found.is_empty() {
-        //         return Some(*longest_path_found.start()..=*longest_path_found.end());
-        //     }
-
-        //     None
-        // }
-
-        maybe_path_variations
+        starts
+            .into_iter()
+            .map(move |start| {
+                WORD_RE
+                    .find_iter(&self.text[self.word.start..])
+                    .map(|match_| match_.end())
+                    .map(move |end| MaybePath::new(&self.text, start..self.word.start + end))
+            })
+            .collect::<Vec<_>>()
     }
 
     /// Expands the `word` within `text` to the longest matching pair of surrounding symbols.
@@ -192,29 +141,35 @@ impl MatchedMaybePath {
     pub(super) fn longest_maybe_path_by_surrounding_symbols(&self) -> Option<Range<usize>> {
         let mut longest = None::<Range<usize>>;
 
+        let surrounds_word = |current: &Range<usize>| {
+            current.contains(&self.word.start) && current.contains(&(self.word.end - 1))
+        };
+
         for (start, end) in COMMON_PATH_SURROUNDING_SYMBOLS {
             if let (Some(first), Some(last)) = (self.text.find(*start), self.text.rfind(*end)) {
-                if first < last && first <= self.word.start && last >= self.word.end - 1 {
+                if first < last {
                     let current = first..last + 1;
-                    if let Some(longest) = &mut longest {
-                        if first < longest.start && last > longest.end - 1 {
-                            *longest = current;
-                        }
-                    } else {
-                        longest = Some(current);
+                    if surrounds_word(&current) {
+                        if let Some(longest_so_far) = &longest {
+                            if current.len() > longest_so_far.len() {
+                                longest = Some(current);
+                            }
+                        } else {
+                            longest = Some(current);
+                        };
                     }
                 }
             }
         }
 
-        longest.as_ref().inspect(|longest| {
-            info!(
-                "Terminal: Longest surrounding symbols: {:?}",
-                self.text_at(longest)
-            )
-        });
+        // It's possible that `self.word` is the longest, but that will be processed elsewhere.
+        if let Some(longest) = longest {
+            if longest != self.word {
+                return Some(longest)
+            }
+        }
 
-        longest
+        None
     }
 
     /// Expands the `word` within `text` to the longest potential path using the following heuristic:
@@ -310,6 +265,26 @@ pub struct RowColumn {
     pub column: Option<u32>,
 }
 
+#[cfg(not(test))]
+#[derive(Clone, Debug)]
+pub struct MaybePathWithPosition<'a> {
+    pub path: Cow<'a, Path>,
+    pub position: Option<RowColumn>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaybePathWithPosition<'a> {
+    pub path: Cow<'a, Path>,
+    pub position: Option<RowColumn>,
+}
+
+impl<'a> MaybePathWithPosition<'a> {
+    fn new(path: Cow<'a, Path>, position: Option<RowColumn>) -> Self {
+        Self { path, position }
+    }
+}
+
 /// Contains well defined sub range variations of a MaybePath
 /// - Line and column suffix
 /// - Stripped common surrounding symbols
@@ -318,6 +293,7 @@ pub struct RowColumn {
 pub struct MaybePath {
     variations: Vec<Range<usize>>,
     positioned_variation: Option<(Range<usize>, RowColumn)>,
+    absolutize_home_dir: bool,
 }
 
 impl MaybePath {
@@ -325,6 +301,7 @@ impl MaybePath {
         // We add variation longest to shortest
         let mut maybe_path = &text[path.clone()];
         let mut positioned_variation = None::<(Range<usize>, RowColumn)>;
+        let mut absolutize_home_dir = true;
 
         // Start with full range
         let mut variations = vec![path.clone()];
@@ -349,6 +326,7 @@ impl MaybePath {
             if (maybe_path.starts_with('a') || maybe_path.starts_with('b'))
                 && maybe_path[1..].starts_with(MAIN_SEPARATOR)
             {
+                absolutize_home_dir = false;
                 variations.push(path.start + 2..path.end);
             } else if let (suffix_start, Some(row), column) =
                 PathWithPosition::parse_row_column(maybe_path)
@@ -363,13 +341,14 @@ impl MaybePath {
         Self {
             variations,
             positioned_variation,
+            absolutize_home_dir,
         }
     }
 
     pub fn relative_variations<'a>(
         &self,
         matched_maybe_path: &'a MatchedMaybePath,
-    ) -> Vec<(&'a Path, Option<RowColumn>)> {
+    ) -> Vec<MaybePathWithPosition<'a>> {
         let mut variations = Vec::new();
         for range in &self.variations {
             variations.push((matched_maybe_path.text_at(range), None));
@@ -383,7 +362,9 @@ impl MaybePath {
             .into_iter()
             .filter_map(|(variation, position)| {
                 let maybe_path = Path::new(variation);
-                maybe_path.is_relative().then(|| (maybe_path, position))
+                maybe_path
+                    .is_relative()
+                    .then(|| MaybePathWithPosition::new(Cow::Borrowed(maybe_path), position))
             })
             .collect()
     }
@@ -395,21 +376,32 @@ impl MaybePath {
         home_dir: &Option<PathBuf>,
         range: &Range<usize>,
         position: Option<RowColumn>,
-    ) -> Vec<(Cow<'a, Path>, Option<RowColumn>)> {
+    ) -> Vec<MaybePathWithPosition<'a>> {
         let maybe_path = Path::new(matched_maybe_path.text_at(&range));
         let mut absolutized = Vec::new();
         if maybe_path.is_absolute() {
-            absolutized.push((Cow::Borrowed(maybe_path), position));
+            absolutized.push(MaybePathWithPosition::new(
+                Cow::Borrowed(maybe_path),
+                position,
+            ));
             return absolutized;
         }
 
         if let Some(cwd) = cwd {
-            absolutized.push((Cow::Owned(cwd.join(maybe_path)), position));
+            absolutized.push(MaybePathWithPosition::new(
+                Cow::Owned(cwd.join(maybe_path)),
+                position,
+            ));
         }
 
-        if let Some(home_dir) = home_dir {
-            if let Ok(stripped) = maybe_path.strip_prefix("~") {
-                absolutized.push((Cow::Owned(home_dir.join(stripped)), position));
+        if self.absolutize_home_dir {
+            if let Some(home_dir) = home_dir {
+                if let Ok(stripped) = maybe_path.strip_prefix("~") {
+                    absolutized.push(MaybePathWithPosition::new(
+                        Cow::Owned(home_dir.join(stripped)),
+                        position,
+                    ));
+                }
             }
         }
 
@@ -421,7 +413,7 @@ impl MaybePath {
         matched_maybe_path: &'a MatchedMaybePath,
         cwd: &Option<PathBuf>,
         home_dir: &Option<PathBuf>,
-    ) -> Vec<(Cow<'a, Path>, Option<RowColumn>)> {
+    ) -> Vec<MaybePathWithPosition<'a>> {
         let mut variations = Vec::new();
         for range in &self.variations {
             variations.append(&mut self.absolutize(
@@ -449,77 +441,319 @@ impl MaybePath {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{mem, path::Path, sync::Arc};
 
     use super::*;
     use fs::{FakeFs, Fs};
     use gpui::TestAppContext;
     use serde_json::json;
 
+    impl<'a> Into<MaybePathWithPosition<'a>> for &'a str {
+        fn into(self) -> MaybePathWithPosition<'a> {
+            MaybePathWithPosition {
+                path: Cow::Borrowed(Path::new(self)),
+                position: None,
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    struct ExpectedMaybePathVariations<'a> {
+        word_relative: Vec<MaybePathWithPosition<'a>>,
+        word_absolute: Vec<MaybePathWithPosition<'a>>,
+        advanced_relative: Vec<MaybePathWithPosition<'a>>,
+        advanced_absolute: Vec<MaybePathWithPosition<'a>>,
+        exhaustive_relative: Vec<MaybePathWithPosition<'a>>,
+        exhaustive_absolute: Vec<MaybePathWithPosition<'a>>,
+    }
+
     #[gpui::test]
-    async fn test_maybe_path(cx: &mut TestAppContext) {
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/root1",
-            json!({
-                "one.txt": "",
-                "two.txt": "",
-            }),
-        )
-        .await;
-        fs.insert_tree(
-            "/root2",
-            json!({
-                "three.txt": "",
-            }),
-        )
-        .await;
+    async fn simple_maybe_paths(cx: &mut TestAppContext) {
+        let mut trees = vec![
+            (
+                "/root1",
+                json!({
+                    "one.txt": "",
+                    "two.txt": "",
+                }),
+            ),
+            (
+                "/root 2",
+                json!({
+                    "three.txt": "",
+                }),
+            ),
+        ];
 
-        let path = "(/root2/three.txt)";
-        let line = "+++ a/hello   super/cool path: (/root2/three.txt)".to_string();
-        let path_match = line.find(path).unwrap()..line.len();
-        assert_eq!(&line[path_match.clone()], path);
+        let expected = vec![
+            ExpectedMaybePathVariations {
+                word_relative: vec![],
+                word_absolute: vec![],
+                advanced_relative: [
+                    "+++",
+                    "+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                advanced_absolute: [
+                    "/Some/cool/place/+++",
+                    "/Some/cool/place/+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                exhaustive_relative: vec![],
+                exhaustive_absolute: vec![],
+            },
+            ExpectedMaybePathVariations {
+                word_relative: vec![],
+                word_absolute: vec![],
+                advanced_relative: [
+                    "a/~/hello",
+                    "~/hello",
+                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                advanced_absolute: [
+                    "/Some/cool/place/a/~/hello",
+                    "/Some/cool/place/~/hello",
+                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                exhaustive_relative: vec![],
+                exhaustive_absolute: vec![],
+            },
+            ExpectedMaybePathVariations {
+                word_relative: vec![],
+                word_absolute: vec![],
+                advanced_relative: [
+                    "~/super/cool",
+                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                advanced_absolute: [
+                    "/Some/cool/place/~/super/cool",
+                    "/Usors/uzer/super/cool",
+                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                exhaustive_relative: vec![],
+                exhaustive_absolute: vec![],
+            },
+            ExpectedMaybePathVariations {
+                word_relative: vec![],
+                word_absolute: vec![],
+                advanced_relative: vec![
+                    MaybePathWithPosition::new(Path::new("path:4:2").into(), None),
+                    MaybePathWithPosition::new(
+                        Path::new("path").into(),
+                        Some(RowColumn {
+                            row: 4,
+                            column: Some(2),
+                        }),
+                    ),
+                    MaybePathWithPosition::new(
+                        Path::new("a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)").into(),
+                        None,
+                    ),
+                    MaybePathWithPosition::new(
+                        Path::new("~/hello   ~/super/cool path:4:2 (/root 2/three.txt)").into(),
+                        None,
+                    ),
+                ],
+                advanced_absolute: vec![
+                    MaybePathWithPosition::new(Path::new("/Some/cool/place/path:4:2").into(), None),
+                    MaybePathWithPosition::new(
+                        Path::new("/Some/cool/place/path").into(),
+                        Some(RowColumn {
+                            row: 4,
+                            column: Some(2),
+                        }),
+                    ),
+                    MaybePathWithPosition::new(
+                        Path::new("/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)").into(),
+                        None,
+                    ),
+                    MaybePathWithPosition::new(
+                        Path::new("/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)").into(),
+                        None,
+                    ),
+                ],
+                exhaustive_relative: vec![],
+                exhaustive_absolute: vec![],
+            },
+            ExpectedMaybePathVariations {
+                word_relative: vec![],
+                word_absolute: vec![],
+                advanced_relative: [
+                    "(/root",
+                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                advanced_absolute: [
+                    "/Some/cool/place/(/root",
+                    "/root 2/three.txt",
+                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                exhaustive_relative: vec![],
+                exhaustive_absolute: vec![],
+            },
+            ExpectedMaybePathVariations {
+                word_relative: vec![],
+                word_absolute: vec![],
+                advanced_relative: [
+                    "2/three.txt)",
+                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                advanced_absolute: [
+                    "/Some/cool/place/2/three.txt)",
+                    "/root 2/three.txt",
+                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                ]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+                exhaustive_relative: vec![],
+                exhaustive_absolute: vec![],
+            },
+        ];
 
-        let expected = [
-            "(/root2/three.txt)",
-            // TODO: "/root2/three.txt",
-            "a/hello   super/cool path: (/root2/three.txt)",
-            "hello   super/cool path: (/root2/three.txt)",
-        ]
-        .into_iter()
-        .map(|str| (Path::new(str), None))
-        .collect::<Vec<_>>();
+        let word_regex = Regex::new(crate::WORD_REGEX).unwrap();
 
-        let maybe_path =
-            MatchedMaybePath::from_line(line, path_match, PathHyperlinkNavigation::Advanced);
-        let maybe_path_variations = maybe_path.maybe_paths();
-        assert_eq!(maybe_path_variations.len(), 2);
+        let line = "+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
 
-        let actual = maybe_path_variations
+        for (match_, expected) in word_regex.find_iter(&line).zip(expected.into_iter()) {
+            test_matched_maybe_path(cx, &mut trees, line, match_.range(), expected).await
+        }
+    }
+
+    async fn check_variations<'a>(
+        fs: Arc<FakeFs>,
+        actual: &Vec<MaybePathWithPosition<'a>>,
+        expected: &Vec<MaybePathWithPosition<'a>>,
+    ) {
+        assert_eq!(actual.len(), expected.len(), "{:#?}", actual);
+
+        let errors: Vec<_> = actual
             .iter()
-            .map(|maybe_path_variations| maybe_path_variations.relative_variations(&maybe_path))
-            .flatten();
+            .zip(expected.iter())
+            .filter(|(actual, expected)| *actual != *expected)
+            .inspect(|(actual, expected)| {
+                println!("  left: {:?}", actual);
+                println!(" right: {:?}", expected);
+            })
+            .collect();
 
-        assert_eq!(
-            actual.clone().count(),
-            3,
-            "{:#?}",
-            actual.clone().collect::<Vec<_>>()
-        );
-
-        for (actual, expected) in actual.clone().zip(expected.iter()) {
-            assert_eq!(actual, *expected)
+        if !errors.is_empty() {
+            println!("Actual:");
+            println!("{:#?}", actual);
+            println!("Expected:");
+            println!("{:#?}", expected);
+            assert!(false);
         }
 
         let mut canonical_paths = Vec::new();
-        for (path, position) in actual {
-            println!("Checking maybe_path: {:?} at {:?}", path, position);
+        for MaybePathWithPosition { path, .. } in actual {
             if let Ok(canonical_path) = fs.canonicalize(&path).await {
                 canonical_paths.push(canonical_path);
             }
         }
 
+        // TODO(davewa): Metadata (file/dir?)
+        // TODO(davewa): Expected navigation targets
         assert_eq!(canonical_paths.len(), 0);
-        // TODO: assert_eq!(canonical_paths[0], expected[0].0)
+        // TODO(davewa): assert_eq!(canonical_paths[0], expected[0].0)
+    }
+
+    async fn test_matched_maybe_path<'a>(
+        cx: &mut TestAppContext,
+        trees: &mut Vec<(&str, serde_json::Value)>,
+        line: &str,
+        word: Range<usize>,
+        expected: ExpectedMaybePathVariations<'a>,
+    ) {
+        let path_hyperlink_navigation = PathHyperlinkNavigation::Exhaustive;
+        let matched_maybe_path =
+            MatchedMaybePath::from_line(line.to_string(), word, path_hyperlink_navigation);
+
+        println!("\nTesting {}", matched_maybe_path);
+
+        let fs = FakeFs::new(cx.executor());
+        for tree in trees {
+            fs.insert_tree(tree.0, mem::take(&mut tree.1)).await;
+        }
+
+        let maybe_paths = matched_maybe_path.maybe_paths();
+        //assert_eq!(maybe_paths.len(), 3);
+
+        for maybe_path in &maybe_paths {
+            println!(
+                "Maybe path: {}",
+                matched_maybe_path.text_at(&maybe_path.variations[0])
+            );
+        }
+
+        println!("\nTesting relative {}", matched_maybe_path);
+
+        let actual_relative: Vec<_> = maybe_paths
+            .iter()
+            .map(|maybe_path| maybe_path.relative_variations(&matched_maybe_path))
+            .flatten()
+            .collect();
+
+        check_variations(
+            Arc::clone(&fs),
+            &actual_relative,
+            &expected.advanced_relative,
+        )
+        .await;
+
+        println!("\nTesting absolutized {}", matched_maybe_path);
+
+        const HOME_DIR: &str = "/Usors/uzer";
+        const CWD: &str = "/Some/cool/place";
+
+        let home_dir = Some(Path::new(HOME_DIR).to_path_buf());
+        let cwd = Some(Path::new(CWD).to_path_buf());
+
+        let actual_absolutized: Vec<_> = maybe_paths
+            .iter()
+            .map(|maybe_path| {
+                maybe_path.absolutized_variations(&matched_maybe_path, &cwd, &home_dir)
+            })
+            .flatten()
+            .collect();
+
+        check_variations(
+            Arc::clone(&fs),
+            &actual_absolutized,
+            &expected.advanced_absolute,
+        )
+        .await;
     }
 }

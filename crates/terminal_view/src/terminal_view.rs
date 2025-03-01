@@ -17,7 +17,9 @@ use persistence::TERMINAL_DB;
 use project::Entry;
 use project::{search::SearchQuery, terminals::TerminalKind, Fs, Metadata, Project};
 use schemars::JsonSchema;
-use terminal::terminal_path_hyperlinks::{MatchedMaybePath, MaybePath, RowColumn};
+use terminal::terminal_path_hyperlinks::{
+    MatchedMaybePath, MaybePath, MaybePathWithPosition, RowColumn,
+};
 use terminal::{
     alacritty_terminal::{
         index::Point,
@@ -979,52 +981,118 @@ fn subscribe_for_terminal_events(
     vec![terminal_subscription, terminal_events_subscription]
 }
 
+async fn canonicalize_maybe_paths(
+    fs: Arc<dyn Fs>,
+    home_dir: &Option<PathBuf>,
+    cwd: &Option<PathBuf>,
+    matched_maybe_path: &MatchedMaybePath,
+    maybe_paths: &Vec<MaybePath>,
+) -> Vec<(PathBuf, Option<RowColumn>)> {
+    let mut canonical_with_positions = Vec::new();
+
+    for maybe_path in maybe_paths {
+        // TODO(davewa): check for timeout
+        for MaybePathWithPosition {
+            path: absolute,
+            position,
+        } in maybe_path.absolutized_variations(&matched_maybe_path, &cwd, &home_dir)
+        {
+            info!("Terminal: MaybePath absolutized variation: {:?}", absolute);
+            if let Ok(canonical) = fs.canonicalize(&absolute).await {
+                canonical_with_positions.push((canonical, position));
+            }
+        }
+    }
+
+    canonical_with_positions
+}
+
 fn possible_open_paths_metadata(
     fs: Arc<dyn Fs>,
     home_dir: Option<PathBuf>,
     cwd: Option<PathBuf>,
     matched_maybe_path: MatchedMaybePath,
-    maybe_paths_variations: Vec<MaybePath>,
+    maybe_paths: Vec<MaybePath>,
     canonical_worktree_path_sets: HashMap<Arc<Path>, Vec<(Box<Path>, Option<RowColumn>)>>,
     cx: &mut Context<TerminalView>,
 ) -> Task<Vec<(PathWithPosition, Metadata)>> {
     cx.background_spawn(async move {
         let mut canonical_paths = HashSet::<PathWithPosition>::from_iter([]);
 
-        let mut insert_canonical = |canonical: PathBuf, position: Option<RowColumn>| {
-            let (row, column) = if let Some(ref position) = position {
-                (Some(position.row), position.column)
-            } else {
-                (None, None)
+        let path_with_position =
+            |canonical: PathBuf, position: Option<RowColumn>| -> PathWithPosition {
+                let (row, column) = if let Some(ref position) = position {
+                    (Some(position.row), position.column)
+                } else {
+                    (None, None)
+                };
+                PathWithPosition {
+                    // TODO(davewa): Shouldn't abs_root in the worktree always already be sanitized?
+                    path: SanitizedPath::from(canonical).as_path().to_path_buf(),
+                    row,
+                    column,
+                }
             };
-            canonical_paths.insert(PathWithPosition {
-                // TODO(davewa): Shouldn't abs_root in the worktree always already be sanitized?
-                path: SanitizedPath::from(canonical).as_path().to_path_buf(),
-                row,
-                column,
-            });
-        };
 
-        for (abs_root, canonical_paths_with_positions) in &canonical_worktree_path_sets {
-            for canonical_path_with_position in canonical_paths_with_positions {
+        for (abs_root, entry_canonical_paths_with_positions) in &canonical_worktree_path_sets {
+            for canonical_path_with_position in entry_canonical_paths_with_positions {
                 let canonical = abs_root.join(&canonical_path_with_position.0);
-                info!("Terminal View: MaybePath worktree variation: {:?}", canonical);
-                insert_canonical(canonical, canonical_path_with_position.1);
+                info!(
+                    "Terminal View: MaybePath worktree variation: {:?}",
+                    canonical
+                );
+                canonical_paths.insert(path_with_position(
+                    canonical,
+                    canonical_path_with_position.1,
+                ));
             }
         }
 
-        for maybe_path_variations in &maybe_paths_variations {
-            for (absolute, position) in
-                maybe_path_variations.absolutized_variations(&matched_maybe_path, &cwd, &home_dir)
-            {
-                info!("Terminal: MaybePath absolutized variation: {:?}", absolute);
-                if let Ok(canonical) = fs.canonicalize(&absolute).await {
-                    insert_canonical(canonical, position);
+        // First, attempt to canonicalize the maybe_paths computed on the main thread; these are the most common
+        for (canonical, position) in canonicalize_maybe_paths(
+            Arc::clone(&fs),
+            &home_dir,
+            &cwd,
+            &matched_maybe_path,
+            &maybe_paths,
+        )
+        .await
+        {
+            canonical_paths.insert(path_with_position(canonical, position));
+        }
+
+        // Iff none of the common cases yielded a real path, attempt the less common cases
+        // TODO(davewa): Process variations from longest to shorted within each maybe path
+        // TODO(davewa): Once any real file is found, only check paths longer than the longest found so far
+        if canonical_paths.is_empty() {
+            for maybe_paths in matched_maybe_path.exhaustive_maybe_paths() {
+                for (canonical, position) in canonicalize_maybe_paths(
+                    Arc::clone(&fs),
+                    &home_dir,
+                    &cwd,
+                    &matched_maybe_path,
+                    &maybe_paths.collect(),
+                )
+                .await
+                {
+                    canonical_paths.insert(path_with_position(canonical, position));
+                }
+            }
+
+            for maybe_paths in matched_maybe_path.regex_maybe_paths() {
+                for (canonical, position) in canonicalize_maybe_paths(
+                    Arc::clone(&fs),
+                    &home_dir,
+                    &cwd,
+                    &matched_maybe_path,
+                    &maybe_paths.into_iter().collect(),
+                )
+                .await
+                {
+                    canonical_paths.insert(path_with_position(canonical, position));
                 }
             }
         }
-
-        // TODO(davewa): If we haven't found any paths yet, try the exhaustive variations
 
         let mut fetch_metadata_tasks = canonical_paths
             .into_iter()
@@ -1071,13 +1139,13 @@ fn possible_open_targets(
                     (worktree.abs_path(), {
                         let mut entry_paths = Vec::new();
                         for maybe_path in &maybe_paths {
-                            for (variation, position) in
+                            for MaybePathWithPosition { path: relative, position } in
                                 maybe_path.relative_variations(matched_maybe_path)
                             {
                                 if let Some(Entry {
                                     canonical_path: Some(entry_canonical_path),
                                     ..
-                                }) = worktree.entry_for_path(&variation)
+                                }) = worktree.entry_for_path(&relative)
                                 {
                                     info!("Terminal View: MaybePath found for worktree: {:?}, entry: {:?}", worktree.abs_path(), entry_canonical_path);
                                     entry_paths.push((entry_canonical_path.clone(), position))
