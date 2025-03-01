@@ -39,7 +39,7 @@ pub enum PathHyperlinkNavigation {
     /// - _Linux and macOS only_ : `~/` prefix resolves to `$HOME`
     /// - `git diff` prefixes, e.g., `a/foo.rs`
     Word,
-    /// Advanced path hyperlink support. All of [Default](PathHyperlinkNavigation::Default),
+    /// Advanced path hyperlink support. All of [Default](PathHyperlinkNavigation::Word),
     /// plus common paths with spaces scenarios
     /// - Path with spaces at the end of a line
     /// - Path with spaces has common surrounding symbols
