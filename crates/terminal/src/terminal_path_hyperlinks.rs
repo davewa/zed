@@ -3,7 +3,6 @@ use std::{
     fmt::Display,
     ops::Range,
     path::{Path, PathBuf, MAIN_SEPARATOR},
-    str,
     sync::LazyLock,
 };
 
@@ -30,10 +29,12 @@ const COMMON_PATH_SURROUNDING_SYMBOLS: &[(char, char)] =
 
 #[derive(Clone, Debug)]
 pub struct MatchedMaybePath {
-    /// The terminal word or line containing maybe_path.
+    /// The terminal hovered or Cmd-clicked word or line containing the word.
     text: String,
-    /// Iff `text` is a line, the range of the hovered or Cmd-clicked word within the line
+    /// Iff `text` is a line, the range of the hovered or Cmd-clicked word within the line,
+    /// the full range of `text` otherwise,
     word: Range<usize>,
+    /// The user settings `terminal.path_hyperlink_navigation`, see [PathHyperlinkNavigation].
     path_hyperlink_navigation: PathHyperlinkNavigation,
 }
 
@@ -59,11 +60,11 @@ impl MatchedMaybePath {
         }
     }
 
-    pub(super) fn matched(&self) -> &str {
+    pub(super) fn word(&self) -> &str {
         &self.text[self.word.clone()]
     }
 
-    pub(super) fn matched_range(&self) -> &Range<usize> {
+    pub(super) fn word_range(&self) -> &Range<usize> {
         &self.word
     }
 
@@ -165,7 +166,7 @@ impl MatchedMaybePath {
         // It's possible that `self.word` is the longest, but that will be processed elsewhere.
         if let Some(longest) = longest {
             if longest != self.word {
-                return Some(longest)
+                return Some(longest);
             }
         }
 
@@ -244,36 +245,22 @@ impl MatchedMaybePath {
 impl Display for MatchedMaybePath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.word.start != 0 || self.word.end != self.text.len() {
-            formatter.write_fmt(format_args!("{:?} «{}»", self, self.matched()))
+            formatter.write_fmt(format_args!("{:?} «{}»", self, self.word()))
         } else {
             formatter.write_fmt(format_args!("{:?}", self))
         }
     }
 }
 
-#[cfg(not(test))]
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(test, derive(Eq, PartialEq))]
 pub struct RowColumn {
     pub row: u32,
     pub column: Option<u32>,
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RowColumn {
-    pub row: u32,
-    pub column: Option<u32>,
-}
-
-#[cfg(not(test))]
 #[derive(Clone, Debug)]
-pub struct MaybePathWithPosition<'a> {
-    pub path: Cow<'a, Path>,
-    pub position: Option<RowColumn>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(test, derive(Eq, PartialEq))]
 pub struct MaybePathWithPosition<'a> {
     pub path: Cow<'a, Path>,
     pub position: Option<RowColumn>,
@@ -443,29 +430,65 @@ impl MaybePath {
 mod tests {
     use std::{mem, path::Path, sync::Arc};
 
+    use crate::WORD_REGEX;
+
     use super::*;
+    use collections::HashMap;
     use fs::{FakeFs, Fs};
     use gpui::TestAppContext;
     use serde_json::json;
 
-    impl<'a> Into<MaybePathWithPosition<'a>> for &'a str {
-        fn into(self) -> MaybePathWithPosition<'a> {
-            MaybePathWithPosition {
-                path: Cow::Borrowed(Path::new(self)),
-                position: None,
-            }
-        }
+    struct ExpectedMaybePathVariations<'a> {
+        relative: Vec<MaybePathWithPosition<'a>>,
+        absolutized: Vec<MaybePathWithPosition<'a>>,
     }
 
-    #[allow(dead_code)]
-    struct ExpectedMaybePathVariations<'a> {
-        word_relative: Vec<MaybePathWithPosition<'a>>,
-        word_absolute: Vec<MaybePathWithPosition<'a>>,
-        advanced_relative: Vec<MaybePathWithPosition<'a>>,
-        advanced_absolute: Vec<MaybePathWithPosition<'a>>,
-        exhaustive_relative: Vec<MaybePathWithPosition<'a>>,
-        exhaustive_absolute: Vec<MaybePathWithPosition<'a>>,
+    type ExpectedMap<'a> = HashMap<PathHyperlinkNavigation, Vec<ExpectedMaybePathVariations<'a>>>;
+
+    macro_rules! maybe_path_with_positions {
+        ($variations:ident, $path:literal, $row:literal, $column:literal; $($tail:tt)*) => {
+            $variations.push(MaybePathWithPosition::new(Cow::Borrowed(Path::new($path)), Some(RowColumn{ row: $row, column: Some($column) })));
+            maybe_path_with_positions!($variations, $($tail)*);
+        };
+
+        ($variations:ident, $path:literal, $row:literal; $($tail:tt)*) => {
+            $variations.push(MaybePathWithPosition::new(Cow::Borrowed(Path::new($path)), Some(RowColumn{ row: $row, column: None })));
+            maybe_path_with_positions!($variations, $($tail)*);
+        };
+
+        ($variations:ident, $path:literal; $($tail:tt)*) => {
+            $variations.push(MaybePathWithPosition::new(Cow::Borrowed(Path::new($path)), None));
+            maybe_path_with_positions!($variations, $($tail)*);
+        };
+
+        ($variations:ident,) => {
+        };
+
+        ($($tail:tt)+) => { {
+            let mut maybe_path_variations = Vec::new();
+            maybe_path_with_positions!(maybe_path_variations, $($tail)+);
+            maybe_path_variations
+        } };
     }
+
+    macro_rules! relative {
+        ($($tail:tt)+) => { maybe_path_with_positions![ $($tail)+ ] }
+    }
+
+    macro_rules! absolutized {
+        ($($tail:tt)+) => { maybe_path_with_positions![ $($tail)+ ] }
+    }
+
+    macro_rules! expected {
+        ($($relative:expr, $aboslutized:expr),+) => {
+            [ $(ExpectedMaybePathVariations {
+                relative: $relative,
+                absolutized: $aboslutized,
+            },)+ ].into_iter().collect()
+        };
+    }
+
+    static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(WORD_REGEX).unwrap());
 
     #[gpui::test]
     async fn simple_maybe_paths(cx: &mut TestAppContext) {
@@ -485,170 +508,95 @@ mod tests {
             ),
         ];
 
-        let expected = vec![
-            ExpectedMaybePathVariations {
-                word_relative: vec![],
-                word_absolute: vec![],
-                advanced_relative: [
-                    "+++",
-                    "+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-                advanced_absolute: [
-                    "/Some/cool/place/+++",
-                    "/Some/cool/place/+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-                exhaustive_relative: vec![],
-                exhaustive_absolute: vec![],
-            },
-            ExpectedMaybePathVariations {
-                word_relative: vec![],
-                word_absolute: vec![],
-                advanced_relative: [
-                    "a/~/hello",
-                    "~/hello",
-                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-                advanced_absolute: [
-                    "/Some/cool/place/a/~/hello",
-                    "/Some/cool/place/~/hello",
-                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-                exhaustive_relative: vec![],
-                exhaustive_absolute: vec![],
-            },
-            ExpectedMaybePathVariations {
-                word_relative: vec![],
-                word_absolute: vec![],
-                advanced_relative: [
-                    "~/super/cool",
-                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-                advanced_absolute: [
-                    "/Some/cool/place/~/super/cool",
-                    "/Usors/uzer/super/cool",
-                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-                exhaustive_relative: vec![],
-                exhaustive_absolute: vec![],
-            },
-            ExpectedMaybePathVariations {
-                word_relative: vec![],
-                word_absolute: vec![],
-                advanced_relative: vec![
-                    MaybePathWithPosition::new(Path::new("path:4:2").into(), None),
-                    MaybePathWithPosition::new(
-                        Path::new("path").into(),
-                        Some(RowColumn {
-                            row: 4,
-                            column: Some(2),
-                        }),
-                    ),
-                    MaybePathWithPosition::new(
-                        Path::new("a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)").into(),
-                        None,
-                    ),
-                    MaybePathWithPosition::new(
-                        Path::new("~/hello   ~/super/cool path:4:2 (/root 2/three.txt)").into(),
-                        None,
-                    ),
+        let expected = ExpectedMap::from_iter([(
+            PathHyperlinkNavigation::Advanced,
+            expected![
+                relative![
+                    "+++";
+                    "+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
                 ],
-                advanced_absolute: vec![
-                    MaybePathWithPosition::new(Path::new("/Some/cool/place/path:4:2").into(), None),
-                    MaybePathWithPosition::new(
-                        Path::new("/Some/cool/place/path").into(),
-                        Some(RowColumn {
-                            row: 4,
-                            column: Some(2),
-                        }),
-                    ),
-                    MaybePathWithPosition::new(
-                        Path::new("/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)").into(),
-                        None,
-                    ),
-                    MaybePathWithPosition::new(
-                        Path::new("/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)").into(),
-                        None,
-                    ),
+                absolutized![
+                    "/Some/cool/place/+++";
+                    "/Some/cool/place/+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
                 ],
-                exhaustive_relative: vec![],
-                exhaustive_absolute: vec![],
-            },
-            ExpectedMaybePathVariations {
-                word_relative: vec![],
-                word_absolute: vec![],
-                advanced_relative: [
-                    "(/root",
-                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+                relative![
+                    "a/~/hello";
+                    "~/hello";
+                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                ],
+                absolutized![
+                    "/Some/cool/place/a/~/hello";
+                    "/Some/cool/place/~/hello";
+                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                ],
+                relative![
+                    "~/super/cool";
+                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                ],
+                absolutized![
+                    "/Some/cool/place/~/super/cool";
+                    "/Usors/uzer/super/cool";
+                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                ],
+                relative![
+                    "path:4:2";
+                    "path", 4, 2;
+                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                ],
+                absolutized![
+                    "/Some/cool/place/path:4:2";
+                    "/Some/cool/place/path", 4, 2;
+                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                ],
+                relative![
+                    "(/root";
+                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                ],
+                absolutized![
+                    "/Some/cool/place/(/root";
+                    "/root 2/three.txt";
+                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                ],
+                relative![
+                    "2/three.txt)";
+                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                ],
+                absolutized![
+                    "/Some/cool/place/2/three.txt)";
+                    "/root 2/three.txt";
+                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
+                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
                 ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-                advanced_absolute: [
-                    "/Some/cool/place/(/root",
-                    "/root 2/three.txt",
-                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-                exhaustive_relative: vec![],
-                exhaustive_absolute: vec![],
-            },
-            ExpectedMaybePathVariations {
-                word_relative: vec![],
-                word_absolute: vec![],
-                advanced_relative: [
-                    "2/three.txt)",
-                    "a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                    "~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-                advanced_absolute: [
-                    "/Some/cool/place/2/three.txt)",
-                    "/root 2/three.txt",
-                    "/Some/cool/place/a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                    "/Some/cool/place/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
-                ]
-                .into_iter()
-                .map(Into::into)
-                .collect(),
-                exhaustive_relative: vec![],
-                exhaustive_absolute: vec![],
-            },
-        ];
+            ],
+        )]);
 
-        let word_regex = Regex::new(crate::WORD_REGEX).unwrap();
+        test_line_maybe_paths(
+            cx,
+            &mut trees,
+            "+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)",
+            &expected,
+        )
+        .await
+    }
 
-        let line = "+++ a/~/hello   ~/super/cool path:4:2 (/root 2/three.txt)";
-
-        for (match_, expected) in word_regex.find_iter(&line).zip(expected.into_iter()) {
-            test_matched_maybe_path(cx, &mut trees, line, match_.range(), expected).await
+    async fn test_line_maybe_paths<'a>(
+        cx: &mut TestAppContext,
+        trees: &mut Vec<(&str, serde_json::Value)>,
+        line: &str,
+        expected: &ExpectedMap<'a>,
+    ) {
+        let advanced_expected = expected.get(&PathHyperlinkNavigation::Advanced).unwrap();
+        for (matched, expected) in WORD_RE.find_iter(&line).zip(advanced_expected) {
+            test_matched_maybe_paths(cx, trees, line, matched.range(), &expected).await
         }
     }
 
@@ -690,12 +638,12 @@ mod tests {
         // TODO(davewa): assert_eq!(canonical_paths[0], expected[0].0)
     }
 
-    async fn test_matched_maybe_path<'a>(
+    async fn test_matched_maybe_paths<'a>(
         cx: &mut TestAppContext,
         trees: &mut Vec<(&str, serde_json::Value)>,
         line: &str,
         word: Range<usize>,
-        expected: ExpectedMaybePathVariations<'a>,
+        expected: &ExpectedMaybePathVariations<'a>,
     ) {
         let path_hyperlink_navigation = PathHyperlinkNavigation::Exhaustive;
         let matched_maybe_path =
@@ -726,12 +674,7 @@ mod tests {
             .flatten()
             .collect();
 
-        check_variations(
-            Arc::clone(&fs),
-            &actual_relative,
-            &expected.advanced_relative,
-        )
-        .await;
+        check_variations(Arc::clone(&fs), &actual_relative, &expected.relative).await;
 
         println!("\nTesting absolutized {}", matched_maybe_path);
 
@@ -749,11 +692,6 @@ mod tests {
             .flatten()
             .collect();
 
-        check_variations(
-            Arc::clone(&fs),
-            &actual_absolutized,
-            &expected.advanced_absolute,
-        )
-        .await;
+        check_variations(Arc::clone(&fs), &actual_absolutized, &expected.absolutized).await;
     }
 }

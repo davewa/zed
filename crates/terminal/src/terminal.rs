@@ -756,13 +756,13 @@ impl Terminal {
     ) -> Option<Match> {
         let expanded_match = |expanded: Range<usize>| {
             let expand_left = maybe_path
-                .text_at(&(expanded.start..maybe_path.matched_range().start))
+                .text_at(&(expanded.start..maybe_path.word_range().start))
                 .graphemes(true)
                 .count();
 
-            let expand_right = if expanded.end > maybe_path.matched_range().end {
+            let expand_right = if expanded.end > maybe_path.word_range().end {
                 maybe_path
-                    .text_at(&(maybe_path.matched_range().end..expanded.end))
+                    .text_at(&(maybe_path.word_range().end..expanded.end))
                     .graphemes(true)
                     .count()
             } else {
@@ -858,7 +858,7 @@ impl Terminal {
             ))
         } else {
             Some((
-                maybe_path.matched().to_string(),
+                maybe_path.word().to_string(),
                 false,
                 word_match.clone(),
                 Some(maybe_path),
