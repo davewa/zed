@@ -814,12 +814,16 @@ impl BufferSearchBar {
 
         self.configured_options =
             SearchOptions::from_settings(&EditorSettings::get_global(cx).search);
-        if self.dismissed && self.configured_options != self.default_options {
+        if self.dismissed
+            && (self.configured_options != self.default_options
+                || self.configured_options != self.search_options)
+        {
             self.search_options = self.configured_options;
             self.default_options = self.configured_options;
         }
 
         self.dismissed = false;
+        self.adjust_query_regex_language(cx);
         handle.search_bar_visibility_changed(true, window, cx);
         cx.notify();
         cx.emit(Event::UpdateLocation);
@@ -923,7 +927,7 @@ impl BufferSearchBar {
                     query_buffer.edit([(0..len, query)], None, cx);
                 });
             });
-            self.search_options = options;
+            self.set_search_options(options, cx);
             self.clear_matches(window, cx);
             cx.notify();
         }
@@ -977,6 +981,7 @@ impl BufferSearchBar {
 
     pub fn set_search_options(&mut self, search_options: SearchOptions, cx: &mut Context<Self>) {
         self.search_options = search_options;
+        self.adjust_query_regex_language(cx);
         cx.notify();
     }
 
@@ -1907,7 +1912,7 @@ mod tests {
         .unindent();
         let expected_query_matches_count = buffer_text
             .chars()
-            .filter(|c| c.to_ascii_lowercase() == 'a')
+            .filter(|c| c.eq_ignore_ascii_case(&'a'))
             .count();
         assert!(
             expected_query_matches_count > 1,

@@ -405,6 +405,7 @@ dependencies = [
  "pretty_assertions",
  "project",
  "prompt_library",
+ "prompt_store",
  "proto",
  "rand 0.8.5",
  "rope",
@@ -472,6 +473,7 @@ dependencies = [
  "picker",
  "project",
  "prompt_library",
+ "prompt_store",
  "proto",
  "rand 0.8.5",
  "rope",
@@ -526,7 +528,7 @@ dependencies = [
  "picker",
  "pretty_assertions",
  "project",
- "prompt_library",
+ "prompt_store",
  "rand 0.8.5",
  "regex",
  "rope",
@@ -617,7 +619,7 @@ dependencies = [
  "log",
  "pretty_assertions",
  "project",
- "prompt_library",
+ "prompt_store",
  "rope",
  "schemars",
  "semantic_index",
@@ -2076,6 +2078,7 @@ name = "buffer_diff"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clock",
  "ctor",
  "env_logger 0.11.6",
  "futures 0.3.31",
@@ -2841,7 +2844,7 @@ dependencies = [
  "pretty_assertions",
  "project",
  "prometheus",
- "prompt_library",
+ "prompt_store",
  "prost 0.9.0",
  "rand 0.8.5",
  "recent_projects",
@@ -5395,6 +5398,7 @@ dependencies = [
  "anyhow",
  "buffer_diff",
  "collections",
+ "component",
  "db",
  "editor",
  "feature_flags",
@@ -5404,6 +5408,7 @@ dependencies = [
  "gpui",
  "itertools 0.14.0",
  "language",
+ "linkme",
  "menu",
  "multi_buffer",
  "panel",
@@ -5415,6 +5420,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "settings",
+ "smallvec",
  "strum",
  "theme",
  "time",
@@ -10311,10 +10317,34 @@ name = "prompt_library"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "collections",
+ "editor",
+ "gpui",
+ "language",
+ "language_model",
+ "log",
+ "menu",
+ "picker",
+ "prompt_store",
+ "release_channel",
+ "rope",
+ "serde",
+ "settings",
+ "theme",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
+name = "prompt_store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "assets",
  "chrono",
  "collections",
- "editor",
  "fs",
  "futures 0.3.31",
  "fuzzy",
@@ -10322,23 +10352,14 @@ dependencies = [
  "handlebars 4.5.0",
  "heed",
  "language",
- "language_model",
  "log",
- "menu",
  "parking_lot",
  "paths",
- "picker",
- "release_channel",
  "rope",
  "serde",
- "settings",
  "text",
- "theme",
- "ui",
  "util",
  "uuid",
- "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -16830,7 +16851,7 @@ dependencies = [
  "project",
  "project_panel",
  "project_symbols",
- "prompt_library",
+ "prompt_store",
  "proto",
  "recent_projects",
  "release_channel",
@@ -16970,7 +16991,7 @@ dependencies = [
 
 [[package]]
 name = "zed_html"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "zed_extension_api 0.1.0",
 ]
