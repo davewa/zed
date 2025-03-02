@@ -823,27 +823,31 @@ impl Terminal {
         }
 
         let maybe_path_word = term.bounds_to_string(*word_match.start(), *word_match.end());
-        let maybe_path = if path_hyperlink_navigation == PathHyperlinkNavigation::Word {
-            MatchedMaybePath::from_word(maybe_path_word)
+
+        // TODO(davewa): If we don't want the longest_maybe_path_by_surrounding_symbols() hueristic
+        // enabled by default, uncomment from_word below.
+        // let maybe_path = if path_hyperlink_navigation == PathHyperlinkNavigation::Word {
+        //     MatchedMaybePath::from_word(maybe_path_word)
+        // } else {
+        let line_start = term.line_search_left(*word_match.start());
+        let mut line = if line_start == *word_match.start() {
+            String::new()
         } else {
-            let line_start = term.line_search_left(*word_match.start());
-            let mut line = if line_start == *word_match.start() {
-                String::new()
-            } else {
-                term.bounds_to_string(line_start, word_match.start().sub(term, Boundary::Grid, 1))
-            };
-            let word_start = line.len();
-            line.push_str(&maybe_path_word);
-            let word_end = line.len();
-            let line_end = term.line_search_right(*word_match.end());
-            let remainder = if line_end == *word_match.end() {
-                String::new()
-            } else {
-                term.bounds_to_string(word_match.end().add(term, Boundary::Grid, 1), line_end)
-            };
-            line.push_str(&remainder);
-            MatchedMaybePath::from_line(line, word_start..word_end, path_hyperlink_navigation)
+            term.bounds_to_string(line_start, word_match.start().sub(term, Boundary::Grid, 1))
         };
+        let word_start = line.len();
+        line.push_str(&maybe_path_word);
+        let word_end = line.len();
+        let line_end = term.line_search_right(*word_match.end());
+        let remainder = if line_end == *word_match.end() {
+            String::new()
+        } else {
+            term.bounds_to_string(word_match.end().add(term, Boundary::Grid, 1), line_end)
+        };
+        line.push_str(&remainder);
+        let maybe_path =
+            MatchedMaybePath::from_line(line, word_start..word_end, path_hyperlink_navigation);
+        // };
 
         if let Some(best_maybe_path_match) =
             Self::best_maybe_path_match(&maybe_path, term, word_match, path_hyperlink_navigation)

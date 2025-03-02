@@ -140,6 +140,8 @@ impl MatchedMaybePath {
     /// The top level here is an iterator so that we can check for timeout.
     pub fn exhaustive_maybe_paths(&self) -> Vec<impl Iterator<Item = MaybePath> + '_> {
         // TODO(davewa): Some way to assert we are not called on the main thread...
+        // TODO(davewa): Start with "line ends in a path hueristic", e.g., for each start, check only to the end of the line.
+
         info!("Terminal: MaybePaths exhaustive");
 
         static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(super::WORD_REGEX).unwrap());
@@ -571,78 +573,132 @@ mod tests {
             ),
         ];
 
-        let expected = ExpectedMap::from_iter([(
-            PathHyperlinkNavigation::Advanced,
-            expected![
-                relative![
-                    "+++";
-                    "+++ a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+        let expected = ExpectedMap::from_iter([
+            (
+                PathHyperlinkNavigation::Word,
+                expected![
+                    relative![
+                        "+++";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/+++";
+                    ],
+                    relative![
+                        "a/~/hello";
+                        "~/hello";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/a/~/hello";
+                        "/Some/cool/place/~/hello";
+                    ],
+                    relative![
+                        "~/super/cool";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/~/super/cool";
+                        "/Usors/uzer/super/cool";
+                    ],
+                    relative![
+                        "b/path:4:2";
+                        "path:4:2";
+                        "b/path", 4, 2;
+                    ],
+                    absolutized![
+                        "/Some/cool/place/b/path:4:2";
+                        "/Some/cool/place/path:4:2";
+                        "/Some/cool/place/b/path", 4, 2;
+                    ],
+                    relative![
+                        "(/root";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/(/root";
+                        // Iff longest_maybe_path_by_surrounding_symbols() hueristic enabled by default:
+                        "/root 2/three.txt";
+                    ],
+                    relative![
+                        "2/three.txt)";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/2/three.txt)";
+                        // Iff longest_maybe_path_by_surrounding_symbols() hueristic enabled by default:
+                        "/root 2/three.txt";
+                    ]
                 ],
-                absolutized![
-                    "/Some/cool/place/+++";
-                    "/Some/cool/place/+++ a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+            ),
+            (
+                PathHyperlinkNavigation::Advanced,
+                expected![
+                    relative![
+                        "+++";
+                        "+++ a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/+++";
+                        "/Some/cool/place/+++ a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    relative![
+                        "a/~/hello";
+                        "~/hello";
+                        "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                        "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/a/~/hello";
+                        "/Some/cool/place/~/hello";
+                        "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                        "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    relative![
+                        "~/super/cool";
+                        "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                        "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/~/super/cool";
+                        "/Usors/uzer/super/cool";
+                        "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                        "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    relative![
+                        "b/path:4:2";
+                        "path:4:2";
+                        "b/path", 4, 2;
+                        "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                        "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/b/path:4:2";
+                        "/Some/cool/place/path:4:2";
+                        "/Some/cool/place/b/path", 4, 2;
+                        "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                        "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    relative![
+                        "(/root";
+                        "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                        "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/(/root";
+                        "/root 2/three.txt";
+                        "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                        "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    relative![
+                        "2/three.txt)";
+                        "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                        "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ],
+                    absolutized![
+                        "/Some/cool/place/2/three.txt)";
+                        "/root 2/three.txt";
+                        "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                        "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
+                    ]
                 ],
-                relative![
-                    "a/~/hello";
-                    "~/hello";
-                    "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                    "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                ],
-                absolutized![
-                    "/Some/cool/place/a/~/hello";
-                    "/Some/cool/place/~/hello";
-                    "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                    "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                ],
-                relative![
-                    "~/super/cool";
-                    "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                    "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                ],
-                absolutized![
-                    "/Some/cool/place/~/super/cool";
-                    "/Usors/uzer/super/cool";
-                    "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                    "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                ],
-                relative![
-                    "b/path:4:2";
-                    "path:4:2";
-                    "b/path", 4, 2;
-                    "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                    "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                ],
-                absolutized![
-                    "/Some/cool/place/b/path:4:2";
-                    "/Some/cool/place/path:4:2";
-                    "/Some/cool/place/b/path", 4, 2;
-                    "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                    "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                ],
-                relative![
-                    "(/root";
-                    "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                    "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                ],
-                absolutized![
-                    "/Some/cool/place/(/root";
-                    "/root 2/three.txt";
-                    "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                    "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                ],
-                relative![
-                    "2/three.txt)";
-                    "a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                    "~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                ],
-                absolutized![
-                    "/Some/cool/place/2/three.txt)";
-                    "/root 2/three.txt";
-                    "/Some/cool/place/a/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                    "/Some/cool/place/~/hello   ~/super/cool b/path:4:2 (/root 2/three.txt)";
-                ]
-            ],
-        )]);
+            ),
+        ]);
 
         test_line_maybe_paths(
             cx,
@@ -659,9 +715,30 @@ mod tests {
         line: &str,
         expected: &ExpectedMap<'a>,
     ) {
+        let word_expected = expected.get(&PathHyperlinkNavigation::Word).unwrap();
+        for (matched, expected) in WORD_RE.find_iter(&line).zip(word_expected) {
+            test_matched_maybe_paths(
+                cx,
+                trees,
+                line,
+                matched.range(),
+                PathHyperlinkNavigation::Word,
+                &expected,
+            )
+            .await
+        }
+
         let advanced_expected = expected.get(&PathHyperlinkNavigation::Advanced).unwrap();
         for (matched, expected) in WORD_RE.find_iter(&line).zip(advanced_expected) {
-            test_matched_maybe_paths(cx, trees, line, matched.range(), &expected).await
+            test_matched_maybe_paths(
+                cx,
+                trees,
+                line,
+                matched.range(),
+                PathHyperlinkNavigation::Advanced,
+                &expected,
+            )
+            .await
         }
     }
 
@@ -706,9 +783,9 @@ mod tests {
         trees: &mut Vec<(&str, serde_json::Value)>,
         line: &str,
         word: Range<usize>,
+        path_hyperlink_navigation: PathHyperlinkNavigation,
         expected: &ExpectedMaybePathVariations<'a>,
     ) {
-        let path_hyperlink_navigation = PathHyperlinkNavigation::Exhaustive;
         let matched_maybe_path =
             MatchedMaybePath::from_line(line.to_string(), word, path_hyperlink_navigation);
 
