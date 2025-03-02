@@ -31,6 +31,11 @@ use std::{
 // 400 |
 // 401 |
 //
+// - Support escapes in paths, e.g. git octal escaping
+// See https://git-scm.com/docs/git-config#Documentation/git-config.txt-corequotePath
+// Note that "Double-quotes, backslash and control characters are always escaped\
+//  regardless of the setting of this variable.". Currently we don't support any
+// escaping in paths.
 
 use log::info;
 use regex::Regex;
