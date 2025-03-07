@@ -33,22 +33,21 @@ pub enum PathHyperlinkNavigation {
     /// This disables all path hyperlink navigation in the terminal.
     None,
     /// Path hyperlink for the word under the cursor for hover and Cmd-click.
-    /// - Common surrounding symbols are stripped, e.g., `"`,`'`, `[`, `]`, `(`, `)`
-    /// - Line and column suffixes, e.g. `foo.rs:4:2`, `foo.rs(4,2)`
+    /// - Common surrounding symbols are stripped, e.g., `"` `'` `[` `]` `(` `)`
+    /// - Line and column suffixes, e.g. `foo.rs:4:2` and `foo.rs(4,2)`
     /// - Relative paths resolve against all open worktree roots and `CWD`
     /// - _Linux and macOS only_ : `~/` prefix resolves to `$HOME`
     /// - `git diff` prefixes, e.g., `a/foo.rs`
-    Word,
-    /// Advanced path hyperlink support. All of [Default](PathHyperlinkNavigation::Word),
-    /// plus common paths with spaces scenarios
+    /// - Paths with spaces surrounded in common symbols
+    Default,
+    /// Advanced path hyperlink support. All of [Default](PathHyperlinkNavigation::Default),
+    /// plus:
     /// - Path with spaces at the end of a line
-    /// - Path with spaces has common surrounding symbols
-    /// - Path with only interior spaces, i.e., no spaces in the first or last components
     Advanced,
     /// Exhaustive path hyperlink support. All of [Advanced](PathHyperlinkNavigation::Advanced),
     /// plus less common paths with spaces scenarios
-    /// - Any contiguous sequence of words on a line which resolve to path with spaces
-    /// (must contain the hovered Cmd-clicked word)
+    /// - Any contiguous sequence of words on a line which include
+    /// the hovered or Cmd-clicked word and resolve to a real file
     Exhaustive,
 }
 
