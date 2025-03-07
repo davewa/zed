@@ -121,6 +121,7 @@ pub enum Event {
     Discarded,
     DirtyChanged,
     DiagnosticsUpdated,
+    BufferDiffChanged,
 }
 
 /// A diff hunk, representing a range of consequent lines in a multibuffer.
@@ -253,6 +254,7 @@ impl DiffState {
                     if let Some(changed_range) = changed_range.clone() {
                         this.buffer_diff_changed(diff, changed_range, cx)
                     }
+                    cx.emit(Event::BufferDiffChanged);
                 }
                 BufferDiffEvent::LanguageChanged => this.buffer_diff_language_changed(diff, cx),
                 _ => {}
@@ -3523,10 +3525,7 @@ impl MultiBufferSnapshot {
     ) -> impl Iterator<Item = MultiBufferDiffHunk> + '_ {
         let query_range = range.start.to_point(self)..range.end.to_point(self);
         self.lift_buffer_metadata(query_range.clone(), move |buffer, buffer_range| {
-            let Some(diff) = self.diffs.get(&buffer.remote_id()) else {
-                log::debug!("no diff found for {:?}", buffer.remote_id());
-                return None;
-            };
+            let diff = self.diffs.get(&buffer.remote_id())?;
             let buffer_start = buffer.anchor_before(buffer_range.start);
             let buffer_end = buffer.anchor_after(buffer_range.end);
             Some(

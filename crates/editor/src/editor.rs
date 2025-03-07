@@ -138,8 +138,9 @@ use multi_buffer::{
 use project::{
     lsp_store::{CompletionDocumentation, FormatTrigger, LspFormatTarget, OpenLspBufferHandle},
     project_settings::{GitGutterSetting, ProjectSettings},
-    CodeAction, Completion, CompletionIntent, DocumentHighlight, InlayHint, Location, LocationLink,
-    PrepareRenameResponse, Project, ProjectItem, ProjectTransaction, TaskSourceKind,
+    CodeAction, Completion, CompletionIntent, CompletionSource, DocumentHighlight, InlayHint,
+    Location, LocationLink, PrepareRenameResponse, Project, ProjectItem, ProjectTransaction,
+    TaskSourceKind,
 };
 use rand::prelude::*;
 use rpc::{proto::*, ErrorExt};
@@ -1250,11 +1251,6 @@ impl Editor {
         let mut project_subscriptions = Vec::new();
         if mode == EditorMode::Full {
             if let Some(project) = project.as_ref() {
-                if buffer.read(cx).is_singleton() {
-                    project_subscriptions.push(cx.observe_in(project, window, |_, _, _, cx| {
-                        cx.emit(EditorEvent::TitleChanged);
-                    }));
-                }
                 project_subscriptions.push(cx.subscribe_in(
                     project,
                     window,
@@ -14887,14 +14883,14 @@ impl Editor {
         &self,
         window: &mut Window,
         cx: &mut App,
-    ) -> BTreeMap<DisplayRow, Background> {
+    ) -> BTreeMap<DisplayRow, LineHighlight> {
         let snapshot = self.snapshot(window, cx);
         let mut used_highlight_orders = HashMap::default();
         self.highlighted_rows
             .iter()
             .flat_map(|(_, highlighted_rows)| highlighted_rows.iter())
             .fold(
-                BTreeMap::<DisplayRow, Background>::new(),
+                BTreeMap::<DisplayRow, LineHighlight>::new(),
                 |mut unique_rows, highlight| {
                     let start = highlight.range.start.to_display_point(&snapshot);
                     let end = highlight.range.end.to_display_point(&snapshot);
@@ -15442,14 +15438,9 @@ impl Editor {
             }
             multi_buffer::Event::DirtyChanged => cx.emit(EditorEvent::DirtyChanged),
             multi_buffer::Event::Saved => cx.emit(EditorEvent::Saved),
-            multi_buffer::Event::FileHandleChanged | multi_buffer::Event::Reloaded => {
-                cx.emit(EditorEvent::TitleChanged)
-            }
-            // multi_buffer::Event::DiffBaseChanged => {
-            //     self.scrollbar_marker_state.dirty = true;
-            //     cx.emit(EditorEvent::DiffBaseChanged);
-            //     cx.notify();
-            // }
+            multi_buffer::Event::FileHandleChanged
+            | multi_buffer::Event::Reloaded
+            | multi_buffer::Event::BufferDiffChanged => cx.emit(EditorEvent::TitleChanged),
             multi_buffer::Event::Closed => cx.emit(EditorEvent::Closed),
             multi_buffer::Event::DiagnosticsUpdated => {
                 self.refresh_active_diagnostics(cx);
@@ -16907,38 +16898,40 @@ fn snippet_completions(
                 Some(Completion {
                     old_range: range,
                     new_text: snippet.body.clone(),
-                    resolved: false,
+                    source: CompletionSource::Lsp {
+                        server_id: LanguageServerId(usize::MAX),
+                        resolved: true,
+                        lsp_completion: Box::new(lsp::CompletionItem {
+                            label: snippet.prefix.first().unwrap().clone(),
+                            kind: Some(CompletionItemKind::SNIPPET),
+                            label_details: snippet.description.as_ref().map(|description| {
+                                lsp::CompletionItemLabelDetails {
+                                    detail: Some(description.clone()),
+                                    description: None,
+                                }
+                            }),
+                            insert_text_format: Some(InsertTextFormat::SNIPPET),
+                            text_edit: Some(lsp::CompletionTextEdit::InsertAndReplace(
+                                lsp::InsertReplaceEdit {
+                                    new_text: snippet.body.clone(),
+                                    insert: lsp_range,
+                                    replace: lsp_range,
+                                },
+                            )),
+                            filter_text: Some(snippet.body.clone()),
+                            sort_text: Some(char::MAX.to_string()),
+                            ..lsp::CompletionItem::default()
+                        }),
+                    },
                     label: CodeLabel {
                         text: matching_prefix.clone(),
-                        runs: vec![],
+                        runs: Vec::new(),
                         filter_range: 0..matching_prefix.len(),
                     },
-                    server_id: LanguageServerId(usize::MAX),
                     documentation: snippet
                         .description
                         .clone()
                         .map(|description| CompletionDocumentation::SingleLine(description.into())),
-                    lsp_completion: lsp::CompletionItem {
-                        label: snippet.prefix.first().unwrap().clone(),
-                        kind: Some(CompletionItemKind::SNIPPET),
-                        label_details: snippet.description.as_ref().map(|description| {
-                            lsp::CompletionItemLabelDetails {
-                                detail: Some(description.clone()),
-                                description: None,
-                            }
-                        }),
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        text_edit: Some(lsp::CompletionTextEdit::InsertAndReplace(
-                            lsp::InsertReplaceEdit {
-                                new_text: snippet.body.clone(),
-                                insert: lsp_range,
-                                replace: lsp_range,
-                            },
-                        )),
-                        filter_text: Some(snippet.body.clone()),
-                        sort_text: Some(char::MAX.to_string()),
-                        ..Default::default()
-                    },
                     confirm: None,
                 })
             })
@@ -18434,5 +18427,29 @@ impl Render for MissingEditPredictionKeybindingTooltip {
                         })),
                 )
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LineHighlight {
+    pub background: Background,
+    pub border: Option<gpui::Hsla>,
+}
+
+impl From<Hsla> for LineHighlight {
+    fn from(hsla: Hsla) -> Self {
+        Self {
+            background: hsla.into(),
+            border: None,
+        }
+    }
+}
+
+impl From<Background> for LineHighlight {
+    fn from(background: Background) -> Self {
+        Self {
+            background,
+            border: None,
+        }
     }
 }
