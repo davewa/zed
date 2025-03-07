@@ -25,6 +25,7 @@ use git::{
         FileStatus, GitSummary, StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode,
     },
     GitHostingProviderRegistry, COMMIT_MESSAGE, DOT_GIT, FSMONITOR_DAEMON, GITIGNORE, INDEX_LOCK,
+    LFS_DIR,
 };
 use gpui::{
     App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Task,
@@ -57,7 +58,7 @@ use std::{
     future::Future,
     mem::{self},
     ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     pin::Pin,
     sync::{
         atomic::{self, AtomicU32, AtomicUsize, Ordering::SeqCst},
@@ -211,7 +212,11 @@ impl RepositoryEntry {
         self.work_directory.relativize(path)
     }
 
-    pub fn unrelativize(&self, path: &RepoPath) -> Option<Arc<Path>> {
+    pub fn try_unrelativize(&self, path: &RepoPath) -> Option<Arc<Path>> {
+        self.work_directory.try_unrelativize(path)
+    }
+
+    pub fn unrelativize(&self, path: &RepoPath) -> Arc<Path> {
         self.work_directory.unrelativize(path)
     }
 
@@ -381,6 +386,7 @@ pub fn proto_to_branch(proto: &proto::Branch) -> git::repository::Branch {
                 sha: commit.sha.to_string().into(),
                 subject: commit.subject.to_string().into(),
                 commit_timestamp: commit.commit_timestamp,
+                has_parent: true,
             }
         }),
     }
@@ -489,7 +495,7 @@ impl WorkDirectory {
     }
 
     /// This is the opposite operation to `relativize` above
-    pub fn unrelativize(&self, path: &RepoPath) -> Option<Arc<Path>> {
+    pub fn try_unrelativize(&self, path: &RepoPath) -> Option<Arc<Path>> {
         match self {
             WorkDirectory::InProject { relative_path } => Some(relative_path.join(path).into()),
             WorkDirectory::AboveProject {
@@ -498,6 +504,33 @@ impl WorkDirectory {
                 // If we fail to strip the prefix, that means this status entry is
                 // external to this worktree, and we definitely won't have an entry_id
                 path.strip_prefix(location_in_repo).ok().map(Into::into)
+            }
+        }
+    }
+
+    pub fn unrelativize(&self, path: &RepoPath) -> Arc<Path> {
+        match self {
+            WorkDirectory::InProject { relative_path } => relative_path.join(path).into(),
+            WorkDirectory::AboveProject {
+                location_in_repo, ..
+            } => {
+                if &path.0 == location_in_repo {
+                    // Single-file worktree
+                    return location_in_repo
+                        .file_name()
+                        .map(Path::new)
+                        .unwrap_or(Path::new(""))
+                        .into();
+                }
+                let mut location_in_repo = &**location_in_repo;
+                let mut parents = PathBuf::new();
+                loop {
+                    if let Ok(segment) = path.strip_prefix(location_in_repo) {
+                        return parents.join(segment).into();
+                    }
+                    location_in_repo = location_in_repo.parent().unwrap_or(Path::new(""));
+                    parents.push(Component::ParentDir);
+                }
             }
         }
     }
@@ -1419,6 +1452,19 @@ impl Worktree {
             entry: task.await?.as_ref().map(|e| e.into()),
             worktree_scan_id: scan_id as u64,
         })
+    }
+
+    pub fn dot_git_abs_path(&self, work_directory: &WorkDirectory) -> PathBuf {
+        let mut path = match work_directory {
+            WorkDirectory::InProject { relative_path } => self.abs_path().join(relative_path),
+            WorkDirectory::AboveProject { absolute_path, .. } => absolute_path.as_ref().to_owned(),
+        };
+        path.push(".git");
+        path
+    }
+
+    pub fn is_single_file(&self) -> bool {
+        self.root_dir().is_none()
     }
 }
 
@@ -4291,7 +4337,11 @@ impl BackgroundScanner {
         let mut containing_git_repository = None;
         for (index, ancestor) in root_abs_path.as_path().ancestors().enumerate() {
             if index != 0 {
-                if let Ok(ignore) =
+                if Some(ancestor) == self.fs.home_dir().as_deref() {
+                    // Unless $HOME is itself the worktree root, don't consider it as a
+                    // containing git repository---expensive and likely unwanted.
+                    break;
+                } else if let Ok(ignore) =
                     build_gitignore(&ancestor.join(*GITIGNORE), self.fs.as_ref()).await
                 {
                     self.state
@@ -4303,6 +4353,7 @@ impl BackgroundScanner {
             }
 
             let ancestor_dot_git = ancestor.join(*DOT_GIT);
+            log::debug!("considering ancestor: {ancestor_dot_git:?}");
             // Check whether the directory or file called `.git` exists (in the
             // case of worktrees it's a file.)
             if self
@@ -4311,21 +4362,26 @@ impl BackgroundScanner {
                 .await
                 .is_ok_and(|metadata| metadata.is_some())
             {
+                log::debug!(".git path exists");
                 if index != 0 {
                     // We canonicalize, since the FS events use the canonicalized path.
                     if let Some(ancestor_dot_git) =
                         self.fs.canonicalize(&ancestor_dot_git).await.log_err()
                     {
+                        let location_in_repo = root_abs_path
+                            .as_path()
+                            .strip_prefix(ancestor)
+                            .unwrap()
+                            .into();
+                        log::debug!(
+                            "inserting parent git repo for this worktree: {location_in_repo:?}"
+                        );
                         // We associate the external git repo with our root folder and
                         // also mark where in the git repo the root folder is located.
                         let local_repository = self.state.lock().insert_git_repository_for_path(
                             WorkDirectory::AboveProject {
                                 absolute_path: ancestor.into(),
-                                location_in_repo: root_abs_path
-                                    .as_path()
-                                    .strip_prefix(ancestor)
-                                    .unwrap()
-                                    .into(),
+                                location_in_repo,
                             },
                             ancestor_dot_git.clone().into(),
                             self.fs.as_ref(),
@@ -4340,8 +4396,12 @@ impl BackgroundScanner {
 
                 // Reached root of git repository.
                 break;
+            } else {
+                log::debug!(".git path doesn't exist");
             }
         }
+
+        log::debug!("containing git repository: {containing_git_repository:?}");
 
         let (scan_job_tx, scan_job_rx) = channel::unbounded();
         {
@@ -4513,7 +4573,7 @@ impl BackgroundScanner {
         // Certain directories may have FS changes, but do not lead to git data changes that Zed cares about.
         // Ignore these, to avoid Zed unnecessarily rescanning git metadata.
         let skipped_files_in_dot_git = HashSet::from_iter([*COMMIT_MESSAGE, *INDEX_LOCK]);
-        let skipped_dirs_in_dot_git = [*FSMONITOR_DAEMON];
+        let skipped_dirs_in_dot_git = [*FSMONITOR_DAEMON, *LFS_DIR];
 
         let mut relative_paths = Vec::with_capacity(abs_paths.len());
         let mut dot_git_abs_paths = Vec::new();
@@ -5493,7 +5553,7 @@ impl BackgroundScanner {
 
                 let mut new_entries_by_path = SumTree::new(&());
                 for (repo_path, status) in statuses.entries.iter() {
-                    let project_path = repository.work_directory.unrelativize(repo_path);
+                    let project_path = repository.work_directory.try_unrelativize(repo_path);
 
                     new_entries_by_path.insert_or_replace(
                         StatusEntry {

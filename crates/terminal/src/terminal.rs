@@ -122,7 +122,7 @@ pub struct PathLikeTarget {
     pub maybe_path: MaybePath,
     /// Current working directory of the terminal
     pub terminal_dir: Option<PathBuf>,
-    /// The id of the hyperlink
+    /// The id of the hovered word
     pub id: usize,
 }
 
@@ -653,6 +653,7 @@ pub struct TaskState {
     pub hide: HideStrategy,
     pub show_summary: bool,
     pub show_command: bool,
+    pub show_rerun: bool,
 }
 
 /// A status of the current terminal tab's task.

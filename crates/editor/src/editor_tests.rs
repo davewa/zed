@@ -2965,7 +2965,7 @@ async fn test_indent_outdent(cx: &mut TestAppContext) {
          four
     "});
 
-    cx.update_editor(|e, window, cx| e.tab_prev(&TabPrev, window, cx));
+    cx.update_editor(|e, window, cx| e.backtab(&Backtab, window, cx));
     cx.assert_editor_state(indoc! {"
         «oneˇ» «twoˇ»
         three
@@ -2985,7 +2985,7 @@ async fn test_indent_outdent(cx: &mut TestAppContext) {
         ˇ» four
     "});
 
-    cx.update_editor(|e, window, cx| e.tab_prev(&TabPrev, window, cx));
+    cx.update_editor(|e, window, cx| e.backtab(&Backtab, window, cx));
     cx.assert_editor_state(indoc! {"
         one two
         t«hree
@@ -3010,7 +3010,7 @@ async fn test_indent_outdent(cx: &mut TestAppContext) {
         ˇ    three
             four
     "});
-    cx.update_editor(|e, window, cx| e.tab_prev(&TabPrev, window, cx));
+    cx.update_editor(|e, window, cx| e.backtab(&Backtab, window, cx));
     cx.assert_editor_state(indoc! {"
         one two
         ˇthree
@@ -3044,13 +3044,13 @@ async fn test_indent_outdent_with_hard_tabs(cx: &mut TestAppContext) {
         three
         four
     "});
-    cx.update_editor(|e, window, cx| e.tab_prev(&TabPrev, window, cx));
+    cx.update_editor(|e, window, cx| e.backtab(&Backtab, window, cx));
     cx.assert_editor_state(indoc! {"
         \t«oneˇ» «twoˇ»
         three
         four
     "});
-    cx.update_editor(|e, window, cx| e.tab_prev(&TabPrev, window, cx));
+    cx.update_editor(|e, window, cx| e.backtab(&Backtab, window, cx));
     cx.assert_editor_state(indoc! {"
         «oneˇ» «twoˇ»
         three
@@ -3075,13 +3075,13 @@ async fn test_indent_outdent_with_hard_tabs(cx: &mut TestAppContext) {
         \t\tt«hree
         ˇ»four
     "});
-    cx.update_editor(|e, window, cx| e.tab_prev(&TabPrev, window, cx));
+    cx.update_editor(|e, window, cx| e.backtab(&Backtab, window, cx));
     cx.assert_editor_state(indoc! {"
         one two
         \tt«hree
         ˇ»four
     "});
-    cx.update_editor(|e, window, cx| e.tab_prev(&TabPrev, window, cx));
+    cx.update_editor(|e, window, cx| e.backtab(&Backtab, window, cx));
     cx.assert_editor_state(indoc! {"
         one two
         t«hree
@@ -3094,7 +3094,7 @@ async fn test_indent_outdent_with_hard_tabs(cx: &mut TestAppContext) {
         ˇthree
         four
     "});
-    cx.update_editor(|e, window, cx| e.tab_prev(&TabPrev, window, cx));
+    cx.update_editor(|e, window, cx| e.backtab(&Backtab, window, cx));
     cx.assert_editor_state(indoc! {"
         one two
         ˇthree
@@ -3106,7 +3106,7 @@ async fn test_indent_outdent_with_hard_tabs(cx: &mut TestAppContext) {
         \tˇthree
         four
     "});
-    cx.update_editor(|e, window, cx| e.tab_prev(&TabPrev, window, cx));
+    cx.update_editor(|e, window, cx| e.backtab(&Backtab, window, cx));
     cx.assert_editor_state(indoc! {"
         one two
         ˇthree
@@ -3211,7 +3211,7 @@ fn test_indent_outdent_with_excerpts(cx: &mut TestAppContext) {
             "},
             cx,
         );
-        editor.tab_prev(&TabPrev, window, cx);
+        editor.backtab(&Backtab, window, cx);
         assert_text_with_selections(
             &mut editor,
             indoc! {"
@@ -4931,6 +4931,34 @@ async fn test_paste_multiline(cx: &mut TestAppContext) {
             )
         );
     "});
+
+    // Copy an indented block, starting mid-line
+    cx.set_state(indoc! {"
+        const a: B = (
+            c(),
+            somethin«g(
+                e,
+                f
+            )ˇ»
+        );
+    "});
+    cx.update_editor(|e, window, cx| e.copy(&Copy, window, cx));
+
+    // Paste it on a line with a lower indent level
+    cx.update_editor(|e, window, cx| e.move_to_end(&Default::default(), window, cx));
+    cx.update_editor(|e, window, cx| e.paste(&Paste, window, cx));
+    cx.assert_editor_state(indoc! {"
+        const a: B = (
+            c(),
+            something(
+                e,
+                f
+            )
+        );
+        g(
+            e,
+            f
+        )ˇ"});
 }
 
 #[gpui::test]
@@ -11026,7 +11054,7 @@ async fn go_to_prev_overlapping_diagnostic(executor: BackgroundExecutor, cx: &mu
     executor.run_until_parked();
 
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_diagnostic(&GoToPrevDiagnostic, window, cx);
+        editor.go_to_prev_diagnostic(&GoToPreviousDiagnostic, window, cx);
     });
 
     cx.assert_editor_state(indoc! {"
@@ -11035,7 +11063,7 @@ async fn go_to_prev_overlapping_diagnostic(executor: BackgroundExecutor, cx: &mu
     "});
 
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_diagnostic(&GoToPrevDiagnostic, window, cx);
+        editor.go_to_prev_diagnostic(&GoToPreviousDiagnostic, window, cx);
     });
 
     cx.assert_editor_state(indoc! {"
@@ -11044,7 +11072,7 @@ async fn go_to_prev_overlapping_diagnostic(executor: BackgroundExecutor, cx: &mu
     "});
 
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_diagnostic(&GoToPrevDiagnostic, window, cx);
+        editor.go_to_prev_diagnostic(&GoToPreviousDiagnostic, window, cx);
     });
 
     cx.assert_editor_state(indoc! {"
@@ -11053,7 +11081,7 @@ async fn go_to_prev_overlapping_diagnostic(executor: BackgroundExecutor, cx: &mu
     "});
 
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_diagnostic(&GoToPrevDiagnostic, window, cx);
+        editor.go_to_prev_diagnostic(&GoToPreviousDiagnostic, window, cx);
     });
 
     cx.assert_editor_state(indoc! {"
@@ -11133,7 +11161,7 @@ async fn cycle_through_same_place_diagnostics(
 
     // Fourth diagnostic
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_diagnostic(&GoToPrevDiagnostic, window, cx);
+        editor.go_to_prev_diagnostic(&GoToPreviousDiagnostic, window, cx);
     });
     cx.assert_editor_state(indoc! {"
         fn func(abc def: i32) -> ˇu32 {
@@ -11142,7 +11170,7 @@ async fn cycle_through_same_place_diagnostics(
 
     // Third diagnostic
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_diagnostic(&GoToPrevDiagnostic, window, cx);
+        editor.go_to_prev_diagnostic(&GoToPreviousDiagnostic, window, cx);
     });
     cx.assert_editor_state(indoc! {"
         fn func(abc ˇdef: i32) -> u32 {
@@ -11151,7 +11179,7 @@ async fn cycle_through_same_place_diagnostics(
 
     // Second diagnostic, same place
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_diagnostic(&GoToPrevDiagnostic, window, cx);
+        editor.go_to_prev_diagnostic(&GoToPreviousDiagnostic, window, cx);
     });
     cx.assert_editor_state(indoc! {"
         fn func(abc ˇdef: i32) -> u32 {
@@ -11160,7 +11188,7 @@ async fn cycle_through_same_place_diagnostics(
 
     // First diagnostic
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_diagnostic(&GoToPrevDiagnostic, window, cx);
+        editor.go_to_prev_diagnostic(&GoToPreviousDiagnostic, window, cx);
     });
     cx.assert_editor_state(indoc! {"
         fn func(abcˇ def: i32) -> u32 {
@@ -11169,7 +11197,7 @@ async fn cycle_through_same_place_diagnostics(
 
     // Wrapped over, fourth diagnostic
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_diagnostic(&GoToPrevDiagnostic, window, cx);
+        editor.go_to_prev_diagnostic(&GoToPreviousDiagnostic, window, cx);
     });
     cx.assert_editor_state(indoc! {"
         fn func(abc def: i32) -> ˇu32 {
@@ -11413,7 +11441,7 @@ async fn test_go_to_hunk(executor: BackgroundExecutor, cx: &mut TestAppContext) 
     cx.update_editor(|editor, window, cx| {
         //Wrap around the bottom of the buffer
         for _ in 0..3 {
-            editor.go_to_next_hunk(&GoToHunk::default(), window, cx);
+            editor.go_to_next_hunk(&GoToHunk, window, cx);
         }
     });
 
@@ -11435,7 +11463,7 @@ async fn test_go_to_hunk(executor: BackgroundExecutor, cx: &mut TestAppContext) 
     cx.update_editor(|editor, window, cx| {
         //Wrap around the top of the buffer
         for _ in 0..2 {
-            editor.go_to_prev_hunk(&GoToPrevHunk::default(), window, cx);
+            editor.go_to_prev_hunk(&GoToPreviousHunk, window, cx);
         }
     });
 
@@ -11455,7 +11483,7 @@ async fn test_go_to_hunk(executor: BackgroundExecutor, cx: &mut TestAppContext) 
     );
 
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_hunk(&GoToPrevHunk::default(), window, cx);
+        editor.go_to_prev_hunk(&GoToPreviousHunk, window, cx);
     });
 
     cx.assert_editor_state(
@@ -11474,7 +11502,7 @@ async fn test_go_to_hunk(executor: BackgroundExecutor, cx: &mut TestAppContext) 
     );
 
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_prev_hunk(&GoToPrevHunk::default(), window, cx);
+        editor.go_to_prev_hunk(&GoToPreviousHunk, window, cx);
     });
 
     cx.assert_editor_state(
@@ -11494,7 +11522,7 @@ async fn test_go_to_hunk(executor: BackgroundExecutor, cx: &mut TestAppContext) 
 
     cx.update_editor(|editor, window, cx| {
         for _ in 0..2 {
-            editor.go_to_prev_hunk(&GoToPrevHunk::default(), window, cx);
+            editor.go_to_prev_hunk(&GoToPreviousHunk, window, cx);
         }
     });
 
@@ -11518,7 +11546,7 @@ async fn test_go_to_hunk(executor: BackgroundExecutor, cx: &mut TestAppContext) 
     });
 
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_next_hunk(&GoToHunk::default(), window, cx);
+        editor.go_to_next_hunk(&GoToHunk, window, cx);
     });
 
     cx.assert_editor_state(
@@ -12229,7 +12257,7 @@ async fn test_completions_resolve_happens_once(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     cx.update_editor(|editor, window, cx| {
-        editor.context_menu_prev(&ContextMenuPrev, window, cx);
+        editor.context_menu_prev(&ContextMenuPrevious, window, cx);
     });
     cx.run_until_parked();
     cx.update_editor(|editor, window, cx| {
@@ -12419,7 +12447,7 @@ async fn test_completions_default_resolve_data_handling(cx: &mut TestAppContext)
     resolved_items.lock().clear();
 
     cx.update_editor(|editor, window, cx| {
-        editor.context_menu_prev(&ContextMenuPrev, window, cx);
+        editor.context_menu_prev(&ContextMenuPrevious, window, cx);
     });
     cx.run_until_parked();
     // Completions that have already been resolved are skipped.
@@ -13525,7 +13553,7 @@ async fn test_toggle_selected_diff_hunks(executor: BackgroundExecutor, cx: &mut 
     executor.run_until_parked();
 
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_next_hunk(&GoToHunk::default(), window, cx);
+        editor.go_to_next_hunk(&GoToHunk, window, cx);
         editor.toggle_selected_diff_hunks(&ToggleSelectedDiffHunks, window, cx);
     });
     executor.run_until_parked();
@@ -13547,7 +13575,7 @@ async fn test_toggle_selected_diff_hunks(executor: BackgroundExecutor, cx: &mut 
 
     cx.update_editor(|editor, window, cx| {
         for _ in 0..2 {
-            editor.go_to_next_hunk(&GoToHunk::default(), window, cx);
+            editor.go_to_next_hunk(&GoToHunk, window, cx);
             editor.toggle_selected_diff_hunks(&ToggleSelectedDiffHunks, window, cx);
         }
     });
@@ -13570,7 +13598,7 @@ async fn test_toggle_selected_diff_hunks(executor: BackgroundExecutor, cx: &mut 
     );
 
     cx.update_editor(|editor, window, cx| {
-        editor.go_to_next_hunk(&GoToHunk::default(), window, cx);
+        editor.go_to_next_hunk(&GoToHunk, window, cx);
         editor.toggle_selected_diff_hunks(&ToggleSelectedDiffHunks, window, cx);
     });
     executor.run_until_parked();
@@ -16777,6 +16805,245 @@ async fn test_tree_sitter_brackets_newline_insertion(cx: &mut TestAppContext) {
         ˇ
         </span>
     "});
+}
+
+mod autoclose_tags {
+    use super::*;
+    use language::language_settings::JsxTagAutoCloseSettings;
+    use languages::language;
+
+    async fn test_setup(cx: &mut TestAppContext) -> EditorTestContext {
+        init_test(cx, |settings| {
+            settings.defaults.jsx_tag_auto_close = Some(JsxTagAutoCloseSettings { enabled: true });
+        });
+
+        let mut cx = EditorTestContext::new(cx).await;
+        cx.update_buffer(|buffer, cx| {
+            let language = language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into());
+
+            buffer.set_language(Some(language), cx)
+        });
+
+        cx
+    }
+
+    macro_rules! check {
+        ($name:ident, $initial:literal + $input:literal => $expected:expr) => {
+            #[gpui::test]
+            async fn $name(cx: &mut TestAppContext) {
+                let mut cx = test_setup(cx).await;
+                cx.set_state($initial);
+                cx.run_until_parked();
+
+                cx.update_editor(|editor, window, cx| {
+                    editor.handle_input($input, window, cx);
+                });
+                cx.run_until_parked();
+                cx.assert_editor_state($expected);
+            }
+        };
+    }
+
+    check!(
+        test_basic,
+        "<divˇ" + ">" => "<div>ˇ</div>"
+    );
+
+    check!(
+        test_basic_nested,
+        "<div><divˇ</div>" + ">" => "<div><div>ˇ</div></div>"
+    );
+
+    check!(
+        test_basic_ignore_already_closed,
+        "<div><divˇ</div></div>" + ">" => "<div><div>ˇ</div></div>"
+    );
+
+    check!(
+        test_doesnt_autoclose_closing_tag,
+        "</divˇ" + ">" => "</div>ˇ"
+    );
+
+    check!(
+        test_jsx_attr,
+        "<div attr={</div>}ˇ" + ">" => "<div attr={</div>}>ˇ</div>"
+    );
+
+    check!(
+        test_ignores_closing_tags_in_expr_block,
+        "<div><divˇ{</div>}</div>" + ">" => "<div><div>ˇ</div>{</div>}</div>"
+    );
+
+    check!(
+        test_doesnt_autoclose_on_gt_in_expr,
+        "<div attr={1 ˇ" + ">" => "<div attr={1 >ˇ"
+    );
+
+    check!(
+        test_ignores_closing_tags_with_different_tag_names,
+        "<div><divˇ</div></span>" + ">" => "<div><div>ˇ</div></div></span>"
+    );
+
+    check!(
+        test_autocloses_in_jsx_expression,
+        "<div>{<divˇ}</div>" + ">" => "<div>{<div>ˇ</div>}</div>"
+    );
+
+    check!(
+        test_doesnt_autoclose_already_closed_in_jsx_expression,
+        "<div>{<divˇ</div>}</div>" + ">" => "<div>{<div>ˇ</div>}</div>"
+    );
+
+    check!(
+        test_autocloses_fragment,
+        "<ˇ" + ">" => "<>ˇ</>"
+    );
+
+    check!(
+        test_does_not_include_type_argument_in_autoclose_tag_name,
+        "<Component<T> attr={boolean_value}ˇ" + ">" => "<Component<T> attr={boolean_value}>ˇ</Component>"
+    );
+
+    check!(
+        test_does_not_autoclose_doctype,
+        "<!DOCTYPE htmlˇ" + ">" => "<!DOCTYPE html>ˇ"
+    );
+
+    check!(
+        test_does_not_autoclose_comment,
+        "<!-- comment --ˇ" + ">" => "<!-- comment -->ˇ"
+    );
+
+    check!(
+        test_multi_cursor_autoclose_same_tag,
+        r#"
+        <divˇ
+        <divˇ
+        "#
+        + ">" =>
+        r#"
+        <div>ˇ</div>
+        <div>ˇ</div>
+        "#
+    );
+
+    check!(
+        test_multi_cursor_autoclose_different_tags,
+        r#"
+        <divˇ
+        <spanˇ
+        "#
+        + ">" =>
+        r#"
+        <div>ˇ</div>
+        <span>ˇ</span>
+        "#
+    );
+
+    check!(
+        test_multi_cursor_autoclose_some_dont_autoclose_others,
+        r#"
+        <divˇ
+        <div /ˇ
+        <spanˇ</span>
+        <!DOCTYPE htmlˇ
+        </headˇ
+        <Component<T>ˇ
+        ˇ
+        "#
+        + ">" =>
+        r#"
+        <div>ˇ</div>
+        <div />ˇ
+        <span>ˇ</span>
+        <!DOCTYPE html>ˇ
+        </head>ˇ
+        <Component<T>>ˇ</Component>
+        >ˇ
+        "#
+    );
+
+    check!(
+        test_doesnt_mess_up_trailing_text,
+        "<divˇfoobar" + ">" => "<div>ˇ</div>foobar"
+    );
+
+    #[gpui::test]
+    async fn test_multibuffer(cx: &mut TestAppContext) {
+        init_test(cx, |settings| {
+            settings.defaults.jsx_tag_auto_close = Some(JsxTagAutoCloseSettings { enabled: true });
+        });
+
+        let buffer_a = cx.new(|cx| {
+            let mut buf = language::Buffer::local("<div", cx);
+            buf.set_language(
+                Some(language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())),
+                cx,
+            );
+            buf
+        });
+        let buffer_b = cx.new(|cx| {
+            let mut buf = language::Buffer::local("<pre", cx);
+            buf.set_language(
+                Some(language("tsx", tree_sitter_typescript::LANGUAGE_TSX.into())),
+                cx,
+            );
+            buf
+        });
+        let buffer_c = cx.new(|cx| {
+            let buf = language::Buffer::local("<span", cx);
+            buf
+        });
+        let buffer = cx.new(|cx| {
+            let mut buf = MultiBuffer::new(language::Capability::ReadWrite);
+            buf.push_excerpts(
+                buffer_a,
+                [ExcerptRange {
+                    context: text::Anchor::MIN..text::Anchor::MAX,
+                    primary: None,
+                }],
+                cx,
+            );
+            buf.push_excerpts(
+                buffer_b,
+                [ExcerptRange {
+                    context: text::Anchor::MIN..text::Anchor::MAX,
+                    primary: None,
+                }],
+                cx,
+            );
+            buf.push_excerpts(
+                buffer_c,
+                [ExcerptRange {
+                    context: text::Anchor::MIN..text::Anchor::MAX,
+                    primary: None,
+                }],
+                cx,
+            );
+            buf
+        });
+        let editor = cx.add_window(|window, cx| build_editor(buffer.clone(), window, cx));
+
+        let mut cx = EditorTestContext::for_editor(editor, cx).await;
+
+        cx.update_editor(|editor, window, cx| {
+            editor.change_selections(None, window, cx, |selections| {
+                selections.select(vec![
+                    Selection::from_offset(4),
+                    Selection::from_offset(9),
+                    Selection::from_offset(15),
+                ])
+            })
+        });
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, window, cx| {
+            editor.handle_input(">", window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.assert_editor_state("<div>ˇ</div>\n<pre>ˇ</pre>\n<span>ˇ");
+    }
 }
 
 fn empty_range(row: usize, column: usize) -> Range<DisplayPoint> {

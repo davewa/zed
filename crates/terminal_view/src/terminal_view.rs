@@ -4,20 +4,24 @@ pub mod terminal_panel;
 pub mod terminal_scrollbar;
 pub mod terminal_tab_tooltip;
 
-use collections::{HashMap, HashSet};
+use collections::HashSet;
 use editor::{actions::SelectAll, scroll::ScrollbarAutoHide, Editor, EditorSettings};
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use gpui::{
     anchored, deferred, div, impl_actions, AnyElement, App, DismissEvent, Entity, EventEmitter,
     FocusHandle, Focusable, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
     Pixels, Render, ScrollWheelEvent, Stateful, Styled, Subscription, Task, WeakEntity,
 };
+use itertools::Itertools;
 use log::{info, trace};
 use persistence::TERMINAL_DB;
 use project::Entry;
 use project::{search::SearchQuery, terminals::TerminalKind, Fs, Metadata, Project};
 use schemars::JsonSchema;
-use terminal::terminal_path_hyperlinks::{MaybePath, MaybePathVariant, MaybePathWithPosition};
+use terminal::terminal_path_hyperlinks::{
+    MaybePath, MaybePathVariant, MaybePathWithPosition, RowColumn,
+};
 use terminal::{
     alacritty_terminal::{
         index::Point,
@@ -25,8 +29,8 @@ use terminal::{
     },
     terminal_settings::{self, CursorShape, TerminalBlink, TerminalSettings, WorkingDirectory},
     Clear, Copy, Event, MaybeNavigationTarget, Paste, PathLikeTarget, ScrollLineDown, ScrollLineUp,
-    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ShowCharacterPalette, TaskStatus,
-    Terminal, TerminalBounds, ToggleViMode,
+    ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ShowCharacterPalette, TaskState,
+    TaskStatus, Terminal, TerminalBounds, ToggleViMode,
 };
 use terminal_element::{is_blank, TerminalElement};
 use terminal_panel::TerminalPanel;
@@ -35,15 +39,15 @@ use terminal_tab_tooltip::TerminalTooltip;
 use ui::{
     h_flex, prelude::*, ContextMenu, Icon, IconName, Label, Scrollbar, ScrollbarState, Tooltip,
 };
-use util::{paths::PathWithPosition, ResultExt};
+use util::{debug_panic, ResultExt};
 use workspace::{
     item::{
         BreadcrumbText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
     register_serializable_item,
-    searchable::{SearchEvent, SearchOptions, SearchableItem, SearchableItemHandle},
-    CloseActiveItem, NewCenterTerminal, NewTerminal, OpenVisible, ToolbarItemLocation, Workspace,
-    WorkspaceId,
+    searchable::{Direction, SearchEvent, SearchOptions, SearchableItem, SearchableItemHandle},
+    CloseActiveItem, NewCenterTerminal, NewTerminal, OpenOptions, OpenVisible, ToolbarItemLocation,
+    Workspace, WorkspaceId,
 };
 
 use anyhow::Context as _;
@@ -52,11 +56,11 @@ use settings::{Settings, SettingsStore};
 use smol::Timer;
 use zed_actions::assistant::InlineAssist;
 
+use std::ops::Deref;
 use std::{
     borrow::Cow,
     cmp,
-    fmt::Display,
-    ops::{Range, RangeInclusive},
+    ops::RangeInclusive,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -107,27 +111,10 @@ pub struct BlockContext<'a, 'b> {
 }
 
 #[derive(Clone, Debug)]
-struct ValidPathsToOpen {
+struct MaybePathOpenTarget {
     pub target: PathLikeTarget,
-    pub paths_with_metadata: Vec<(PathWithPosition, Metadata)>,
-    pub hyperlink_range: Range<usize>,
-}
-
-impl Display for ValidPathsToOpen {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_fmt(format_args!(
-            "ValidPathsToOpen{{ target: {:?}, paths_with_position: [",
-            self.target
-        ))?;
-        for (path_with_position, Metadata { is_dir, .. }) in &self.paths_with_metadata {
-            formatter.write_fmt(format_args!("\n{path_with_position:?}, is_dir: {is_dir}"))?;
-        }
-        formatter.write_fmt(format_args!(
-            "], hyperlink_range: {:?} }}",
-            self.hyperlink_range
-        ))?;
-        Ok(())
-    }
+    pub maybe_path_with_position: MaybePathWithPosition<'static>,
+    pub open_target: OpenTarget,
 }
 
 ///A terminal view, maintains the PTY's file handles and communicates with the terminal
@@ -145,7 +132,7 @@ pub struct TerminalView {
     blinking_paused: bool,
     blink_epoch: usize,
     can_navigate_to_selected_word: bool,
-    selected_word_valid_paths_to_open: Option<ValidPathsToOpen>,
+    selected_word_maybe_path_target: Option<MaybePathOpenTarget>,
     workspace_id: Option<WorkspaceId>,
     show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
@@ -229,7 +216,7 @@ impl TerminalView {
             blinking_paused: false,
             blink_epoch: 0,
             can_navigate_to_selected_word: false,
-            selected_word_valid_paths_to_open: None,
+            selected_word_maybe_path_target: None,
             workspace_id,
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
@@ -838,30 +825,57 @@ impl TerminalView {
         )
     }
 
-    fn update_valid_paths_to_open(
+    fn rerun_button(task: &TaskState) -> Option<IconButton> {
+        if !task.show_rerun {
+            return None;
+        }
+
+        let task_id = task.id.clone();
+        Some(
+            IconButton::new("rerun-icon", IconName::Rerun)
+                .icon_size(IconSize::Small)
+                .size(ButtonSize::Compact)
+                .icon_color(Color::Default)
+                .shape(ui::IconButtonShape::Square)
+                .tooltip(Tooltip::text("Rerun task"))
+                .on_click(move |_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(zed_actions::Rerun {
+                            task_id: Some(task_id.0.clone()),
+                            allow_concurrent_runs: Some(true),
+                            use_new_terminal: Some(false),
+                            reevaluate_context: false,
+                        }),
+                        cx,
+                    );
+                }),
+        )
+    }
+
+    fn update_terminal_maybe_path(
         &mut self,
-        path_like_target: &PathLikeTarget,
-        valid_paths_to_open: Option<ValidPathsToOpen>,
+        target: &PathLikeTarget,
+        path_to_open: Option<(MaybePathWithPosition<'static>, OpenTarget)>,
         cx: &mut Context<Self>,
-    ) -> bool {
-        if let Some(valid_paths_to_open) = valid_paths_to_open {
-            self.terminal.update(cx, |term, cx| {
-                term.confirm_maybe_path(
-                    &valid_paths_to_open.target,
-                    Some(valid_paths_to_open.hyperlink_range.clone()),
-                    cx,
-                )
-            });
+    ) {
+        self.terminal.update(cx, |term, cx| {
+            term.confirm_maybe_path(
+                target,
+                path_to_open.as_ref().map(|(maybe_path_with_position, _)| {
+                    maybe_path_with_position.hyperlink_range()
+                }),
+                cx,
+            )
+        });
 
-            self.selected_word_valid_paths_to_open = Some(valid_paths_to_open);
-            true
+        if let Some((maybe_path_with_position, open_target)) = path_to_open {
+            self.selected_word_maybe_path_target = Some(MaybePathOpenTarget {
+                target: target.clone(),
+                maybe_path_with_position,
+                open_target,
+            });
         } else {
-            self.terminal.update(cx, |term, cx| {
-                term.confirm_maybe_path(&path_like_target, None, cx)
-            });
-
-            self.selected_word_valid_paths_to_open = None;
-            false
+            self.selected_word_maybe_path_target = None;
         }
     }
 }
@@ -906,14 +920,13 @@ fn subscribe_for_terminal_events(
                 this.can_navigate_to_selected_word = match maybe_navigation_target {
                     Some(MaybeNavigationTarget::Url(_)) => true,
                     Some(MaybeNavigationTarget::PathLike(path_like_target)) => {
-                        if let Ok(fs) = workspace.update(cx, |workspace, cx| {
-                            workspace.project().read(cx).fs().clone()
-                        }) {
-                            let home_dir = this.home_dir.clone();
-                            let valid_paths_to_open_task =
-                                possible_open_targets(fs, &workspace, home_dir, &path_like_target, cx);
-                            this.update_valid_paths_to_open(&path_like_target, smol::block_on(valid_paths_to_open_task), cx)
+                        let open_target_task =
+                            possible_open_target(&workspace, &this.home_dir, &path_like_target, cx);
+                        if let Some(open_target) = smol::block_on(open_target_task) {
+                            this.update_terminal_maybe_path(path_like_target, Some(open_target), cx);
+                            true
                         } else {
+                            this.update_terminal_maybe_path(path_like_target, None, cx);
                             false
                         }
                     }
@@ -927,54 +940,46 @@ fn subscribe_for_terminal_events(
 
                 MaybeNavigationTarget::PathLike(path_like_target) => {
                     let task_workspace = workspace.clone();
-                    let Some(fs) = workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.project().read(cx).fs().clone()
-                        })
-                        .ok()
-                    else {
-                        return;
-                    };
-
                     let path_like_target = path_like_target.clone();
                     let home_dir = this.home_dir.clone();
-                    let selected_word_valid_paths_to_open =
-                        this.selected_word_valid_paths_to_open.clone();
-
+                    let selected_word_open_target =
+                        this.selected_word_maybe_path_target.clone();
                     cx.spawn_in(window, |terminal_view, mut cx| async move {
-                        let Some((valid_paths_to_open, newly_confirmed_maybe_path)) = (match selected_word_valid_paths_to_open {
-                            Some(selected_word_valid_paths_to_open)
-                                if selected_word_valid_paths_to_open.target.id == path_like_target.id =>
+                        let Some(((path_to_open, open_target), newly_confirmed_maybe_path)) = (match selected_word_open_target {
+                            Some(MaybePathOpenTarget{ target, maybe_path_with_position, open_target })
+                                if target.id == path_like_target.id =>
                             {
                                 trace!("Terminal View: Event::Open: Reusing hovered valid files to open");
-                                Some((selected_word_valid_paths_to_open, false))
+                                Some(((maybe_path_with_position, open_target), false))
                             }
                             _ => {
                                 terminal_view.update(&mut cx, |_, cx| {
-                                    possible_open_targets(
-                                        fs,
+                                    possible_open_target(
                                         &task_workspace,
-                                        home_dir,
+                                        &home_dir,
                                         &path_like_target,
                                         cx,
                                     )
                                 })?
-                                .await.map(|valid_paths_to_open| (valid_paths_to_open, true))
+                                .await.map(|open_target| (open_target, true))
                             }
                         }) else {
+                            terminal_view.update(&mut cx, |this, cx| {
+                                this.update_terminal_maybe_path(&path_like_target, None, cx);
+                                this.can_navigate_to_selected_word = false;
+                            })?;
+
                             return anyhow::Ok(());
                         };
 
-                        let paths_to_open = valid_paths_to_open
-                            .paths_with_metadata
-                            .iter()
-                            .map(|(p, _)| p.path.clone())
-                            .collect();
                         let opened_items = task_workspace
                             .update_in(&mut cx, |workspace, window, cx| {
                                 workspace.open_paths(
-                                    paths_to_open,
-                                    OpenVisible::OnlyDirectories,
+                                    vec![path_to_open.path.to_path_buf()],
+                                    OpenOptions {
+                                        visible: Some(OpenVisible::OnlyDirectories),
+                                        ..Default::default()
+                                    },
                                     None,
                                     window,
                                     cx,
@@ -982,48 +987,50 @@ fn subscribe_for_terminal_events(
                             })
                             .context("workspace update")?
                             .await;
-
-                        let mut has_dirs = false;
-                        for ((path, metadata), opened_item) in valid_paths_to_open
-                            .paths_with_metadata
-                            .iter()
-                            .zip(opened_items.into_iter())
-                        {
-                            if metadata.is_dir {
-                                has_dirs = true;
-                            } else if let Some(Ok(opened_item)) = opened_item {
-                                if let Some(row) = path.row {
-                                    let col = path.column.unwrap_or(0);
-                                    if let Some(active_editor) = opened_item.downcast::<Editor>() {
-                                        active_editor
-                                            .downgrade()
-                                            .update_in(&mut cx, |editor, window, cx| {
-                                                editor.go_to_singleton_buffer_point(
-                                                    language::Point::new(
-                                                        row.saturating_sub(1),
-                                                        col.saturating_sub(1),
-                                                    ),
-                                                    window,
-                                                    cx,
-                                                )
-                                            })
-                                            .log_err();
-                                    }
-                                }
-                            }
+                        if opened_items.len() != 1 {
+                            debug_panic!(
+                                "Received {} items for one path {path_to_open:?}",
+                                opened_items.len(),
+                            );
                         }
 
-                        if has_dirs {
-                            task_workspace.update(&mut cx, |workspace, cx| {
-                                workspace.project().update(cx, |_, cx| {
-                                    cx.emit(project::Event::ActivateProjectPanel);
-                                })
-                            })?;
+                        if let Some(opened_item) = opened_items.first() {
+                            if open_target.is_file() {
+                                if let Some(Ok(opened_item)) = opened_item {
+                                    if let Some(RowColumn{ row, column, .. }) = path_to_open.position {
+                                        let col = column.unwrap_or(0);
+                                        if let Some(active_editor) =
+                                            opened_item.downcast::<Editor>()
+                                        {
+                                            active_editor
+                                                .downgrade()
+                                                .update_in(&mut cx, |editor, window, cx| {
+                                                    editor.go_to_singleton_buffer_point(
+                                                        language::Point::new(
+                                                            row.saturating_sub(1),
+                                                            col.saturating_sub(1),
+                                                        ),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })
+                                                .log_err();
+                                        }
+                                    }
+                                }
+                            } else if open_target.is_dir() {
+                                task_workspace.update(&mut cx, |workspace, cx| {
+                                    workspace.project().update(cx, |_, cx| {
+                                        cx.emit(project::Event::ActivateProjectPanel);
+                                    })
+                                })?;
+                            }
                         }
 
                         if newly_confirmed_maybe_path {
                             terminal_view.update(&mut cx, |this, cx| {
-                                this.update_valid_paths_to_open(&path_like_target, Some(valid_paths_to_open), cx);
+                                this.update_terminal_maybe_path(&path_like_target, Some((path_to_open, open_target)), cx);
+                                this.can_navigate_to_selected_word = true;
                             })?;
                         }
 
@@ -1043,39 +1050,134 @@ fn subscribe_for_terminal_events(
     vec![terminal_subscription, terminal_events_subscription]
 }
 
-fn possible_open_paths_metadata(
+#[derive(Debug, Clone)]
+enum OpenTarget {
+    Worktree(Entry),
+    File(Metadata),
+}
+
+impl OpenTarget {
+    fn is_file(&self) -> bool {
+        match self {
+            OpenTarget::Worktree(entry) => entry.is_file(),
+            OpenTarget::File(metadata) => !metadata.is_dir,
+        }
+    }
+
+    fn is_dir(&self) -> bool {
+        match self {
+            OpenTarget::Worktree(entry) => entry.is_dir(),
+            OpenTarget::File(metadata) => metadata.is_dir,
+        }
+    }
+}
+
+fn possible_open_target(
+    workspace: &WeakEntity<Workspace>,
+    home_dir: &Option<PathBuf>,
+    target: &PathLikeTarget,
+    cx: &mut Context<TerminalView>,
+) -> Task<Option<(MaybePathWithPosition<'static>, OpenTarget)>> {
+    let Some(workspace) = workspace.upgrade() else {
+        return Task::ready(None);
+    };
+
+    let maybe_path_variants = target.maybe_path.maybe_path_variants();
+    let mut sorted_worktree_roots = Vec::new();
+
+    // The only work we can not do in the background is read the worktrees, if any.
+    // When we get a hit, do the minimal amount of work here for the hit as well, the
+    // rest can be done in the background.
+    let cwd = target.terminal_dir.as_ref();
+    if let Some(open_target) = workspace.read(cx).worktrees(cx).sorted_by_key(|worktree| {
+        let worktree_root = worktree.read(cx).abs_path();
+        match cwd
+            .and_then(|cwd| worktree_root.strip_prefix(cwd).ok())
+        {
+            Some(cwd_child) => cwd_child.components().count(),
+            None => usize::MAX,
+        }
+    }).filter_map(|worktree| {
+        let worktree_root = worktree.read(cx).abs_path();
+        sorted_worktree_roots.push(Arc::clone(&worktree_root));
+        let paths_to_check = maybe_path_variants.iter().flat_map(|maybe_path_variant|
+            maybe_path_variant.relative_variations(&target.maybe_path, &worktree_root));
+
+        let mut traversal = worktree
+            .read(cx)
+            .traverse_from_path(true, true, false, "".as_ref());
+        while let Some(entry) = traversal.next() {
+            if let Some(MaybePathWithPosition{ range, position, .. }) = paths_to_check.clone()
+                .find(|path_to_check| entry.path.ends_with(&path_to_check.path))
+            {
+                trace!("Terminal View: MaybePath found for worktree: {worktree_root:?}, entry: {:?}", entry.path);
+                return Some(Task::ready(Some((
+                    MaybePathWithPosition::new(&range, Cow::Owned(worktree_root.join(&entry.path)), position),
+                    OpenTarget::Worktree(entry.clone())
+                ))));
+            }
+        }
+
+        None
+    }).nth(0) {
+        return open_target;
+    }
+
+    if !workspace.read(cx).project().read(cx).is_local() {
+        return Task::ready(None);
+    }
+
+    let fs = workspace.read(cx).project().read(cx).fs().clone();
+
+    possible_open_target_from_fs(
+        fs,
+        home_dir.clone(),
+        target.clone(),
+        maybe_path_variants,
+        sorted_worktree_roots,
+        cx,
+    )
+}
+
+fn possible_open_target_from_fs(
     fs: Arc<dyn Fs>,
     home_dir: Option<PathBuf>,
     target: PathLikeTarget,
     maybe_path_variants: Vec<MaybePathVariant>,
-    canonical_worktree_path_sets: HashMap<Arc<Path>, Vec<MaybePathWithPosition<'static>>>,
+    sorted_worktree_roots: Vec<Arc<Path>>,
     cx: &mut Context<TerminalView>,
-) -> Task<Option<ValidPathsToOpen>> {
+) -> Task<Option<(MaybePathWithPosition<'static>, OpenTarget)>> {
     cx.background_spawn(async move {
-        struct CanonicalizeContext<'a, 'b> {
+        struct CanonicalizeContext<'a, 'b, RootIterator>
+        where
+            RootIterator: Iterator<Item = &'b Path> + Clone + 'b,
+        {
             pub fs: Arc<dyn Fs>,
             pub home_dir: &'b Option<PathBuf>,
-            pub cwd: &'b Option<PathBuf>,
+            pub roots: RootIterator,
             pub maybe_path: &'a MaybePath,
         }
 
-        async fn canonicalize_maybe_path_variants<'a>(
-            canonicalize_context: &CanonicalizeContext<'a, '_>,
+        async fn canonicalize_maybe_path_variants<'a, 'b, RootIterator>(
+            canonicalize_context: &CanonicalizeContext<'a, 'b, RootIterator>,
             maybe_path_variants: impl Iterator<Item = MaybePathVariant> + 'a,
-        ) -> Vec<MaybePathWithPosition<'a>> {
+        ) -> Vec<MaybePathWithPosition<'a>>
+        where
+            RootIterator: Iterator<Item = &'b Path> + Clone + 'b,
+        {
             let mut canonical_with_positions = Vec::new();
 
             let CanonicalizeContext {
                 fs,
                 home_dir,
-                cwd,
+                roots,
                 maybe_path,
             } = canonicalize_context;
 
             for maybe_path_variant in maybe_path_variants {
                 // TODO(davewa): check for timeout here (and return Option<>)
                 let mut fetch_canonical_tasks = maybe_path_variant
-                    .absolutized_variations(&maybe_path, &cwd, &home_dir)
+                    .absolutized_variations(&maybe_path, roots.clone(), &home_dir)
                     .into_iter()
                     .map(
                         |MaybePathWithPosition {
@@ -1108,46 +1210,24 @@ fn possible_open_paths_metadata(
             canonical_with_positions
         }
 
-        let cwd = &target.terminal_dir;
-        let maybe_path = &target.maybe_path;
+        let mut paths_with_metadata: Vec<(MaybePathWithPosition, Metadata)> = Vec::new();
+        let mut index_of_longest_maybe_path = 0;
 
-        let mut canonical_paths = HashSet::<MaybePathWithPosition>::from_iter([]);
-
-        // TODO(davewa): Figure out where and when to use SanitizedPath
-
-        // Absolutize worktree entries matched on the main thread. These should already be canonical, just
-        // need to join them with their worktree abs_root.
-        for (abs_root, entry_canonical_paths_with_positions) in
-            canonical_worktree_path_sets.into_iter()
+        // TODO(davewa): Figure out where and when to use SanitizedPath?
         {
-            for maybe_path_with_position in
-                entry_canonical_paths_with_positions
-                    .into_iter()
-                    .map(|maybe_path_with_position| {
-                        let path = abs_root.join(&maybe_path_with_position.path);
-                        trace!("Terminal: MaybePath worktree entry: {path:?}",);
-                        MaybePathWithPosition::new(
-                            &maybe_path_with_position.range,
-                            Cow::Owned(path),
-                            maybe_path_with_position.position,
-                        )
-                    })
-            {
-                canonical_paths.insert(maybe_path_with_position);
-            }
-        }
+            let mut longest_hyperlink_range = 0..0;
+            let mut canonical_paths = HashSet::<MaybePathWithPosition>::from_iter([]);
 
-        let mut paths_with_metadata: Vec<(PathWithPosition, Metadata)> = Vec::new();
-        let mut longest_hyperlink_range = 0..0;
+            let canonicalize_context = CanonicalizeContext {
+                fs: Arc::clone(&fs),
+                home_dir: &home_dir,
+                roots: sorted_worktree_roots
+                    .iter()
+                    .map(Deref::deref)
+                    .chain(target.terminal_dir.iter().map(|cwd| cwd.as_path())),
+                maybe_path: &target.maybe_path,
+            };
 
-        let canonicalize_context = CanonicalizeContext {
-            fs: Arc::clone(&fs),
-            home_dir: &home_dir,
-            cwd: &cwd,
-            maybe_path: &maybe_path,
-        };
-
-        {
             // Attempt to canonicalize the maybe_path_variants computed on the main thread; these are the most common
             for maybe_path_with_position in canonicalize_maybe_path_variants(
                 &canonicalize_context,
@@ -1162,7 +1242,7 @@ fn possible_open_paths_metadata(
             // TODO(davewa): Process variations from longest to shorted within each maybe path
             // TODO(davewa): Once any real file is found, only check paths longer than the longest found so far
             if canonical_paths.is_empty() {
-                for maybe_path_variants in maybe_path.exhaustive_maybe_path_variants() {
+                for maybe_path_variants in target.maybe_path.exhaustive_maybe_path_variants() {
                     for maybe_path_with_position in
                         canonicalize_maybe_path_variants(&canonicalize_context, maybe_path_variants)
                             .await
@@ -1171,7 +1251,7 @@ fn possible_open_paths_metadata(
                     }
                 }
 
-                for maybe_path_variants in maybe_path.regex_maybe_path_variants() {
+                for maybe_path_variants in target.maybe_path.regex_maybe_path_variants() {
                     for maybe_path_with_position in
                         canonicalize_maybe_path_variants(&canonicalize_context, maybe_path_variants)
                             .await
@@ -1193,6 +1273,7 @@ fn possible_open_paths_metadata(
                 })
                 .collect::<FuturesUnordered<_>>();
 
+            let mut index = 0;
             while let Some((maybe_path_with_position, metadata)) = fetch_metadata_tasks.next().await
             {
                 if let Some(metadata) = metadata {
@@ -1200,78 +1281,30 @@ fn possible_open_paths_metadata(
                     if maybe_path_with_position.hyperlink_range().len()
                         > longest_hyperlink_range.len()
                     {
+                        index_of_longest_maybe_path = index;
                         longest_hyperlink_range = hyperlink_range;
                     }
-                    paths_with_metadata.push((maybe_path_with_position.into(), metadata));
+                    paths_with_metadata.push((maybe_path_with_position, metadata));
+                    index += 1;
                 }
             }
         }
 
         if !paths_with_metadata.is_empty() {
-            let valid_paths_to_open = ValidPathsToOpen {
-                target,
-                paths_with_metadata,
-                hyperlink_range: longest_hyperlink_range,
-            };
-            info!("Terminal View: Valid paths to open: {valid_paths_to_open}",);
-            Some(valid_paths_to_open)
+            let (maybe_path_with_position, metadata) =
+                paths_with_metadata[index_of_longest_maybe_path].clone();
+            info!("Terminal View: Open target: {:?}", maybe_path_with_position);
+            Some((
+                MaybePathWithPosition {
+                    path: Cow::Owned(maybe_path_with_position.path.into_owned()),
+                    ..maybe_path_with_position
+                },
+                OpenTarget::File(metadata),
+            ))
         } else {
             None
         }
     })
-}
-
-fn possible_open_targets(
-    fs: Arc<dyn Fs>,
-    workspace: &WeakEntity<Workspace>,
-    home_dir: Option<PathBuf>,
-    target: &PathLikeTarget,
-    cx: &mut Context<TerminalView>,
-) -> Task<Option<ValidPathsToOpen>> {
-    let maybe_path_variants = target.maybe_path.maybe_path_variants();
-    let mut canonical_worktree_paths =
-        HashMap::<Arc<Path>, Vec<MaybePathWithPosition<'static>>>::from_iter([]);
-
-    // The only work we can not do in the background is read the worktrees, if any.
-    // When we get a hit, do the minimal amount of work here for the hit as well, the
-    // rest can be done in the background.
-    if let Some(workspace) = workspace.upgrade() {
-        canonical_worktree_paths = workspace.update(cx, |workspace, cx| {
-            workspace
-                .worktrees(cx)
-                .map(|worktree| {
-                    let worktree = worktree.read(cx);
-                    (worktree.abs_path(), {
-                        let mut entry_paths = Vec::new();
-                        for maybe_path_variant in &maybe_path_variants {
-                            for MaybePathWithPosition { range, path: relative, position } in
-                                maybe_path_variant.relative_variations(&target.maybe_path)
-                            {
-                                if let Some(Entry {
-                                    canonical_path: Some(entry_canonical_path),
-                                    ..
-                                }) = worktree.entry_for_path(&relative)
-                                {
-                                    trace!("Terminal View: MaybePath found for worktree: {:?}, entry: {entry_canonical_path:?}", worktree.abs_path() );
-                                    entry_paths.push(MaybePathWithPosition::new(&range, Cow::Owned(entry_canonical_path.to_path_buf()), position))
-                                }
-                            }
-                        }
-                        entry_paths
-                    })
-                })
-                .collect()
-        });
-    }
-
-    possible_open_paths_metadata(
-        fs,
-        home_dir,
-        target.clone(),
-        maybe_path_variants,
-        canonical_worktree_paths,
-        cx,
-    )
 }
 
 fn regex_to_literal(regex: &str) -> String {
@@ -1424,44 +1457,26 @@ impl Item for TerminalView {
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
         let terminal = self.terminal().read(cx);
         let title = terminal.title(true);
-        let rerun_button = |task_id: task::TaskId| {
-            IconButton::new("rerun-icon", IconName::Rerun)
-                .icon_size(IconSize::Small)
-                .size(ButtonSize::Compact)
-                .icon_color(Color::Default)
-                .shape(ui::IconButtonShape::Square)
-                .tooltip(Tooltip::text("Rerun task"))
-                .on_click(move |_, window, cx| {
-                    window.dispatch_action(
-                        Box::new(zed_actions::Rerun {
-                            task_id: Some(task_id.0.clone()),
-                            allow_concurrent_runs: Some(true),
-                            use_new_terminal: Some(false),
-                            reevaluate_context: false,
-                        }),
-                        cx,
-                    );
-                })
-        };
 
         let (icon, icon_color, rerun_button) = match terminal.task() {
             Some(terminal_task) => match &terminal_task.status {
                 TaskStatus::Running => (
                     IconName::Play,
                     Color::Disabled,
-                    Some(rerun_button(terminal_task.id.clone())),
+                    TerminalView::rerun_button(&terminal_task),
                 ),
                 TaskStatus::Unknown => (
                     IconName::Warning,
                     Color::Warning,
-                    Some(rerun_button(terminal_task.id.clone())),
+                    TerminalView::rerun_button(&terminal_task),
                 ),
                 TaskStatus::Completed { success } => {
-                    let rerun_button = rerun_button(terminal_task.id.clone());
+                    let rerun_button = TerminalView::rerun_button(&terminal_task);
+
                     if *success {
-                        (IconName::Check, Color::Success, Some(rerun_button))
+                        (IconName::Check, Color::Success, rerun_button)
                     } else {
-                        (IconName::XCircle, Color::Error, Some(rerun_button))
+                        (IconName::XCircle, Color::Error, rerun_button)
                     }
                 }
             },
@@ -1787,6 +1802,7 @@ impl SearchableItem for TerminalView {
     /// Reports back to the search toolbar what the active match should be (the selection)
     fn active_match_index(
         &mut self,
+        direction: Direction,
         matches: &[Self::Match],
         _: &mut Window,
         cx: &mut Context<Self>,
@@ -1797,19 +1813,36 @@ impl SearchableItem for TerminalView {
         let res = if !matches.is_empty() {
             if let Some(selection_head) = self.terminal().read(cx).selection_head {
                 // If selection head is contained in a match. Return that match
-                if let Some(ix) = matches
-                    .iter()
-                    .enumerate()
-                    .find(|(_, search_match)| {
-                        search_match.contains(&selection_head)
-                            || search_match.start() > &selection_head
-                    })
-                    .map(|(ix, _)| ix)
-                {
-                    Some(ix)
-                } else {
-                    // If no selection after selection head, return the last match
-                    Some(matches.len().saturating_sub(1))
+                match direction {
+                    Direction::Prev => {
+                        // If no selection before selection head, return the first match
+                        Some(
+                            matches
+                                .iter()
+                                .enumerate()
+                                .rev()
+                                .find(|(_, search_match)| {
+                                    search_match.contains(&selection_head)
+                                        || search_match.start() < &selection_head
+                                })
+                                .map(|(ix, _)| ix)
+                                .unwrap_or(0),
+                        )
+                    }
+                    Direction::Next => {
+                        // If no selection after selection head, return the last match
+                        Some(
+                            matches
+                                .iter()
+                                .enumerate()
+                                .find(|(_, search_match)| {
+                                    search_match.contains(&selection_head)
+                                        || search_match.start() > &selection_head
+                                })
+                                .map(|(ix, _)| ix)
+                                .unwrap_or(matches.len().saturating_sub(1)),
+                        )
+                    }
                 }
             } else {
                 // Matches found but no active selection, return the first last one (closest to cursor)

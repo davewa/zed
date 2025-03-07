@@ -574,6 +574,7 @@ impl MaybePathVariant {
     pub fn relative_variations<'a>(
         &self,
         maybe_path: &'a MaybePath,
+        prefix_to_strip: &Path,
     ) -> Vec<MaybePathWithPosition<'a>> {
         let mut variations = Vec::new();
         for range in &self.variations {
@@ -589,16 +590,24 @@ impl MaybePathVariant {
             .filter_map(|(range, position)| {
                 let maybe_path = Path::new(maybe_path.text_at(&range));
                 maybe_path.is_relative().then(|| {
-                    MaybePathWithPosition::new(range, Cow::Borrowed(maybe_path), position.cloned())
+                    MaybePathWithPosition::new(
+                        range,
+                        Cow::Borrowed(
+                            maybe_path
+                                .strip_prefix(prefix_to_strip)
+                                .unwrap_or(maybe_path),
+                        ),
+                        position.cloned(),
+                    )
                 })
             })
             .collect()
     }
 
-    fn absolutize<'a>(
+    fn absolutize<'a, 'b>(
         &self,
         maybe_path: &'a MaybePath,
-        cwd: &Option<PathBuf>,
+        roots: impl Iterator<Item = &'b Path> + Clone + 'b,
         home_dir: &Option<PathBuf>,
         variation_range: &Range<usize>,
         position: Option<RowColumn>,
@@ -614,10 +623,10 @@ impl MaybePathVariant {
             return absolutized;
         }
 
-        if let Some(cwd) = cwd {
+        for root in roots {
             absolutized.push(MaybePathWithPosition::new(
                 variation_range,
-                Cow::Owned(cwd.join(variation_path)),
+                Cow::Owned(root.join(variation_path)),
                 position,
             ));
         }
@@ -637,18 +646,18 @@ impl MaybePathVariant {
         absolutized
     }
 
-    pub fn absolutized_variations<'a>(
+    pub fn absolutized_variations<'a, 'b>(
         &self,
         maybe_path: &'a MaybePath,
         // TODO(davewa): Pass an array of cwd and worktree.abs_root()'s instead of just cwd
-        cwd: &Option<PathBuf>,
+        roots: impl Iterator<Item = &'b Path> + Clone + 'b,
         home_dir: &Option<PathBuf>,
     ) -> Vec<MaybePathWithPosition<'a>> {
         let mut variations = Vec::new();
         for variation_range in &self.variations {
             variations.append(&mut self.absolutize(
                 maybe_path,
-                cwd,
+                roots.clone(),
                 home_dir,
                 &variation_range,
                 None,
@@ -658,7 +667,7 @@ impl MaybePathVariant {
         if let Some((variation_range, position)) = &self.positioned_variation {
             variations.append(&mut self.absolutize(
                 maybe_path,
-                cwd,
+                roots.clone(),
                 home_dir,
                 variation_range,
                 Some(*position),
@@ -882,6 +891,7 @@ mod tests {
         test_line_maybe_path_variants(
             cx,
             &mut trees,
+            &Path::new("/root 2"),
             "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)",
             &expected,
         )
@@ -891,6 +901,7 @@ mod tests {
     async fn test_line_maybe_path_variants<'a>(
         cx: &mut TestAppContext,
         trees: &mut Vec<(&str, serde_json::Value)>,
+        worktree_root: &Path,
         line: &str,
         expected: &ExpectedMap<'a>,
     ) {
@@ -899,6 +910,7 @@ mod tests {
             test_maybe_path(
                 cx,
                 trees,
+                worktree_root,
                 line,
                 matched.range(),
                 PathHyperlinkNavigation::Default,
@@ -912,6 +924,7 @@ mod tests {
             test_maybe_path(
                 cx,
                 trees,
+                worktree_root,
                 line,
                 matched.range(),
                 PathHyperlinkNavigation::Advanced,
@@ -962,6 +975,7 @@ mod tests {
     async fn test_maybe_path<'a>(
         cx: &mut TestAppContext,
         trees: &mut Vec<(&str, serde_json::Value)>,
+        worktree_root: &Path,
         line: &str,
         word: Range<usize>,
         path_hyperlink_navigation: PathHyperlinkNavigation,
@@ -1000,7 +1014,9 @@ mod tests {
 
         let actual_relative: Vec<_> = maybe_path_variants
             .iter()
-            .map(|maybe_path_variant| maybe_path_variant.relative_variations(&maybe_path))
+            .map(|maybe_path_variant| {
+                maybe_path_variant.relative_variations(&maybe_path, worktree_root)
+            })
             .flatten()
             .collect();
 
@@ -1012,12 +1028,15 @@ mod tests {
         const CWD: &str = "/Some/cool/place";
 
         let home_dir = Some(Path::new(HOME_DIR).to_path_buf());
-        let cwd = Some(Path::new(CWD).to_path_buf());
 
         let actual_absolutized: Vec<_> = maybe_path_variants
             .iter()
             .map(|maybe_path_variant| {
-                maybe_path_variant.absolutized_variations(&maybe_path, &cwd, &home_dir)
+                maybe_path_variant.absolutized_variations(
+                    &maybe_path,
+                    [Path::new(CWD)].into_iter(),
+                    &home_dir,
+                )
             })
             .flatten()
             .collect();
