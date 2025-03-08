@@ -39,7 +39,7 @@ use terminal_tab_tooltip::TerminalTooltip;
 use ui::{
     h_flex, prelude::*, ContextMenu, Icon, IconName, Label, Scrollbar, ScrollbarState, Tooltip,
 };
-use util::{debug_panic, ResultExt};
+use util::{debug_panic, paths, ResultExt};
 use workspace::{
     item::{
         BreadcrumbText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
@@ -140,7 +140,6 @@ pub struct TerminalView {
     scrollbar_state: ScrollbarState,
     scroll_handle: TerminalScrollHandle,
     show_scrollbar: bool,
-    home_dir: Option<PathBuf>,
     hide_scrollbar_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
@@ -224,7 +223,6 @@ impl TerminalView {
             scrollbar_state: ScrollbarState::new(scroll_handle.clone()),
             scroll_handle,
             show_scrollbar: !Self::should_autohide_scrollbar(cx),
-            home_dir: dirs::home_dir(),
             hide_scrollbar_task: None,
             _subscriptions: vec![
                 focus_in,
@@ -921,7 +919,7 @@ fn subscribe_for_terminal_events(
                     Some(MaybeNavigationTarget::Url(_)) => true,
                     Some(MaybeNavigationTarget::PathLike(path_like_target)) => {
                         let open_target_task =
-                            possible_open_target(&workspace, &this.home_dir, &path_like_target, cx);
+                            possible_open_target(&workspace, &path_like_target, cx);
                         if let Some(open_target) = smol::block_on(open_target_task) {
                             this.update_terminal_maybe_path(path_like_target, Some(open_target), cx);
                             true
@@ -941,7 +939,6 @@ fn subscribe_for_terminal_events(
                 MaybeNavigationTarget::PathLike(path_like_target) => {
                     let task_workspace = workspace.clone();
                     let path_like_target = path_like_target.clone();
-                    let home_dir = this.home_dir.clone();
                     let selected_word_open_target =
                         this.selected_word_maybe_path_target.clone();
                     cx.spawn_in(window, |terminal_view, mut cx| async move {
@@ -956,7 +953,6 @@ fn subscribe_for_terminal_events(
                                 terminal_view.update(&mut cx, |_, cx| {
                                     possible_open_target(
                                         &task_workspace,
-                                        &home_dir,
                                         &path_like_target,
                                         cx,
                                     )
@@ -1074,7 +1070,6 @@ impl OpenTarget {
 
 fn possible_open_target(
     workspace: &WeakEntity<Workspace>,
-    home_dir: &Option<PathBuf>,
     target: &PathLikeTarget,
     cx: &mut Context<TerminalView>,
 ) -> Task<Option<(MaybePathWithPosition<'static>, OpenTarget)>> {
@@ -1139,7 +1134,6 @@ fn possible_open_target(
 
     possible_open_target_from_fs(
         project.fs().clone(),
-        home_dir.clone(),
         target.clone(),
         maybe_path_variants,
         sorted_worktree_roots,
@@ -1149,7 +1143,6 @@ fn possible_open_target(
 
 fn possible_open_target_from_fs(
     fs: Arc<dyn Fs>,
-    home_dir: Option<PathBuf>,
     target: PathLikeTarget,
     maybe_path_variants: Vec<MaybePathVariant>,
     sorted_worktree_roots: Vec<Arc<Path>>,
@@ -1163,7 +1156,7 @@ fn possible_open_target_from_fs(
             RootIterator: Iterator<Item = &'b Path> + Clone + 'b,
         {
             pub fs: Arc<dyn Fs>,
-            pub home_dir: &'b Option<PathBuf>,
+            pub home_dir: &'b PathBuf,
             pub roots: RootIterator,
             pub maybe_path: &'a MaybePath,
         }
@@ -1187,7 +1180,7 @@ fn possible_open_target_from_fs(
             for maybe_path_variant in maybe_path_variants {
                 // TODO(davewa): check for timeout here (and return Option<>)
                 let mut fetch_canonical_tasks = maybe_path_variant
-                    .absolutized_variations(&maybe_path, roots.clone(), &home_dir)
+                    .absolutized_variations(&maybe_path, roots.clone(), home_dir)
                     .into_iter()
                     .map(
                         |MaybePathWithPosition {
@@ -1230,7 +1223,7 @@ fn possible_open_target_from_fs(
 
             let canonicalize_context = CanonicalizeContext {
                 fs: Arc::clone(&fs),
-                home_dir: &home_dir,
+                home_dir: paths::home_dir(),
                 roots: sorted_worktree_roots
                     .iter()
                     .map(Deref::deref)

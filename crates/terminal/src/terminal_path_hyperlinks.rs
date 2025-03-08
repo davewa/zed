@@ -38,6 +38,10 @@
 // regardless of the setting of this variable.". Currently we don't support any
 // escaping in paths, so these currently do not work.
 
+// TODO(davewa) TASK LIST
+// - [ ]
+// - [ ] Significantly simplify Terminal::maybe_update_last_hovered_word()
+//
 use alacritty_terminal::{index::Boundary, term::search::Match, Term};
 use log::{debug, trace};
 use regex::Regex;
@@ -45,7 +49,7 @@ use std::{
     borrow::Cow,
     fmt::Display,
     ops::Range,
-    path::{Path, PathBuf, MAIN_SEPARATOR},
+    path::{Path, PathBuf},
     sync::LazyLock,
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -61,6 +65,7 @@ use crate::{terminal_settings::PathHyperlinkNavigation, ZedListener};
 ///
 /// See [C++ Escape sequences](https://en.cppreference.com/w/cpp/language/escape)
 const PATH_WHITESPACE_CHARS: &str = "\t\u{c}\u{b} ";
+const MAIN_SEPARATORS: [char; 2] = ['\\', '/'];
 
 const COMMON_PATH_SURROUNDING_SYMBOLS: &[(char, char)] =
     &[('"', '"'), ('\'', '\''), ('[', ']'), ('(', ')')];
@@ -182,8 +187,7 @@ impl MaybePath {
         let word = self.text_at(word_range);
         Path::new(word).extension().is_some()
             || word.starts_with('.')
-            // TODO(davewa): Should we always just check for all platforms, e.g. '\' and '/'?
-            || word.contains(MAIN_SEPARATOR)
+            || word.contains(MAIN_SEPARATORS)
     }
 
     pub(super) fn match_from_text_range(
@@ -362,7 +366,7 @@ impl MaybePath {
     fn expanded_maybe_path_by_interior_spaces(&self) -> Option<Range<usize>> {
         let mut range = self.hovered_word_range.clone();
 
-        if let Some(first_separator) = self.line.find(MAIN_SEPARATOR) {
+        if let Some(first_separator) = self.line.find(MAIN_SEPARATORS) {
             if first_separator < range.start {
                 let word_start = first_separator
                     - self.line[..first_separator]
@@ -386,7 +390,7 @@ impl MaybePath {
             }
         }
 
-        if let Some(last_separator) = self.line.rfind(MAIN_SEPARATOR) {
+        if let Some(last_separator) = self.line.rfind(MAIN_SEPARATORS) {
             if last_separator >= range.end {
                 let word_end = self.line[last_separator..]
                     .find(PATH_WHITESPACE_CHARS)
@@ -533,7 +537,7 @@ impl MaybePathVariant {
             // Git diff parsing--only if we did not strip common symbols
             if !common_symbols_stripped
                 && (maybe_path.starts_with('a') || maybe_path.starts_with('b'))
-                && maybe_path[1..].starts_with(MAIN_SEPARATOR)
+                && maybe_path[1..].starts_with(MAIN_SEPARATORS)
             {
                 absolutize_home_dir = false;
                 variations.push(path.start + 2..path.end);
@@ -608,7 +612,7 @@ impl MaybePathVariant {
         &self,
         maybe_path: &'a MaybePath,
         roots: impl Iterator<Item = &'b Path> + Clone + 'b,
-        home_dir: &Option<PathBuf>,
+        home_dir: &PathBuf,
         variation_range: &Range<usize>,
         position: Option<RowColumn>,
     ) -> Vec<MaybePathWithPosition<'a>> {
@@ -632,14 +636,12 @@ impl MaybePathVariant {
         }
 
         if self.absolutize_home_dir {
-            if let Some(home_dir) = home_dir {
-                if let Ok(tildeless_path) = variation_path.strip_prefix("~") {
-                    absolutized.push(MaybePathWithPosition::new(
-                        variation_range,
-                        Cow::Owned(home_dir.join(tildeless_path)),
-                        position,
-                    ));
-                }
+            if let Ok(tildeless_path) = variation_path.strip_prefix("~") {
+                absolutized.push(MaybePathWithPosition::new(
+                    variation_range,
+                    Cow::Owned(home_dir.join(tildeless_path)),
+                    position,
+                ));
             }
         }
 
@@ -649,9 +651,8 @@ impl MaybePathVariant {
     pub fn absolutized_variations<'a, 'b>(
         &self,
         maybe_path: &'a MaybePath,
-        // TODO(davewa): Pass an array of cwd and worktree.abs_root()'s instead of just cwd
         roots: impl Iterator<Item = &'b Path> + Clone + 'b,
-        home_dir: &Option<PathBuf>,
+        home_dir: &PathBuf,
     ) -> Vec<MaybePathWithPosition<'a>> {
         let mut variations = Vec::new();
         for variation_range in &self.variations {
@@ -1056,7 +1057,7 @@ mod tests {
         const HOME_DIR: &str = "/Usors/uzer";
         const CWD: &str = "/Some/cool/place";
 
-        let home_dir = Some(Path::new(HOME_DIR).to_path_buf());
+        let home_dir = Path::new(HOME_DIR).to_path_buf();
 
         let actual_absolutized: Vec<_> = maybe_path_variants
             .iter()
