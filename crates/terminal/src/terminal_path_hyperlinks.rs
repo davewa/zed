@@ -39,7 +39,6 @@
 // escaping in paths, so these currently do not work.
 
 // TODO(davewa) TASK LIST
-// - [ ]
 // - [ ] Significantly simplify Terminal::maybe_update_last_hovered_word()
 //
 use alacritty_terminal::{index::Boundary, term::search::Match, Term};
@@ -48,9 +47,10 @@ use regex::Regex;
 use std::{
     borrow::Cow,
     fmt::Display,
+    iter,
     ops::Range,
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::OnceLock,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use util::{paths::PathWithPosition, TakeUntilExt};
@@ -70,6 +70,12 @@ const MAIN_SEPARATORS: [char; 2] = ['\\', '/'];
 const COMMON_PATH_SURROUNDING_SYMBOLS: &[(char, char)] =
     &[('"', '"'), ('\'', '\''), ('[', ']'), ('(', ')')];
 
+/// Returns the word_regex.
+pub fn word_regex() -> &'static Regex {
+    static WORD_REGEX: OnceLock<Regex> = OnceLock::new();
+    WORD_REGEX.get_or_init(|| Regex::new(super::WORD_REGEX).unwrap())
+}
+
 /// The original matched maybe path from hover or Cmd-click in the terminal
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaybePath {
@@ -77,6 +83,11 @@ pub struct MaybePath {
     hovered_word_range: Range<usize>,
     hovered_word_match: Match,
     path_hyperlink_navigation: PathHyperlinkNavigation,
+}
+
+pub trait MaybePathVariantsIterator:
+    Iterator<Item = Box<dyn Iterator<Item = MaybePathVariant>>> + Clone
+{
 }
 
 impl MaybePath {
@@ -261,6 +272,22 @@ impl MaybePath {
         maybe_path_variants
     }
 
+    /// [PathHyperlinkNavigation::Advanced] maybe path variants that start on [self.hovered_word] or a
+    /// word before it and end at the end of the line.
+    ///
+    /// # Notes
+    /// Iterators are used to enable checking for timeout and stopping early.
+    pub fn line_ends_in_a_path_maybe_path_variants(
+        &self,
+    ) -> impl Iterator<Item = impl Iterator<Item = MaybePathVariant> + '_> + '_ {
+        // TODO(davewa): Some way to assert we are not called on the main thread...
+        iter::once(
+            word_regex()
+                .find_iter(&self.line[..self.hovered_word_range.end])
+                .map(|match_| MaybePathVariant::new(&self.line, match_.start()..self.line.len())),
+        )
+    }
+
     /// [PathHyperlinkNavigation::Exhaustive] maybe path variants that match the
     /// `terminal.path_hyperlink_navigation_regexes` list of path regexes.
     ///
@@ -277,19 +304,16 @@ impl MaybePath {
             .into_iter()
     }
 
-    /// [PathHyperlinkNavigation::Exhaustive]  maybe path variants that start on [self.hovered_word] or a
+    /// [PathHyperlinkNavigation::Exhaustive] maybe path variants that start on [self.hovered_word] or a
     /// word before it and end [self.hovered_word] or a word after it.
     ///
     /// # Notes
     /// Iterators are used to enable checking for timeout and stopping early.
-    pub fn exhaustive_maybe_path_variants(
+    pub fn permuted_maybe_path_variants(
         &self,
     ) -> impl Iterator<Item = impl Iterator<Item = MaybePathVariant> + '_> + '_ {
         // TODO(davewa): Some way to assert we are not called on the main thread...
-        // TODO(davewa): Start with "line ends in a path hueristic", e.g., for each start, check only to the end of the line.
-        static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(super::WORD_REGEX).unwrap());
-
-        let starts = WORD_RE
+        let starts = word_regex()
             .find_iter(
                 if self.path_hyperlink_navigation == PathHyperlinkNavigation::Exhaustive {
                     &self.line[..self.hovered_word_range.end]
@@ -300,7 +324,7 @@ impl MaybePath {
             .map(|match_| match_.start());
 
         starts.into_iter().map(move |start| {
-            WORD_RE
+            word_regex()
                 .find_iter(&self.line[self.hovered_word_range.start..])
                 .map(|match_| match_.end())
                 .map(move |end| {
@@ -683,8 +707,6 @@ impl MaybePathVariant {
 mod tests {
     use std::{mem, path::Path, sync::Arc};
 
-    use crate::WORD_REGEX;
-
     use super::*;
     use alacritty_terminal::index::Point as AlacPoint;
     use collections::HashMap;
@@ -741,8 +763,6 @@ mod tests {
             },)+ ].into_iter().collect()
         };
     }
-
-    static WORD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(WORD_REGEX).unwrap());
 
     #[gpui::test]
     async fn simple_maybe_paths(cx: &mut TestAppContext) {
@@ -936,7 +956,7 @@ mod tests {
         expected: &ExpectedMap<'a>,
     ) {
         let word_expected = expected.get(&PathHyperlinkNavigation::Default).unwrap();
-        for (matched, expected) in WORD_RE.find_iter(&line).zip(word_expected) {
+        for (matched, expected) in word_regex().find_iter(&line).zip(word_expected) {
             test_maybe_path(
                 cx,
                 trees,
@@ -950,7 +970,7 @@ mod tests {
         }
 
         let advanced_expected = expected.get(&PathHyperlinkNavigation::Advanced).unwrap();
-        for (matched, expected) in WORD_RE.find_iter(&line).zip(advanced_expected) {
+        for (matched, expected) in word_regex().find_iter(&line).zip(advanced_expected) {
             test_maybe_path(
                 cx,
                 trees,

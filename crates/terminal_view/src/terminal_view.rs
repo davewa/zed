@@ -1245,21 +1245,39 @@ fn possible_open_target_from_fs(
             // TODO(davewa): Process variations from longest to shorted within each maybe path
             // TODO(davewa): Once any real file is found, only check paths longer than the longest found so far
             if canonical_paths.is_empty() {
-                for maybe_path_variants in target.maybe_path.exhaustive_maybe_path_variants() {
+                for maybe_path_variants in
+                    target.maybe_path.line_ends_in_a_path_maybe_path_variants()
+                {
                     for maybe_path_with_position in
                         canonicalize_maybe_path_variants(&canonicalize_context, maybe_path_variants)
                             .await
                     {
                         canonical_paths.insert(maybe_path_with_position);
+                        break;
                     }
                 }
+            }
 
+            if canonical_paths.is_empty() {
                 for maybe_path_variants in target.maybe_path.regex_maybe_path_variants() {
                     for maybe_path_with_position in
                         canonicalize_maybe_path_variants(&canonicalize_context, maybe_path_variants)
                             .await
                     {
                         canonical_paths.insert(maybe_path_with_position);
+                        break;
+                    }
+                }
+            }
+
+            if canonical_paths.is_empty() {
+                for maybe_path_variants in target.maybe_path.permuted_maybe_path_variants() {
+                    for maybe_path_with_position in
+                        canonicalize_maybe_path_variants(&canonicalize_context, maybe_path_variants)
+                            .await
+                    {
+                        canonical_paths.insert(maybe_path_with_position);
+                        break;
                     }
                 }
             }
