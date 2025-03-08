@@ -769,6 +769,7 @@ mod tests {
                         "+++";
                     ],
                     absolutized![
+                        "/root 2/+++";
                         "/Some/cool/place/+++";
                     ],
                     relative![
@@ -776,13 +777,16 @@ mod tests {
                         "~/협동조합";
                     ],
                     absolutized![
+                        "/root 2/a/~/협동조합";
                         "/Some/cool/place/a/~/협동조합";
+                        "/root 2/~/협동조합";
                         "/Some/cool/place/~/협동조합";
                     ],
                     relative![
                         "~/super/cool";
                     ],
                     absolutized![
+                        "/root 2/~/super/cool";
                         "/Some/cool/place/~/super/cool";
                         "/Usors/uzer/super/cool";
                     ],
@@ -792,14 +796,18 @@ mod tests {
                         "b/path", 4, 2;
                     ],
                     absolutized![
+                        "/root 2/b/path:4:2";
                         "/Some/cool/place/b/path:4:2";
+                        "/root 2/path:4:2";
                         "/Some/cool/place/path:4:2";
+                        "/root 2/b/path", 4, 2;
                         "/Some/cool/place/b/path", 4, 2;
                     ],
                     relative![
                         "(/root";
                     ],
                     absolutized![
+                        "/root 2/(/root";
                         "/Some/cool/place/(/root";
                         // Iff longest_maybe_path_by_surrounding_symbols() hueristic enabled by default:
                         "/root 2/שיתופית.rs";
@@ -808,6 +816,7 @@ mod tests {
                         "2/שיתופית.rs)";
                     ],
                     absolutized![
+                        "/root 2/2/שיתופית.rs)";
                         "/Some/cool/place/2/שיתופית.rs)";
                         // Iff longest_maybe_path_by_surrounding_symbols() hueristic enabled by default:
                         "/root 2/שיתופית.rs";
@@ -822,7 +831,9 @@ mod tests {
                         "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     absolutized![
+                        "/root 2/+++";
                         "/Some/cool/place/+++";
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     relative![
@@ -832,9 +843,13 @@ mod tests {
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     absolutized![
+                        "/root 2/a/~/협동조합";
                         "/Some/cool/place/a/~/협동조합";
+                        "/root 2/~/협동조합";
                         "/Some/cool/place/~/협동조합";
+                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     relative![
@@ -843,9 +858,12 @@ mod tests {
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     absolutized![
+                        "/root 2/~/super/cool";
                         "/Some/cool/place/~/super/cool";
                         "/Usors/uzer/super/cool";
+                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     relative![
@@ -856,10 +874,15 @@ mod tests {
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     absolutized![
+                        "/root 2/b/path:4:2";
                         "/Some/cool/place/b/path:4:2";
+                        "/root 2/path:4:2";
                         "/Some/cool/place/path:4:2";
+                        "/root 2/b/path", 4, 2;
                         "/Some/cool/place/b/path", 4, 2;
+                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     relative![
@@ -868,9 +891,12 @@ mod tests {
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     absolutized![
+                        "/root 2/(/root";
                         "/Some/cool/place/(/root";
                         "/root 2/שיתופית.rs";
+                        "//root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     relative![
@@ -879,9 +905,12 @@ mod tests {
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
                     absolutized![
+                        "/root 2/2/שיתופית.rs)";
                         "/Some/cool/place/2/שיתופית.rs)";
                         "/root 2/שיתופית.rs";
+                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ]
                 ],
@@ -1034,7 +1063,7 @@ mod tests {
             .map(|maybe_path_variant| {
                 maybe_path_variant.absolutized_variations(
                     &maybe_path,
-                    [Path::new(CWD)].into_iter(),
+                    [worktree_root, Path::new(CWD)].into_iter(),
                     &home_dir,
                 )
             })
