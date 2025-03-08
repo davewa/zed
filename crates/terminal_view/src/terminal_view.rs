@@ -1082,13 +1082,21 @@ fn possible_open_target(
         return Task::ready(None);
     };
 
+    // We can be on FS remote part, without real FS, so cannot canonicalize or check for existence the path right away.
+
     let maybe_path_variants = target.maybe_path.maybe_path_variants();
     let mut sorted_worktree_roots = Vec::new();
 
     // The only work we can not do in the background is read the worktrees, if any.
-    // When we get a hit, do the minimal amount of work here for the hit as well, the
-    // rest can be done in the background.
+    // When we get a hit here, just return it and skip any further processing.
     let cwd = target.terminal_dir.as_ref();
+
+    // TODO(davewa): This sort seems undesirable to do on every hover, specifically because it
+    // 1. Is likely to have non-trivial input length
+    // 2. Its input rarely changes
+    // 3. The owner of the input provides events for items being added or removed.
+    // Those make it seem ideal for sorting once on load, then subscribing to events to
+    // maintain the sorted result. This would complete remove sorting from this code path.
     if let Some(open_target) = workspace.read(cx).worktrees(cx).sorted_by_key(|worktree| {
         let worktree_root = worktree.read(cx).abs_path();
         match cwd
@@ -1103,6 +1111,7 @@ fn possible_open_target(
         let paths_to_check = maybe_path_variants.iter().flat_map(|maybe_path_variant|
             maybe_path_variant.relative_variations(&target.maybe_path, &worktree_root));
 
+        // TODO(davewa): Any reason not to use `worktree.read(cx).entry_for_path(path)` here?
         let mut traversal = worktree
             .read(cx)
             .traverse_from_path(true, true, false, "".as_ref());
@@ -1123,14 +1132,13 @@ fn possible_open_target(
         return open_target;
     }
 
-    if !workspace.read(cx).project().read(cx).is_local() {
+    let project = workspace.read(cx).project().read(cx);
+    if !project.is_local() {
         return Task::ready(None);
     }
 
-    let fs = workspace.read(cx).project().read(cx).fs().clone();
-
     possible_open_target_from_fs(
-        fs,
+        project.fs().clone(),
         home_dir.clone(),
         target.clone(),
         maybe_path_variants,
@@ -1148,6 +1156,8 @@ fn possible_open_target_from_fs(
     cx: &mut Context<TerminalView>,
 ) -> Task<Option<(MaybePathWithPosition<'static>, OpenTarget)>> {
     cx.background_spawn(async move {
+        // TODO(davewa): While working on this feature, all `fs.canonicalize()` calls were removed, maybe
+        // those were unnecessary and all that's needed is `fs.metadata()`?
         struct CanonicalizeContext<'a, 'b, RootIterator>
         where
             RootIterator: Iterator<Item = &'b Path> + Clone + 'b,
