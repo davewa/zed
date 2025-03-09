@@ -944,33 +944,30 @@ impl Terminal {
                     None
                 };
 
-                let found_url_or_maybe_path =
-                    if self.path_hyperlink_navigation != PathHyperlinkNavigation::None {
-                        if let Some((url, url_match)) = found_url {
-                            // Treat "file://" URLs like file paths to ensure that
-                            // line numbers at the end of the path are handled correctly
-                            if let Some(file_url_as_path) = url.strip_prefix("file://") {
-                                let maybe_path =
-                                    MaybePath::from_file_url(file_url_as_path, url_match.clone());
-                                debug!("Terminal: {maybe_path}",);
-                                Some((Some((url, url_match)), Some(maybe_path)))
-                            } else {
-                                Some((Some((url, url_match)), None))
-                            }
+                let found_url_or_maybe_path = if self.path_hyperlink_navigation
+                    != PathHyperlinkNavigation::None
+                {
+                    if let Some((url, url_match)) = found_url {
+                        // Treat "file://" URLs like file paths to ensure that
+                        // line numbers at the end of the path are handled correctly
+                        if let Some(file_url_as_path) = url.strip_prefix("file://") {
+                            let maybe_path =
+                                MaybePath::from_file_url(file_url_as_path, url_match.clone());
+                            debug!("Terminal: {maybe_path}",);
+                            Some((Some((url, url_match)), Some(maybe_path)))
                         } else {
-                            regex_match_at(term, point, &mut self.word_regex).map(|word_match| {
-                                let maybe_path = MaybePath::from_hovered_word_match(
-                                    term,
-                                    word_match,
-                                    self.path_hyperlink_navigation,
-                                );
-                                debug!("Terminal: {maybe_path}",);
-                                (maybe_path.best_hueristic_path(term), Some(maybe_path))
-                            })
+                            Some((Some((url, url_match)), None))
                         }
                     } else {
-                        None
-                    };
+                        regex_match_at(term, point, &mut self.word_regex).map(|word_match| {
+                            let maybe_path = MaybePath::from_hovered_word_match(term, word_match);
+                            debug!("Terminal: {maybe_path}",);
+                            (maybe_path.best_hueristic_path(term), Some(maybe_path))
+                        })
+                    }
+                } else {
+                    None
+                };
 
                 let Some((hovered_word_match, maybe_path)) = found_url_or_maybe_path else {
                     self.last_content.last_hovered_word = None;

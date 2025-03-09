@@ -55,7 +55,7 @@ use std::{
 use unicode_segmentation::UnicodeSegmentation;
 use util::{paths::PathWithPosition, TakeUntilExt};
 
-use crate::{terminal_settings::PathHyperlinkNavigation, ZedListener};
+use crate::ZedListener;
 
 /// These are valid in paths and are not matched by [WORD_REGEX](terminal::WORD_REGEX).
 /// We use them to find potential path words within a line.
@@ -64,7 +64,6 @@ use crate::{terminal_settings::PathHyperlinkNavigation, ZedListener};
 /// - **`\u{b}`** is **`\v`** (vertical tab)
 ///
 /// See [C++ Escape sequences](https://en.cppreference.com/w/cpp/language/escape)
-const PATH_WHITESPACE_CHARS: &str = "\t\u{c}\u{b} ";
 const MAIN_SEPARATORS: [char; 2] = ['\\', '/'];
 
 const COMMON_PATH_SURROUNDING_SYMBOLS: &[(char, char)] =
@@ -82,7 +81,6 @@ pub struct MaybePath {
     line: String,
     hovered_word_range: Range<usize>,
     hovered_word_match: Match,
-    path_hyperlink_navigation: PathHyperlinkNavigation,
 }
 
 pub trait MaybePathVariantsIterator:
@@ -97,7 +95,6 @@ impl MaybePath {
             line: file_iri.to_string(),
             hovered_word_range: 0..file_iri.len(),
             hovered_word_match: file_iri_match,
-            path_hyperlink_navigation: PathHyperlinkNavigation::Default,
         }
     }
 
@@ -105,20 +102,17 @@ impl MaybePath {
         line: String,
         hovered_word_range: Range<usize>,
         hovered_word_match: Match,
-        path_hyperlink_navigation: PathHyperlinkNavigation,
     ) -> Self {
         Self {
             line,
             hovered_word_range,
             hovered_word_match,
-            path_hyperlink_navigation,
         }
     }
 
     pub(super) fn from_hovered_word_match(
         term: &mut Term<ZedListener>,
         hovered_word_match: Match,
-        path_hyperlink_navigation: PathHyperlinkNavigation,
     ) -> Self {
         let maybe_path_word =
             term.bounds_to_string(*hovered_word_match.start(), *hovered_word_match.end());
@@ -149,7 +143,6 @@ impl MaybePath {
             line,
             hovered_word_start..hovered_word_end,
             hovered_word_match,
-            path_hyperlink_navigation,
         );
         maybe_path
     }
@@ -245,31 +238,38 @@ impl MaybePath {
         Match::new(start, end)
     }
 
-    /// [PathHyperlinkNavigation::Default] and [PathHyperlinkNavigation::Advanced] maybe path variants
-    pub fn maybe_path_variants(&self) -> Vec<MaybePathVariant> {
-        let mut maybe_path_variants = Vec::new();
-        maybe_path_variants.push(MaybePathVariant::new(
-            &self.line,
-            self.hovered_word_range.clone(),
-        ));
+    /// All [PathHyperlinkNavigation::Default] maybe path variants. These
+    /// need to be kept to a small well-defined set of variants.
+    ///
+    /// On the main thread, these will be checked against worktrees only. Additionally, for local
+    /// workspaces only, they will also be checked for existence in the workspace's real file
+    /// system on the background thread.
+    pub fn default_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
+        let maybe_path_variants =
+            [Some(self.hovered_word_range.clone())]
+                .into_iter()
+                .chain(iter::once_with(|| {
+                    self.longest_surrounding_symbols_match()
+                        // A surrounded `self.word` is already covered above in the first maybe path's variations
+                        .take_if(|surrounding_range| *surrounding_range != self.hovered_word_range)
+                        .map(|surrounding_range| {
+                            surrounding_range.start + 1..surrounding_range.end - 1
+                        })
+                }));
 
-        if let Some(longest_range) = self.longest_surrounding_symbols_match() {
-            // A surrounded `self.word` is already covered above in the first maybe path's variations
-            if longest_range != self.hovered_word_range {
-                maybe_path_variants.push(MaybePathVariant::new(
-                    &self.line,
-                    longest_range.start + 1..longest_range.end - 1,
-                ));
-            }
-        }
-
-        if self.path_hyperlink_navigation > PathHyperlinkNavigation::Default {
-            if let Some(expanded_range) = self.expanded_maybe_path_by_interior_spaces() {
-                maybe_path_variants.push(MaybePathVariant::new(&self.line, expanded_range));
-            }
-        }
-
+        const MAX_MAIN_THREAD_PREFIX_WORDS: usize = 2;
         maybe_path_variants
+            .flatten()
+            .map(|range| MaybePathVariant::new(&self.line, range))
+            .chain(self.line_ends_in_a_path_maybe_path_variants(MAX_MAIN_THREAD_PREFIX_WORDS))
+    }
+
+    /// All [PathHyperlinkNavigation::Advanced] maybe path variants.
+    pub fn advanced_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
+        const MAX_BACKGROUND_THREAD_PREFIX_WORDS: usize = usize::MAX;
+
+        self.regex_maybe_path_variants()
+            .chain(self.line_ends_in_a_path_maybe_path_variants(MAX_BACKGROUND_THREAD_PREFIX_WORDS))
     }
 
     /// [PathHyperlinkNavigation::Advanced] maybe path variants that start on [self.hovered_word] or a
@@ -277,31 +277,30 @@ impl MaybePath {
     ///
     /// # Notes
     /// Iterators are used to enable checking for timeout and stopping early.
-    pub fn line_ends_in_a_path_maybe_path_variants(
+    fn line_ends_in_a_path_maybe_path_variants(
         &self,
-    ) -> impl Iterator<Item = impl Iterator<Item = MaybePathVariant> + '_> + '_ {
+        max_prefix_words: usize,
+    ) -> impl Iterator<Item = MaybePathVariant> + '_ {
         // TODO(davewa): Some way to assert we are not called on the main thread...
-        iter::once(
-            word_regex()
-                .find_iter(&self.line[..self.hovered_word_range.end])
-                .map(|match_| MaybePathVariant::new(&self.line, match_.start()..self.line.len())),
-        )
+        word_regex()
+            .find_iter(&self.line[..self.hovered_word_range.end])
+            .take(max_prefix_words)
+            .map(|match_| MaybePathVariant::new(&self.line, match_.start()..self.line.len()))
     }
 
-    /// [PathHyperlinkNavigation::Exhaustive] maybe path variants that match the
+    /// [PathHyperlinkNavigation::Advanced] maybe path variants that match the
     /// `terminal.path_hyperlink_navigation_regexes` list of path regexes.
     ///
     /// # Notes
     /// Iterators are used to enable checking for timeout and stopping early.
-    // TOOD: This is just an stub to show where path regex user settings would go if we decided to support that.
-    pub fn regex_maybe_path_variants(
-        &self,
-    ) -> impl Iterator<Item = impl Iterator<Item = MaybePathVariant> + '_> + '_ {
+    // TOOD: Merge code from path_hyperlink_navigation_regexes prototype here.
+    fn regex_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
         // TODO(davewa): Some way to assert we are not called on the main thread...
         Vec::<Vec<MaybePathVariant>>::new()
             .into_iter()
             .map(|maybe_path_variants| maybe_path_variants.into_iter())
             .into_iter()
+            .flatten()
     }
 
     /// [PathHyperlinkNavigation::Exhaustive] maybe path variants that start on [self.hovered_word] or a
@@ -309,28 +308,26 @@ impl MaybePath {
     ///
     /// # Notes
     /// Iterators are used to enable checking for timeout and stopping early.
-    pub fn permuted_maybe_path_variants(
-        &self,
-    ) -> impl Iterator<Item = impl Iterator<Item = MaybePathVariant> + '_> + '_ {
+    pub fn exhaustive_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
         // TODO(davewa): Some way to assert we are not called on the main thread...
         let starts = word_regex()
-            .find_iter(
-                if self.path_hyperlink_navigation == PathHyperlinkNavigation::Exhaustive {
-                    &self.line[..self.hovered_word_range.end]
-                } else {
-                    ""
-                },
-            )
+            .find_iter(&self.line[..self.hovered_word_range.end])
             .map(|match_| match_.start());
 
-        starts.into_iter().map(move |start| {
-            word_regex()
-                .find_iter(&self.line[self.hovered_word_range.start..])
-                .map(|match_| match_.end())
-                .map(move |end| {
-                    MaybePathVariant::new(&self.line, start..self.hovered_word_range.start + end)
-                })
-        })
+        starts
+            .into_iter()
+            .map(move |start| {
+                word_regex()
+                    .find_iter(&self.line[self.hovered_word_range.start..])
+                    .map(|match_| match_.end())
+                    .map(move |end| {
+                        MaybePathVariant::new(
+                            &self.line,
+                            start..self.hovered_word_range.start + end,
+                        )
+                    })
+            })
+            .flatten()
     }
 
     /// Returns the longest range of matching surrounding symbols on [line] which contains [word].
@@ -387,7 +384,10 @@ impl MaybePath {
     /// PathHyperlinkNavigation::Advanced. If it is not that common in reality, this could be removed. It would
     /// still be handled correctly by PathHyperlinkNavigation::Exhaustive even without this.
     // TODO(davewa): Use looks_like_a_path_match()
+    #[allow(dead_code)]
     fn expanded_maybe_path_by_interior_spaces(&self) -> Option<Range<usize>> {
+        const PATH_WHITESPACE_CHARS: &str = "\t\u{c}\u{b} ";
+
         let mut range = self.hovered_word_range.clone();
 
         if let Some(first_separator) = self.line.find(MAIN_SEPARATORS) {
@@ -705,7 +705,9 @@ impl MaybePathVariant {
 
 #[cfg(test)]
 mod tests {
-    use std::{mem, path::Path, sync::Arc};
+    use std::{path::Path, sync::Arc};
+
+    use crate::terminal_settings::PathHyperlinkNavigation;
 
     use super::*;
     use alacritty_terminal::index::Point as AlacPoint;
@@ -717,6 +719,7 @@ mod tests {
     struct ExpectedMaybePathVariations<'a> {
         relative: Vec<MaybePathWithPosition<'a>>,
         absolutized: Vec<MaybePathWithPosition<'a>>,
+        open_target: Option<MaybePathWithPosition<'static>>,
     }
 
     type ExpectedMap<'a> = HashMap<PathHyperlinkNavigation, Vec<ExpectedMaybePathVariations<'a>>>;
@@ -755,98 +758,81 @@ mod tests {
         ($($tail:tt)+) => { maybe_path_with_positions![ $($tail)+ ] }
     }
 
+    macro_rules! open_target {
+        ($path:literal, $row:literal, $column:literal) => {
+            Some(MaybePathWithPosition::new(
+                &(0..0),
+                Cow::Borrowed(Path::new($path)),
+                Some(RowColumn {
+                    row: $row,
+                    column: Some($column),
+                    suffix_length: 4,
+                }),
+            ))
+        };
+        ($path:literal, $row:literal) => {
+            Some(MaybePathWithPosition::new(
+                &(0..0),
+                Cow::Borrowed(Path::new($path)),
+                Some(RowColumn {
+                    row: $row,
+                    column: None,
+                    suffix_length: 2,
+                }),
+            ))
+        };
+        ($path:literal) => {
+            Some(MaybePathWithPosition::new(
+                &(0..0),
+                Cow::Borrowed(Path::new($path)),
+                None,
+            ))
+        };
+    }
+
     macro_rules! expected {
-        ($($relative:expr, $aboslutized:expr),+) => {
-            [ $(ExpectedMaybePathVariations {
+        ($relative:expr, $absolutized:expr) => {
+            ExpectedMaybePathVariations {
                 relative: $relative,
-                absolutized: $aboslutized,
-            },)+ ].into_iter().collect()
+                absolutized: $absolutized,
+                open_target: None,
+            }
+        };
+
+        ($relative:expr, $absolutized:expr, $open_target:expr) => {
+            ExpectedMaybePathVariations {
+                relative: $relative,
+                absolutized: $absolutized,
+                open_target: $open_target,
+            }
         };
     }
 
     #[gpui::test]
     async fn simple_maybe_paths(cx: &mut TestAppContext) {
-        let mut trees = vec![
-            (
-                "/root1",
-                json!({
-                    "one.txt": "",
-                    "two.txt": "",
-                }),
-            ),
-            (
-                "/root 2",
-                json!({
-                    "שיתופית.rs": "",
-                }),
-            ),
-        ];
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/root1",
+            json!({
+                "one.txt": "",
+                "two.txt": "",
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            "/root 2",
+            json!({
+                "שיתופית.rs": "",
+            }),
+        )
+        .await;
 
-        let expected = ExpectedMap::from_iter([
-            (
-                PathHyperlinkNavigation::Default,
-                expected![
-                    relative![
-                        "+++";
-                    ],
-                    absolutized![
-                        "/root 2/+++";
-                        "/Some/cool/place/+++";
-                    ],
-                    relative![
-                        "a/~/협동조합";
-                        "~/협동조합";
-                    ],
-                    absolutized![
-                        "/root 2/a/~/협동조합";
-                        "/Some/cool/place/a/~/협동조합";
-                        "/root 2/~/협동조합";
-                        "/Some/cool/place/~/협동조합";
-                    ],
-                    relative![
-                        "~/super/cool";
-                    ],
-                    absolutized![
-                        "/root 2/~/super/cool";
-                        "/Some/cool/place/~/super/cool";
-                        "/Usors/uzer/super/cool";
-                    ],
-                    relative![
-                        "b/path:4:2";
-                        "path:4:2";
-                        "b/path", 4, 2;
-                    ],
-                    absolutized![
-                        "/root 2/b/path:4:2";
-                        "/Some/cool/place/b/path:4:2";
-                        "/root 2/path:4:2";
-                        "/Some/cool/place/path:4:2";
-                        "/root 2/b/path", 4, 2;
-                        "/Some/cool/place/b/path", 4, 2;
-                    ],
-                    relative![
-                        "(/root";
-                    ],
-                    absolutized![
-                        "/root 2/(/root";
-                        "/Some/cool/place/(/root";
-                        // Iff longest_maybe_path_by_surrounding_symbols() hueristic enabled by default:
-                        "/root 2/שיתופית.rs";
-                    ],
-                    relative![
-                        "2/שיתופית.rs)";
-                    ],
-                    absolutized![
-                        "/root 2/2/שיתופית.rs)";
-                        "/Some/cool/place/2/שיתופית.rs)";
-                        // Iff longest_maybe_path_by_surrounding_symbols() hueristic enabled by default:
-                        "/root 2/שיתופית.rs";
-                    ]
-                ],
-            ),
-            (
-                PathHyperlinkNavigation::Advanced,
-                expected![
+        let mut expected = ExpectedMap::from_iter([]);
+
+        expected.insert(
+            PathHyperlinkNavigation::Default,
+            Vec::from_iter([
+                expected!{
                     relative![
                         "+++";
                         "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
@@ -856,10 +842,13 @@ mod tests {
                         "/Some/cool/place/+++";
                         "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                    ],
+                    ]
+                },
+                expected!{
                     relative![
                         "a/~/협동조합";
                         "~/협동조합";
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
@@ -868,13 +857,18 @@ mod tests {
                         "/Some/cool/place/a/~/협동조합";
                         "/root 2/~/협동조합";
                         "/Some/cool/place/~/협동조합";
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                    ],
+                    ]
+                },
+                expected!{
                     relative![
                         "~/super/cool";
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
@@ -882,18 +876,23 @@ mod tests {
                         "/root 2/~/super/cool";
                         "/Some/cool/place/~/super/cool";
                         "/Usors/uzer/super/cool";
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                    ],
+                    ]
+                },
+                expected!{
                     relative![
                         "b/path:4:2";
                         "path:4:2";
                         "b/path", 4, 2;
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                    ],
+                        ],
                     absolutized![
                         "/root 2/b/path:4:2";
                         "/Some/cool/place/b/path:4:2";
@@ -901,13 +900,18 @@ mod tests {
                         "/Some/cool/place/path:4:2";
                         "/root 2/b/path", 4, 2;
                         "/Some/cool/place/b/path", 4, 2;
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                    ],
+                    ]
+                },
+                expected!{
                     relative![
                         "(/root";
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
@@ -915,13 +919,19 @@ mod tests {
                         "/root 2/(/root";
                         "/Some/cool/place/(/root";
                         "/root 2/שיתופית.rs";
-                        "//root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
+                    open_target!("/root 2/שיתופית.rs")
+                },
+                expected!{
                     relative![
                         "2/שיתופית.rs)";
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ],
@@ -929,18 +939,157 @@ mod tests {
                         "/root 2/2/שיתופית.rs)";
                         "/Some/cool/place/2/שיתופית.rs)";
                         "/root 2/שיתופית.rs";
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                    ],
+                    open_target!("/root 2/שיתופית.rs")
+                }
+            ].into_iter()),
+        );
+
+        expected.insert(
+            PathHyperlinkNavigation::Advanced,
+            Vec::from_iter([
+                expected!{
+                    relative![
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                    ],
+                    absolutized![
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                    ]
+                },
+                expected!{
+                    relative![
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                    ],
+                    absolutized![
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                     ]
-                ],
-            ),
-        ]);
+                },
+                expected!{
+                    relative![
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                    ],
+                    absolutized![
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Usors/uzer/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                    ]
+                },
+                expected!{
+                    relative![
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "b/path:4:2 (/root 2/שיתופית.rs)";
+                        "path:4:2 (/root 2/שיתופית.rs)";
+                    ],
+                    absolutized![
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Usors/uzer/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/path:4:2 (/root 2/שיתופית.rs)";
+                    ]
+                },
+                expected!{
+                    relative![
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "b/path:4:2 (/root 2/שיתופית.rs)";
+                        "path:4:2 (/root 2/שיתופית.rs)";
+                        "(/root 2/שיתופית.rs)";
+                    ],
+                    absolutized![
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Usors/uzer/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/(/root 2/שיתופית.rs)";
+                        "/Some/cool/place/(/root 2/שיתופית.rs)";
+                        "/root 2/שיתופית.rs";
+                    ],
+                    open_target!("/root 2/שיתופית.rs")
+                },
+                expected!{
+                    relative![
+                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "b/path:4:2 (/root 2/שיתופית.rs)";
+                        "path:4:2 (/root 2/שיתופית.rs)";
+                        "(/root 2/שיתופית.rs)";
+                        "2/שיתופית.rs)";
+                    ],
+                    absolutized![
+                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Usors/uzer/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/b/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/path:4:2 (/root 2/שיתופית.rs)";
+                        "/Some/cool/place/path:4:2 (/root 2/שיתופית.rs)";
+                        "/root 2/(/root 2/שיתופית.rs)";
+                        "/Some/cool/place/(/root 2/שיתופית.rs)";
+                        "/root 2/שיתופית.rs";
+                        "/root 2/2/שיתופית.rs)";
+                        "/Some/cool/place/2/שיתופית.rs)";
+                    ],
+                    open_target!("/root 2/שיתופית.rs")
+                }
+            ].into_iter()),
+        );
 
         test_line_maybe_path_variants(
-            cx,
-            &mut trees,
+            fs,
             &Path::new("/root 2"),
             "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)",
             &expected,
@@ -949,21 +1098,28 @@ mod tests {
     }
 
     async fn test_line_maybe_path_variants<'a>(
-        cx: &mut TestAppContext,
-        trees: &mut Vec<(&str, serde_json::Value)>,
+        fs: Arc<FakeFs>,
         worktree_root: &Path,
         line: &str,
         expected: &ExpectedMap<'a>,
     ) {
+        // TODO(davewa): Currently we don't test word_match functionality
+        let dummy_word_match = Match::new(
+            AlacPoint::new(0.into(), 0.into()),
+            AlacPoint::new(0.into(), 0.into()),
+        );
+
         let word_expected = expected.get(&PathHyperlinkNavigation::Default).unwrap();
         for (matched, expected) in word_regex().find_iter(&line).zip(word_expected) {
+            let maybe_path =
+                MaybePath::from_line(line.to_string(), matched.range(), dummy_word_match.clone());
+            println!("\n\nTesting Default: {}", maybe_path);
+
             test_maybe_path(
-                cx,
-                trees,
+                Arc::clone(&fs),
                 worktree_root,
-                line,
-                matched.range(),
-                PathHyperlinkNavigation::Default,
+                &maybe_path,
+                || maybe_path.default_maybe_path_variants(),
                 &expected,
             )
             .await
@@ -971,21 +1127,22 @@ mod tests {
 
         let advanced_expected = expected.get(&PathHyperlinkNavigation::Advanced).unwrap();
         for (matched, expected) in word_regex().find_iter(&line).zip(advanced_expected) {
+            let maybe_path =
+                MaybePath::from_line(line.to_string(), matched.range(), dummy_word_match.clone());
+            println!("\n\nTesting Advanced: {}", maybe_path);
+
             test_maybe_path(
-                cx,
-                trees,
+                Arc::clone(&fs),
                 worktree_root,
-                line,
-                matched.range(),
-                PathHyperlinkNavigation::Advanced,
+                &maybe_path,
+                || maybe_path.advanced_maybe_path_variants(),
                 &expected,
             )
             .await
         }
     }
 
-    async fn check_variations<'a>(
-        fs: Arc<FakeFs>,
+    fn check_variations<'a>(
         actual: &Vec<MaybePathWithPosition<'a>>,
         expected: &Vec<MaybePathWithPosition<'a>>,
     ) {
@@ -1002,95 +1159,108 @@ mod tests {
             .collect();
 
         if actual.len() != expected.len() || !errors.is_empty() {
-            println!("Actual:");
-            println!("{:#?}", actual);
-            println!("Expected:");
-            println!("{:#?}", expected);
+            println!("\nActual:");
+            actual
+                .iter()
+                .for_each(|MaybePathWithPosition { path, .. }| println!("    {path:?};"));
+            println!("\nExpected:");
+            expected
+                .iter()
+                .for_each(|MaybePathWithPosition { path, .. }| println!("    {path:?};"));
             assert!(false);
         }
-
-        let mut canonical_paths = Vec::new();
-        for MaybePathWithPosition { path, .. } in actual {
-            if let Ok(canonical_path) = fs.canonicalize(&path).await {
-                canonical_paths.push(canonical_path);
-            }
-        }
-
-        // TODO(davewa): Metadata (file/dir?)
-        // TODO(davewa): Expected navigation targets
-        assert_eq!(canonical_paths.len(), 0);
-        // TODO(davewa): assert_eq!(canonical_paths[0], expected[0].0)
     }
 
-    async fn test_maybe_path<'a>(
-        cx: &mut TestAppContext,
-        trees: &mut Vec<(&str, serde_json::Value)>,
+    async fn test_maybe_path<'a, VariantIterator>(
+        fs: Arc<FakeFs>,
         worktree_root: &Path,
-        line: &str,
-        word: Range<usize>,
-        path_hyperlink_navigation: PathHyperlinkNavigation,
+        maybe_path: &'a MaybePath,
+        variants: impl Fn() -> VariantIterator,
         expected: &ExpectedMaybePathVariations<'a>,
-    ) {
-        // TODO(davewa): Currently we don't test word_match functionality
-        let dummy_word_match = Match::new(
-            AlacPoint::new(0.into(), 0.into()),
-            AlacPoint::new(0.into(), 0.into()),
+    ) where
+        VariantIterator: Iterator<Item = MaybePathVariant> + 'a,
+    {
+        //assert_eq!(variants().len(), 3);
+
+        println!(
+            "\nVariants: {:#?}",
+            variants()
+                .map(|maybe_path_variant| maybe_path.text_at(&maybe_path_variant.variations[0]))
+                .collect::<Vec<_>>()
         );
-        let maybe_path = MaybePath::from_line(
-            line.to_string(),
-            word,
-            dummy_word_match,
-            path_hyperlink_navigation,
-        );
 
-        println!("\nTesting {}", maybe_path);
+        println!("\nTesting Relative: strip_prefix = {worktree_root:?}");
 
-        let fs = FakeFs::new(cx.executor());
-        for tree in trees {
-            fs.insert_tree(tree.0, mem::take(&mut tree.1)).await;
-        }
-
-        let maybe_path_variants = maybe_path.maybe_path_variants();
-        //assert_eq!(maybe_path_variants.len(), 3);
-
-        for maybe_path_variant in &maybe_path_variants {
-            println!(
-                "Maybe path: {}",
-                maybe_path.text_at(&maybe_path_variant.variations[0])
-            );
-        }
-
-        println!("\nTesting relative {}", maybe_path);
-
-        let actual_relative: Vec<_> = maybe_path_variants
-            .iter()
+        let actual_relative: Vec<_> = variants()
             .map(|maybe_path_variant| {
                 maybe_path_variant.relative_variations(&maybe_path, worktree_root)
             })
             .flatten()
             .collect();
 
-        check_variations(Arc::clone(&fs), &actual_relative, &expected.relative).await;
-
-        println!("\nTesting absolutized {}", maybe_path);
+        check_variations(&actual_relative, &expected.relative);
 
         const HOME_DIR: &str = "/Usors/uzer";
         const CWD: &str = "/Some/cool/place";
 
         let home_dir = Path::new(HOME_DIR).to_path_buf();
+        let roots = [worktree_root, Path::new(CWD)];
 
-        let actual_absolutized: Vec<_> = maybe_path_variants
-            .iter()
+        println!("\nTesting Absolutized: home_dir: {home_dir:?}, roots: {roots:?}",);
+
+        let actual_absolutized: Vec<_> = variants()
             .map(|maybe_path_variant| {
-                maybe_path_variant.absolutized_variations(
-                    &maybe_path,
-                    [worktree_root, Path::new(CWD)].into_iter(),
-                    &home_dir,
-                )
+                maybe_path_variant.absolutized_variations(&maybe_path, roots.into_iter(), &home_dir)
             })
             .flatten()
             .collect();
 
-        check_variations(Arc::clone(&fs), &actual_absolutized, &expected.absolutized).await;
+        check_variations(&actual_absolutized, &expected.absolutized);
+
+        let actual_open_target = async || {
+            for maybe_path_with_position in &actual_absolutized {
+                let normalized_path = fs::normalize_path(&maybe_path_with_position.path);
+                assert_eq!(
+                    maybe_path_with_position.path, normalized_path,
+                    "Normalized was not a noop"
+                );
+                if let Ok(Some(_metadata)) =
+                    fs.metadata(&fs::normalize_path(&normalized_path)).await
+                {
+                    // TODO(davewa): assert_eq!(metadata.is_dir, expected_open_target.is_dir)
+                    return Some(MaybePathWithPosition {
+                        path: Cow::Owned(maybe_path_with_position.path.to_path_buf()),
+                        ..maybe_path_with_position.clone()
+                    });
+                }
+            }
+
+            None
+        };
+
+        if let Some(actual_open_target) = actual_open_target().await {
+            if let Some(expected_open_target) = expected.open_target.as_ref() {
+                assert_eq!(
+                    *expected_open_target.path, actual_open_target.path,
+                    "Mismatched open target paths"
+                );
+                assert_eq!(
+                    expected_open_target.position, actual_open_target.position,
+                    "Mismatched open target positions"
+                );
+            } else {
+                assert!(
+                    false,
+                    "Expected no open target, but found: {:?}",
+                    actual_open_target
+                );
+            }
+        } else if let Some(expected_open_target) = expected.open_target.as_ref() {
+            assert!(
+                false,
+                "No open target found, expected: {:?}",
+                expected_open_target
+            );
+        }
     }
 }

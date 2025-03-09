@@ -4,10 +4,7 @@ pub mod terminal_panel;
 pub mod terminal_scrollbar;
 pub mod terminal_tab_tooltip;
 
-use collections::HashSet;
 use editor::{actions::SelectAll, scroll::ScrollbarAutoHide, Editor, EditorSettings};
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
 use gpui::{
     anchored, deferred, div, impl_actions, AnyElement, App, DismissEvent, Entity, EventEmitter,
     FocusHandle, Focusable, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
@@ -22,6 +19,7 @@ use schemars::JsonSchema;
 use terminal::terminal_path_hyperlinks::{
     MaybePath, MaybePathVariant, MaybePathWithPosition, RowColumn,
 };
+use terminal::terminal_settings::PathHyperlinkNavigation;
 use terminal::{
     alacritty_terminal::{
         index::Point,
@@ -133,6 +131,7 @@ pub struct TerminalView {
     blink_epoch: usize,
     can_navigate_to_selected_word: bool,
     selected_word_maybe_path_target: Option<MaybePathOpenTarget>,
+    path_hyperlink_navigation: terminal_settings::PathHyperlinkNavigation,
     workspace_id: Option<WorkspaceId>,
     show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
@@ -216,6 +215,7 @@ impl TerminalView {
             blink_epoch: 0,
             can_navigate_to_selected_word: false,
             selected_word_maybe_path_target: None,
+            path_hyperlink_navigation: TerminalSettings::get_global(cx).path_hyperlink_navigation,
             workspace_id,
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
@@ -919,7 +919,7 @@ fn subscribe_for_terminal_events(
                     Some(MaybeNavigationTarget::Url(_)) => true,
                     Some(MaybeNavigationTarget::PathLike(path_like_target)) => {
                         let open_target_task =
-                            possible_open_target(&workspace, &path_like_target, cx);
+                            possible_open_target(&workspace, &path_like_target, this.path_hyperlink_navigation, cx);
                         if let Some(open_target) = smol::block_on(open_target_task) {
                             this.update_terminal_maybe_path(path_like_target, Some(open_target), cx);
                             true
@@ -950,10 +950,11 @@ fn subscribe_for_terminal_events(
                                 Some(((maybe_path_with_position, open_target), false))
                             }
                             _ => {
-                                terminal_view.update(&mut cx, |_, cx| {
+                                terminal_view.update(&mut cx, |this, cx| {
                                     possible_open_target(
                                         &task_workspace,
                                         &path_like_target,
+                                        this.path_hyperlink_navigation,
                                         cx,
                                     )
                                 })?
@@ -1071,20 +1072,14 @@ impl OpenTarget {
 fn possible_open_target(
     workspace: &WeakEntity<Workspace>,
     target: &PathLikeTarget,
+    path_hyperlink_navigation: PathHyperlinkNavigation,
     cx: &mut Context<TerminalView>,
 ) -> Task<Option<(MaybePathWithPosition<'static>, OpenTarget)>> {
     let Some(workspace) = workspace.upgrade() else {
         return Task::ready(None);
     };
 
-    // We can be on FS remote part, without real FS, so cannot canonicalize or check for existence the path right away.
-
-    let maybe_path_variants = target.maybe_path.maybe_path_variants();
-    let mut sorted_worktree_roots = Vec::new();
-
-    // The only work we can not do in the background is read the worktrees, if any.
-    // When we get a hit here, just return it and skip any further processing.
-    let cwd = target.terminal_dir.as_ref();
+    // We can be on FS remote part, without real FS, so cannot check for existence the path right away.
 
     // TODO(davewa): This sort seems undesirable to do on every hover, specifically because it
     // 1. Is likely to have non-trivial input length
@@ -1092,39 +1087,53 @@ fn possible_open_target(
     // 3. The owner of the input provides events for items being added or removed.
     // Those make it seem ideal for sorting once on load, then subscribing to events to
     // maintain the sorted result. This would complete remove sorting from this code path.
-    if let Some(open_target) = workspace.read(cx).worktrees(cx).sorted_by_key(|worktree| {
-        let worktree_root = worktree.read(cx).abs_path();
-        match cwd
-            .and_then(|cwd| worktree_root.strip_prefix(cwd).ok())
-        {
-            Some(cwd_child) => cwd_child.components().count(),
-            None => usize::MAX,
-        }
-    }).filter_map(|worktree| {
-        let worktree_root = worktree.read(cx).abs_path();
-        sorted_worktree_roots.push(Arc::clone(&worktree_root));
-        let paths_to_check = maybe_path_variants.iter().flat_map(|maybe_path_variant|
-            maybe_path_variant.relative_variations(&target.maybe_path, &worktree_root));
+    let cwd = target.terminal_dir.as_ref();
+    let sorted_worktrees: Vec<_> = workspace
+        .read(cx)
+        .worktrees(cx)
+        .sorted_by_key(|worktree| {
+            let worktree_root = worktree.read(cx).abs_path();
+            match cwd.and_then(|cwd| worktree_root.strip_prefix(cwd).ok()) {
+                Some(cwd_child) => cwd_child.components().count(),
+                None => usize::MAX,
+            }
+        })
+        .collect();
 
-        // TODO(davewa): Any reason not to use `worktree.read(cx).entry_for_path(path)` here?
-        let mut traversal = worktree
-            .read(cx)
-            .traverse_from_path(true, true, false, "".as_ref());
-        while let Some(entry) = traversal.next() {
-            if let Some(MaybePathWithPosition{ range, position, .. }) = paths_to_check.clone()
-                .find(|path_to_check| entry.path.ends_with(&path_to_check.path))
+    // TODO(davewa): Any reason not to use `worktree.read(cx).entry_for_path(path)` here?
+
+    // Outer loops should be maybe path variants and variations so that we stop as soon as
+    // a match is found. Variants and variations are order by most common to least common.
+    for maybe_path_variant in target.maybe_path.default_maybe_path_variants() {
+        for worktree in &sorted_worktrees {
+            // The only work we can not do in the background is read the worktrees, if any.
+            // When we get a hit here, just return it and skip any further processing.
+            let worktree_root = worktree.read(cx).abs_path();
+
+            for MaybePathWithPosition {
+                range,
+                path,
+                position,
+            } in maybe_path_variant.relative_variations(&target.maybe_path, &worktree_root)
             {
-                trace!("Terminal View: MaybePath found for worktree: {worktree_root:?}, entry: {:?}", entry.path);
-                return Some(Task::ready(Some((
-                    MaybePathWithPosition::new(&range, Cow::Owned(worktree_root.join(&entry.path)), position),
-                    OpenTarget::Worktree(entry.clone())
-                ))));
+                for entry in worktree
+                    .read(cx)
+                    .traverse_from_path(true, true, false, "".as_ref())
+                {
+                    if entry.path.ends_with(&path) {
+                        trace!("Terminal View: MaybePath found for worktree: {worktree_root:?}, entry: {:?}", entry.path);
+                        return Task::ready(Some((
+                            MaybePathWithPosition::new(
+                                &range,
+                                Cow::Owned(worktree_root.join(&entry.path)),
+                                position,
+                            ),
+                            OpenTarget::Worktree(entry.clone()),
+                        )));
+                    }
+                }
             }
         }
-
-        None
-    }).nth(0) {
-        return open_target;
     }
 
     let project = workspace.read(cx).project().read(cx);
@@ -1135,8 +1144,11 @@ fn possible_open_target(
     possible_open_target_from_fs(
         project.fs().clone(),
         target.clone(),
-        maybe_path_variants,
-        sorted_worktree_roots,
+        sorted_worktrees
+            .into_iter()
+            .map(|worktree| worktree.read(cx).abs_path())
+            .collect(),
+        path_hyperlink_navigation,
         cx,
     )
 }
@@ -1144,184 +1156,92 @@ fn possible_open_target(
 fn possible_open_target_from_fs(
     fs: Arc<dyn Fs>,
     target: PathLikeTarget,
-    maybe_path_variants: Vec<MaybePathVariant>,
-    sorted_worktree_roots: Vec<Arc<Path>>,
+    mut sorted_worktree_roots: Vec<Arc<Path>>,
+    path_hyperlink_navigation: PathHyperlinkNavigation,
     cx: &mut Context<TerminalView>,
 ) -> Task<Option<(MaybePathWithPosition<'static>, OpenTarget)>> {
-    cx.background_spawn(async move {
-        // TODO(davewa): While working on this feature, all `fs.canonicalize()` calls were removed, maybe
-        // those were unnecessary and all that's needed is `fs.metadata()`?
-        struct CanonicalizeContext<'a, 'b, RootIterator>
-        where
-            RootIterator: Iterator<Item = &'b Path> + Clone + 'b,
-        {
-            pub fs: Arc<dyn Fs>,
-            pub home_dir: &'b PathBuf,
-            pub roots: RootIterator,
-            pub maybe_path: &'a MaybePath,
-        }
-
-        async fn canonicalize_maybe_path_variants<'a, 'b, RootIterator>(
-            canonicalize_context: &CanonicalizeContext<'a, 'b, RootIterator>,
-            maybe_path_variants: impl Iterator<Item = MaybePathVariant> + 'a,
-        ) -> Vec<MaybePathWithPosition<'a>>
-        where
-            RootIterator: Iterator<Item = &'b Path> + Clone + 'b,
-        {
-            let mut canonical_with_positions = Vec::new();
-
-            let CanonicalizeContext {
-                fs,
+    async fn search_absolutized_maybe_path_variants<'a>(
+        fs: Arc<dyn Fs>,
+        home_dir: &PathBuf,
+        roots: &Vec<Arc<Path>>,
+        maybe_path: &'a MaybePath,
+        maybe_path_variants: impl Iterator<Item = MaybePathVariant> + 'a,
+    ) -> Option<(MaybePathWithPosition<'static>, OpenTarget)> {
+        for maybe_path_variant in maybe_path_variants {
+            // TODO(davewa): check for timeout here (and return Error::Timeout, e.g. Result<Option<(...)>>)
+            for maybe_path_with_position in maybe_path_variant.absolutized_variations(
+                &maybe_path,
+                roots.iter().map(Deref::deref),
                 home_dir,
-                roots,
-                maybe_path,
-            } = canonicalize_context;
-
-            for maybe_path_variant in maybe_path_variants {
-                // TODO(davewa): check for timeout here (and return Option<>)
-                let mut fetch_canonical_tasks = maybe_path_variant
-                    .absolutized_variations(&maybe_path, roots.clone(), home_dir)
-                    .into_iter()
-                    .map(
-                        |MaybePathWithPosition {
-                             range,
-                             path,
-                             position,
-                         }| {
-                            let fs = Arc::clone(&fs);
-                            async move {
-                                trace!("Terminal: MaybePath absolutized variation: {path:?}",);
-                                fs.canonicalize(&path).await.ok().map(|canonical| {
-                                    MaybePathWithPosition::new(
-                                        &range,
-                                        Cow::Owned(canonical),
-                                        position,
-                                    )
-                                })
-                            }
+            ) {
+                if let Some(metadata) = fs
+                    .metadata(&maybe_path_with_position.path)
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    info!(
+                        "Terminal: MaybePath found absolutized variation: {:?}",
+                        maybe_path_with_position.path
+                    );
+                    return Some((
+                        MaybePathWithPosition {
+                            path: Cow::Owned(maybe_path_with_position.path.into_owned()),
+                            ..maybe_path_with_position
                         },
-                    )
-                    .collect::<FuturesUnordered<_>>();
-
-                while let Some(maybe_path_with_position) = fetch_canonical_tasks.next().await {
-                    if let Some(maybe_path_with_position) = maybe_path_with_position {
-                        canonical_with_positions.push(maybe_path_with_position);
-                    }
+                        OpenTarget::File(metadata),
+                    ));
+                } else {
+                    trace!(
+                        "Terminal: MaybePath skipping absolutized variation: {:?}",
+                        maybe_path_with_position.path
+                    );
                 }
             }
-
-            canonical_with_positions
         }
 
-        let mut paths_with_metadata: Vec<(MaybePathWithPosition, Metadata)> = Vec::new();
-        let mut index_of_longest_maybe_path = 0;
+        None
+    }
 
-        // TODO(davewa): Figure out where and when to use SanitizedPath?
+    cx.background_spawn(async move {
+        let home_dir = paths::home_dir();
+        if let Some(terminal_dir) = target.terminal_dir {
+            sorted_worktree_roots.push(terminal_dir.into());
+        };
+
+        if let Some(default) = search_absolutized_maybe_path_variants(
+            Arc::clone(&fs),
+            home_dir,
+            &sorted_worktree_roots,
+            &target.maybe_path,
+            target.maybe_path.default_maybe_path_variants(),
+        )
+        .await
         {
-            let mut longest_hyperlink_range = 0..0;
-            let mut canonical_paths = HashSet::<MaybePathWithPosition>::from_iter([]);
-
-            let canonicalize_context = CanonicalizeContext {
-                fs: Arc::clone(&fs),
-                home_dir: paths::home_dir(),
-                roots: sorted_worktree_roots
-                    .iter()
-                    .map(Deref::deref)
-                    .chain(target.terminal_dir.iter().map(|cwd| cwd.as_path())),
-                maybe_path: &target.maybe_path,
-            };
-
-            // Attempt to canonicalize the maybe_path_variants computed on the main thread; these are the most common
-            for maybe_path_with_position in canonicalize_maybe_path_variants(
-                &canonicalize_context,
-                maybe_path_variants.into_iter(),
+            Some(default)
+        } else if path_hyperlink_navigation > PathHyperlinkNavigation::Default {
+            if let Some(advanced) = search_absolutized_maybe_path_variants(
+                Arc::clone(&fs),
+                home_dir,
+                &sorted_worktree_roots,
+                &target.maybe_path,
+                target.maybe_path.advanced_maybe_path_variants(),
             )
             .await
             {
-                canonical_paths.insert(maybe_path_with_position);
+                Some(advanced)
+            } else if path_hyperlink_navigation > PathHyperlinkNavigation::Advanced {
+                search_absolutized_maybe_path_variants(
+                    Arc::clone(&fs),
+                    home_dir,
+                    &sorted_worktree_roots,
+                    &target.maybe_path,
+                    target.maybe_path.exhaustive_maybe_path_variants(),
+                )
+                .await
+            } else {
+                None
             }
-
-            // Iff none of the common cases yielded a real path, attempt the less common cases
-            // TODO(davewa): Process variations from longest to shorted within each maybe path
-            // TODO(davewa): Once any real file is found, only check paths longer than the longest found so far
-            if canonical_paths.is_empty() {
-                for maybe_path_variants in
-                    target.maybe_path.line_ends_in_a_path_maybe_path_variants()
-                {
-                    for maybe_path_with_position in
-                        canonicalize_maybe_path_variants(&canonicalize_context, maybe_path_variants)
-                            .await
-                    {
-                        canonical_paths.insert(maybe_path_with_position);
-                        break;
-                    }
-                }
-            }
-
-            if canonical_paths.is_empty() {
-                for maybe_path_variants in target.maybe_path.regex_maybe_path_variants() {
-                    for maybe_path_with_position in
-                        canonicalize_maybe_path_variants(&canonicalize_context, maybe_path_variants)
-                            .await
-                    {
-                        canonical_paths.insert(maybe_path_with_position);
-                        break;
-                    }
-                }
-            }
-
-            if canonical_paths.is_empty() {
-                for maybe_path_variants in target.maybe_path.permuted_maybe_path_variants() {
-                    for maybe_path_with_position in
-                        canonicalize_maybe_path_variants(&canonicalize_context, maybe_path_variants)
-                            .await
-                    {
-                        canonical_paths.insert(maybe_path_with_position);
-                        break;
-                    }
-                }
-            }
-
-            let mut fetch_metadata_tasks = canonical_paths
-                .into_iter()
-                .map(|maybe_path_with_position| async {
-                    let metadata = fs
-                        .metadata(&maybe_path_with_position.path)
-                        .await
-                        .ok()
-                        .flatten();
-                    (maybe_path_with_position, metadata)
-                })
-                .collect::<FuturesUnordered<_>>();
-
-            let mut index = 0;
-            while let Some((maybe_path_with_position, metadata)) = fetch_metadata_tasks.next().await
-            {
-                if let Some(metadata) = metadata {
-                    let hyperlink_range = maybe_path_with_position.hyperlink_range();
-                    if maybe_path_with_position.hyperlink_range().len()
-                        > longest_hyperlink_range.len()
-                    {
-                        index_of_longest_maybe_path = index;
-                        longest_hyperlink_range = hyperlink_range;
-                    }
-                    paths_with_metadata.push((maybe_path_with_position, metadata));
-                    index += 1;
-                }
-            }
-        }
-
-        if !paths_with_metadata.is_empty() {
-            let (maybe_path_with_position, metadata) =
-                paths_with_metadata[index_of_longest_maybe_path].clone();
-            info!("Terminal View: Open target: {:?}", maybe_path_with_position);
-            Some((
-                MaybePathWithPosition {
-                    path: Cow::Owned(maybe_path_with_position.path.into_owned()),
-                    ..maybe_path_with_position
-                },
-                OpenTarget::File(metadata),
-            ))
         } else {
             None
         }
