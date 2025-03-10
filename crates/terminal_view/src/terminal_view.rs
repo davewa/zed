@@ -1114,7 +1114,8 @@ fn possible_open_target(
                 range,
                 path,
                 position,
-            } in maybe_path_variant.relative_variations(&target.maybe_path, &worktree_root)
+            } in
+                maybe_path_variant.relative_variations(&target.maybe_path, Some(&worktree_root))
             {
                 for entry in worktree
                     .read(cx)
