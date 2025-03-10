@@ -1,6 +1,7 @@
 use crate::askpass_modal::AskPassModal;
 use crate::commit_modal::CommitModal;
 use crate::git_panel_settings::StatusStyle;
+use crate::project_diff::Diff;
 use crate::remote_output_toast::{RemoteAction, RemoteOutputToast};
 use crate::repository_selector::filtered_repository_entries;
 use crate::{branch_picker, render_remote_button};
@@ -231,6 +232,7 @@ pub struct GitPanel {
     fs: Arc<dyn Fs>,
     hide_scrollbar_task: Option<Task<()>>,
     new_count: usize,
+    entry_count: usize,
     new_staged_count: usize,
     pending: Vec<PendingOperation>,
     pending_commit: Option<Task<()>>,
@@ -381,6 +383,7 @@ impl GitPanel {
             context_menu: None,
             workspace,
             modal_open: false,
+            entry_count: 0,
         };
         git_panel.schedule_update(false, window, cx);
         git_panel.show_scrollbar = git_panel.should_show_scrollbar(cx);
@@ -1078,7 +1081,7 @@ impl GitPanel {
         });
     }
 
-    fn stage_all(&mut self, _: &StageAll, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn stage_all(&mut self, _: &StageAll, _window: &mut Window, cx: &mut Context<Self>) {
         let entries = self
             .entries
             .iter()
@@ -1089,7 +1092,7 @@ impl GitPanel {
         self.change_file_stage(true, entries, cx);
     }
 
-    fn unstage_all(&mut self, _: &UnstageAll, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn unstage_all(&mut self, _: &UnstageAll, _window: &mut Window, cx: &mut Context<Self>) {
         let entries = self
             .entries
             .iter()
@@ -1453,6 +1456,10 @@ impl GitPanel {
 
     /// Generates a commit message using an LLM.
     pub fn generate_commit_message(&mut self, cx: &mut Context<Self>) {
+        if !self.can_commit() {
+            return;
+        }
+
         let model = match current_language_model(cx) {
             Some(value) => value,
             None => return,
@@ -2133,10 +2140,12 @@ impl GitPanel {
         self.tracked_count = 0;
         self.new_staged_count = 0;
         self.tracked_staged_count = 0;
+        self.entry_count = 0;
         for entry in &self.entries {
             let Some(status_entry) = entry.status_entry() else {
                 continue;
             };
+            self.entry_count += 1;
             if repo.has_conflict(&status_entry.repo_path) {
                 self.conflicted_count += 1;
                 if self.entry_staging(status_entry).has_staged() {
@@ -2291,14 +2300,28 @@ impl GitPanel {
                     .into_any_element();
             }
 
+            let can_commit = self.can_commit();
+            let editor_focus_handle = self.commit_editor.focus_handle(cx);
             IconButton::new("generate-commit-message", IconName::AiEdit)
                 .shape(ui::IconButtonShape::Square)
                 .icon_color(Color::Muted)
-                .tooltip(Tooltip::for_action_title_in(
-                    "Generate Commit Message",
-                    &git::GenerateCommitMessage,
-                    &self.commit_editor.focus_handle(cx),
-                ))
+                .tooltip(move |window, cx| {
+                    if can_commit {
+                        Tooltip::for_action_in(
+                            "Generate Commit Message",
+                            &git::GenerateCommitMessage,
+                            &editor_focus_handle,
+                            window,
+                            cx,
+                        )
+                    } else {
+                        Tooltip::simple(
+                            "You must have either staged changes or tracked files to generate a commit message",
+                            cx,
+                        )
+                    }
+                })
+                .disabled(!can_commit)
                 .on_click(cx.listener(move |this, _event, _window, cx| {
                     this.generate_commit_message(cx);
                 }))
@@ -2382,6 +2405,43 @@ impl GitPanel {
                 })
                 .ok();
         })
+    }
+
+    fn render_panel_header(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let text;
+        let action;
+        let tooltip;
+        if self.total_staged_count() == self.entry_count {
+            text = "Unstage All";
+            action = git::UnstageAll.boxed_clone();
+            tooltip = "git reset";
+        } else {
+            text = "Stage All";
+            action = git::StageAll.boxed_clone();
+            tooltip = "git add --all ."
+        }
+
+        self.panel_header_container(window, cx)
+            .child(
+                Button::new("diff", "Open diff")
+                    .tooltip(Tooltip::for_action_title("Open diff", &Diff))
+                    .on_click(|_, _, cx| {
+                        cx.defer(|cx| {
+                            cx.dispatch_action(&Diff);
+                        })
+                    }),
+            )
+            .child(div().flex_grow()) // spacer
+            .child(
+                Button::new("stage-unstage-all", text)
+                    .tooltip(Tooltip::for_action_title(tooltip, action.as_ref()))
+                    .on_click(move |_, _, cx| {
+                        let action = action.boxed_clone();
+                        cx.defer(move |cx| {
+                            cx.dispatch_action(action.as_ref());
+                        })
+                    }),
+            )
     }
 
     pub fn render_footer(
@@ -3148,6 +3208,7 @@ impl Render for GitPanel {
             .child(
                 v_flex()
                     .size_full()
+                    .child(self.render_panel_header(window, cx))
                     .map(|this| {
                         if has_entries {
                             this.child(self.render_entries(has_write_access, window, cx))
