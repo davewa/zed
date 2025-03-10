@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use smol::channel::{Receiver, Sender};
 use task::{HideStrategy, Shell, TaskId};
-use terminal_path_hyperlinks::MaybePath;
+use terminal_path_hyperlinks::HoveredMaybePath;
 use terminal_settings::{AlternateScroll, CursorShape, PathHyperlinkNavigation, TerminalSettings};
 use theme::{ActiveTheme, Theme};
 use util::{paths::home_dir, truncate_and_trailoff};
@@ -119,7 +119,7 @@ pub struct PathLikeTarget {
     /// File system path, absolute or relative, existing or not.
     /// Might have line and column number(s) attached as `file.rs:1:23`
     /// or `file.rs(1,23)`
-    pub maybe_path: MaybePath,
+    pub maybe_path: HoveredMaybePath,
     /// Current working directory of the terminal
     pub terminal_dir: Option<PathBuf>,
     /// The id of the hovered word
@@ -322,7 +322,7 @@ const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
 /// Paths can contain almost any unicode characters. Here we use whitespace to separate paths
 /// into "words" so that the common case of paths without spaces can be processed more efficiently.
-const WORD_REGEX: &str = r#"[^\s]+"#;
+pub const WORD_REGEX: &str = r#"[^\s]+"#;
 
 pub struct TerminalBuilder {
     terminal: Terminal,
@@ -587,7 +587,7 @@ pub struct HoveredWord {
     pub word: String,
     pub word_match: RangeInclusive<AlacPoint>,
     pub(self) id: usize,
-    pub(self) maybe_path: Option<MaybePath>,
+    pub(self) maybe_path: Option<HoveredMaybePath>,
 }
 
 impl Default for TerminalContent {
@@ -942,30 +942,32 @@ impl Terminal {
                     None
                 };
 
-                let found_url_or_maybe_path = if self.path_hyperlink_navigation
-                    != PathHyperlinkNavigation::None
-                {
-                    if let Some((url, url_match)) = found_url {
-                        // Treat "file://" URLs like file paths to ensure that
-                        // line numbers at the end of the path are handled correctly
-                        if let Some(file_url_as_path) = url.strip_prefix("file://") {
-                            let maybe_path =
-                                MaybePath::from_file_url(file_url_as_path, url_match.clone());
-                            debug!("Terminal: {maybe_path}",);
-                            Some((Some((url, url_match)), Some(maybe_path)))
+                let found_url_or_maybe_path =
+                    if self.path_hyperlink_navigation != PathHyperlinkNavigation::None {
+                        if let Some((url, url_match)) = found_url {
+                            // Treat "file://" URLs like file paths to ensure that
+                            // line numbers at the end of the path are handled correctly
+                            if let Some(file_url_as_path) = url.strip_prefix("file://") {
+                                let maybe_path = HoveredMaybePath::from_file_url(
+                                    file_url_as_path,
+                                    url_match.clone(),
+                                );
+                                debug!("Terminal: {maybe_path}",);
+                                Some((Some((url, url_match)), Some(maybe_path)))
+                            } else {
+                                Some((Some((url, url_match)), None))
+                            }
                         } else {
-                            Some((Some((url, url_match)), None))
+                            regex_match_at(term, point, &mut self.word_regex).map(|word_match| {
+                                let maybe_path =
+                                    HoveredMaybePath::from_hovered_word_match(term, word_match);
+                                debug!("Terminal: {maybe_path}",);
+                                (maybe_path.best_hueristic_path(term), Some(maybe_path))
+                            })
                         }
                     } else {
-                        regex_match_at(term, point, &mut self.word_regex).map(|word_match| {
-                            let maybe_path = MaybePath::from_hovered_word_match(term, word_match);
-                            debug!("Terminal: {maybe_path}",);
-                            (maybe_path.best_hueristic_path(term), Some(maybe_path))
-                        })
-                    }
-                } else {
-                    None
-                };
+                        None
+                    };
 
                 let Some((hovered_word_match, maybe_path)) = found_url_or_maybe_path else {
                     self.last_content.last_hovered_word = None;
@@ -1020,7 +1022,7 @@ impl Terminal {
         &mut self,
         prev_word: Option<HoveredWord>,
         hovered_word_match: &Option<(String, Match)>,
-        maybe_path: &Option<MaybePath>,
+        maybe_path: &Option<HoveredMaybePath>,
         cx: &mut Context<Self>,
     ) -> (usize, bool) {
         if let Some(prev_word) = prev_word {
@@ -1045,7 +1047,7 @@ impl Terminal {
                     trace!("Terminal: Update prev last hovered word: Maybe path, with word");
 
                     // The maybe_path came with a hovered_word_match that we've hueristically decided that is likely
-                    // to be a path. See also MaybePath::best_hueristic_path(), so set a new
+                    // to be a path. See also HoveredMaybePath::best_hueristic_path(), so set a new
                     // last_hovered_word now. This is also always true for a 'file://' url which we
                     // treat as path.
                     let id = self.next_link_id();

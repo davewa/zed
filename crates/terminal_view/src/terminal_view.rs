@@ -1,5 +1,6 @@
 mod persistence;
 pub mod terminal_element;
+mod terminal_maybe_path;
 pub mod terminal_panel;
 pub mod terminal_scrollbar;
 pub mod terminal_tab_tooltip;
@@ -16,9 +17,6 @@ use persistence::TERMINAL_DB;
 use project::Entry;
 use project::{search::SearchQuery, terminals::TerminalKind, Fs, Metadata, Project};
 use schemars::JsonSchema;
-use terminal::terminal_path_hyperlinks::{
-    MaybePath, MaybePathVariant, MaybePathWithPosition, RowColumn,
-};
 use terminal::terminal_settings::PathHyperlinkNavigation;
 use terminal::{
     alacritty_terminal::{
@@ -31,6 +29,7 @@ use terminal::{
     TaskStatus, Terminal, TerminalBounds, ToggleViMode,
 };
 use terminal_element::{is_blank, TerminalElement};
+use terminal_maybe_path::{MaybePath, MaybePathVariant, MaybePathWithPosition, RowColumn};
 use terminal_panel::TerminalPanel;
 use terminal_scrollbar::TerminalScrollHandle;
 use terminal_tab_tooltip::TerminalTooltip;
@@ -919,7 +918,7 @@ fn subscribe_for_terminal_events(
                     Some(MaybeNavigationTarget::Url(_)) => true,
                     Some(MaybeNavigationTarget::PathLike(path_like_target)) => {
                         let open_target_task =
-                            possible_open_target(&workspace, &path_like_target, this.path_hyperlink_navigation, cx);
+                            possible_open_target(&workspace, path_like_target.terminal_dir.clone(), &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path), this.path_hyperlink_navigation, cx);
                         if let Some(open_target) = smol::block_on(open_target_task) {
                             this.update_terminal_maybe_path(path_like_target, Some(open_target), cx);
                             true
@@ -953,7 +952,8 @@ fn subscribe_for_terminal_events(
                                 terminal_view.update(&mut cx, |this, cx| {
                                     possible_open_target(
                                         &task_workspace,
-                                        &path_like_target,
+                                        path_like_target.terminal_dir.clone(),
+                                        &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path),
                                         this.path_hyperlink_navigation,
                                         cx,
                                     )
@@ -1071,7 +1071,8 @@ impl OpenTarget {
 
 fn possible_open_target(
     workspace: &WeakEntity<Workspace>,
-    target: &PathLikeTarget,
+    cwd: Option<PathBuf>,
+    maybe_path: &MaybePath,
     path_hyperlink_navigation: PathHyperlinkNavigation,
     cx: &mut Context<TerminalView>,
 ) -> Task<Option<(MaybePathWithPosition<'static>, OpenTarget)>> {
@@ -1087,13 +1088,15 @@ fn possible_open_target(
     // 3. The owner of the input provides events for items being added or removed.
     // Those make it seem ideal for sorting once on load, then subscribing to events to
     // maintain the sorted result. This would complete remove sorting from this code path.
-    let cwd = target.terminal_dir.as_ref();
     let sorted_worktrees: Vec<_> = workspace
         .read(cx)
         .worktrees(cx)
         .sorted_by_key(|worktree| {
             let worktree_root = worktree.read(cx).abs_path();
-            match cwd.and_then(|cwd| worktree_root.strip_prefix(cwd).ok()) {
+            match cwd
+                .as_ref()
+                .and_then(|cwd| worktree_root.strip_prefix(cwd).ok())
+            {
                 Some(cwd_child) => cwd_child.components().count(),
                 None => usize::MAX,
             }
@@ -1104,7 +1107,7 @@ fn possible_open_target(
 
     // Outer loops should be maybe path variants and variations so that we stop as soon as
     // a match is found. Variants and variations are ordered by most common to least common.
-    for maybe_path_variant in target.maybe_path.default_maybe_path_variants() {
+    for maybe_path_variant in maybe_path.default_maybe_path_variants() {
         for worktree in &sorted_worktrees {
             // The only work we can not do in the background is read the worktrees, if any.
             // When we get a hit here, just return it and skip any further processing.
@@ -1114,8 +1117,7 @@ fn possible_open_target(
                 range,
                 path,
                 position,
-            } in
-                maybe_path_variant.relative_variations(&target.maybe_path, Some(&worktree_root))
+            } in maybe_path_variant.relative_variations(&maybe_path, Some(&worktree_root))
             {
                 for entry in worktree
                     .read(cx)
@@ -1144,7 +1146,8 @@ fn possible_open_target(
 
     possible_open_target_from_fs(
         project.fs().clone(),
-        target.clone(),
+        cwd,
+        maybe_path.clone(),
         sorted_worktrees
             .into_iter()
             .map(|worktree| worktree.read(cx).abs_path())
@@ -1156,7 +1159,8 @@ fn possible_open_target(
 
 fn possible_open_target_from_fs(
     fs: Arc<dyn Fs>,
-    target: PathLikeTarget,
+    cwd: Option<PathBuf>,
+    maybe_path: MaybePath,
     mut sorted_worktree_roots: Vec<Arc<Path>>,
     path_hyperlink_navigation: PathHyperlinkNavigation,
     cx: &mut Context<TerminalView>,
@@ -1206,16 +1210,16 @@ fn possible_open_target_from_fs(
 
     cx.background_spawn(async move {
         let home_dir = paths::home_dir();
-        if let Some(terminal_dir) = target.terminal_dir {
-            sorted_worktree_roots.push(terminal_dir.into());
+        if let Some(cwd) = cwd {
+            sorted_worktree_roots.push(cwd.into());
         };
 
         if let Some(default) = search_absolutized_maybe_path_variants(
             Arc::clone(&fs),
             home_dir,
             &sorted_worktree_roots,
-            &target.maybe_path,
-            target.maybe_path.default_maybe_path_variants(),
+            &maybe_path,
+            maybe_path.default_maybe_path_variants(),
         )
         .await
         {
@@ -1225,8 +1229,8 @@ fn possible_open_target_from_fs(
                 Arc::clone(&fs),
                 home_dir,
                 &sorted_worktree_roots,
-                &target.maybe_path,
-                target.maybe_path.advanced_maybe_path_variants(),
+                &maybe_path,
+                maybe_path.advanced_maybe_path_variants(),
             )
             .await
             {
@@ -1236,8 +1240,8 @@ fn possible_open_target_from_fs(
                     Arc::clone(&fs),
                     home_dir,
                     &sorted_worktree_roots,
-                    &target.maybe_path,
-                    target.maybe_path.exhaustive_maybe_path_variants(),
+                    &maybe_path,
+                    maybe_path.exhaustive_maybe_path_variants(),
                 )
                 .await
             } else {

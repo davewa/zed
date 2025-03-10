@@ -21,7 +21,6 @@ futures.workspace = true
 gpui.workspace = true
 libc.workspace = true
 log.workspace = true
-regex.workspace = true
 release_channel.workspace = true
 schemars.workspace = true
 serde.workspace = true
@@ -39,8 +38,6 @@ unicode-segmentation.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
-fs = { workspace = true, features = ["test-support"] }
-gpui = { workspace = true, features = ["test-support"] }
 rand.workspace = true
 regex.workspace = true
 serde_json.workspace = true

@@ -25,9 +25,8 @@ pub struct Toolbar {
 }
 
 #[derive(
-    Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord,
+    Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
-#[cfg_attr(test, derive(Hash))]
 #[serde(rename_all = "snake_case")]
 pub enum PathHyperlinkNavigation {
     /// Disables all path hyperlink navigation in the terminal
