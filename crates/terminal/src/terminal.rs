@@ -322,8 +322,6 @@ const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
 /// Paths can contain almost any unicode characters. Here we use whitespace to separate paths
 /// into "words" so that the common case of paths without spaces can be processed more efficiently.
-/// Use terminal.[enable_enhanced_path_hyperlinks](TerminalSettingsContent::enable_enhanced_path_hyperlinks) = true
-/// to enable paths containing spaces.
 const WORD_REGEX: &str = r#"[^\s]+"#;
 
 pub struct TerminalBuilder {

@@ -1103,7 +1103,7 @@ fn possible_open_target(
     // TODO(davewa): Any reason not to use `worktree.read(cx).entry_for_path(path)` here?
 
     // Outer loops should be maybe path variants and variations so that we stop as soon as
-    // a match is found. Variants and variations are order by most common to least common.
+    // a match is found. Variants and variations are ordered by most common to least common.
     for maybe_path_variant in target.maybe_path.default_maybe_path_variants() {
         for worktree in &sorted_worktrees {
             // The only work we can not do in the background is read the worktrees, if any.

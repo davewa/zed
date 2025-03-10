@@ -30,24 +30,27 @@ pub struct Toolbar {
 #[cfg_attr(test, derive(Hash))]
 #[serde(rename_all = "snake_case")]
 pub enum PathHyperlinkNavigation {
-    /// This disables all path hyperlink navigation in the terminal.
+    /// Disables all path hyperlink navigation in the terminal
     None,
-    /// Path hyperlink for the word under the cursor for hover and Cmd-click.
+    /// Enables path hyperlinks for the hovered or Cmd-clicked word,
     /// - Common surrounding symbols are stripped, e.g., `"` `'` `[` `]` `(` `)`
-    /// - Line and column suffixes, e.g. `foo.rs:4:2` and `foo.rs(4,2)`
-    /// - Relative paths resolve against all open worktree roots and `CWD`
+    /// - Line and column suffixes are processed, e.g. `foo.rs:4:2` and `foo.rs(4,2)`
+    /// - Relative paths resolve against all open worktree roots and the current terminal
+    /// working directory
     /// - _Linux and macOS only_ : `~/` prefix resolves to `$HOME`
-    /// - `git diff` prefixes, e.g., `a/foo.rs`
-    /// - Paths with spaces surrounded in common symbols
+    /// - `git diff` prefixes are processed, e.g., `a/foo.rs`
+    /// - Paths with spaces surrounded in common symbols are supported
+    /// - Paths with spaces which are preceeded by up to 2 tokens, and take up the rest of
+    /// the line are supported
     Default,
-    /// Advanced path hyperlink support. All of [Default](PathHyperlinkNavigation::Default),
+    /// Enables advanced path hyperlink support. All of [Default](PathHyperlinkNavigation::Default),
     /// plus:
     /// - Path with spaces at the end of a line
     Advanced,
-    /// Exhaustive path hyperlink support. All of [Advanced](PathHyperlinkNavigation::Advanced),
+    /// Enables exhaustive path hyperlink support. All of [Advanced](PathHyperlinkNavigation::Advanced),
     /// plus less common paths with spaces scenarios
-    /// - Any contiguous sequence of words on a line which include
-    /// the hovered or Cmd-clicked word and resolve to a real file
+    /// - Paths with spaces comprising any contiguous sequence of words on a line which include
+    /// the hovered or Cmd-clicked word
     Exhaustive,
 }
 
@@ -253,10 +256,9 @@ pub struct TerminalSettingsContent {
     /// Scrollbar-related settings
     pub scrollbar: Option<ScrollbarSettingsContent>,
     pub path_hyperlink_navigation: Option<PathHyperlinkNavigation>,
-    /// Timeout for path hyperlink navigation in milliseconds.
-    /// This limits the maximum time to search for path hyperlink navigation targets.
+    /// Timeout for hover and Cmd-click path hyperlink discovery in milliseconds.
     ///
-    /// Default: 250
+    /// Default: 1000
     pub path_hyperlink_timeout: Option<usize>,
 }
 

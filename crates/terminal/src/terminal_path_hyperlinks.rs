@@ -1,12 +1,14 @@
 // TODO(davewa): Change most (all?) info! messages into debug! or trace!
-// TODO(davewa): Some APIs may benefit from HashSet for deduplication?
 // TODO(davewa): Bugs found while testing this feature:
 // - Navigation to line and column navigates to the wrong column when line
 // contains unicode. I suspect it is using char's instead of graphemes.
 // - [ ] When sending NewNaviagationTarget(None), we were not also clearning last_hovered_word, but we should.
 // - [ ] When holding Cmd, and the terminal output is scrolling, the link is highlighted, but after scrolling
 // away, it is still highlighting whatever new text is where the original link was.
+// - [ ] When holding Cmd, and the terminal contents are not scrolling, but a command is running that is adding
+// output off screen, the hovered link move down one line for each new line of content added off screen
 // - [x] When hovering, initially a link flashes, then goes away
+// - [ ] Tooltips don't render markdown tables correctly
 //
 // TODO(davewa): Some ideas for further improvements
 //
@@ -14,7 +16,8 @@
 // a maybe path unless it is a 'file://' url. However, there could be a real file with a name that looks like
 // a non-'file://' url. Also, a 'file:/' is a valid directory
 //
-// - Support navigation to line in git diff output, e.g. `@@ <line>,<lines> @@`
+// - Only match git diff if line starts with "+++ a/" and treat the whole line as the path.
+// - Support chunk line navigation in git diff output, e.g. `@@ <line>,<lines> @@`
 // and `+ blah`.
 // --- a/TODO.md
 // +++ b/TODO.md
@@ -39,10 +42,26 @@
 // escaping in paths, so these currently do not work.
 
 // TODO(davewa) TASK LIST
-// - [ ] Significantly simplify Terminal::maybe_update_last_hovered_word()
 //
+// - [ ] Significantly simplify Terminal::maybe_update_last_hovered_word()
+// - [ ] Un-pub MaybePathVariant::range.
+// - [ ] Add `line: &'a str` to MaybePathVariant<'a>
+// - [ ] Add Exhaustive expected to unit test
+// - [ ] Add a ton more targeted unit test cases
+// - [ ] Fix tests on Windows
+// - [ ] Test file:// Urls
+// - [ ] Test non-file:// Urls
+// - [ ] Test Match APIs (e.g., RangeInclusive<AlacPoint>)
+// - [ ] Test variations are ordered by descending length
+// - [ ] Move this file from terminal package to terninal_view package
+// - [ ] Implement background (and main thread?) timeout for searching variations
+//   - Use the executor's? timer so that test virtual time works correctly
+
+#[cfg(doc)]
+use crate::terminal_settings::PathHyperlinkNavigation;
 use alacritty_terminal::{index::Boundary, term::search::Match, Term};
-use log::{debug, trace};
+use log::debug;
+
 use regex::Regex;
 use std::{
     borrow::Cow,
@@ -53,7 +72,7 @@ use std::{
     sync::OnceLock,
 };
 use unicode_segmentation::UnicodeSegmentation;
-use util::{paths::PathWithPosition, TakeUntilExt};
+use util::paths::PathWithPosition;
 
 use crate::ZedListener;
 
@@ -70,7 +89,7 @@ const COMMON_PATH_SURROUNDING_SYMBOLS: &[(char, char)] =
     &[('"', '"'), ('\'', '\''), ('[', ']'), ('(', ')')];
 
 /// Returns the word_regex.
-pub fn word_regex() -> &'static Regex {
+fn word_regex() -> &'static Regex {
     static WORD_REGEX: OnceLock<Regex> = OnceLock::new();
     WORD_REGEX.get_or_init(|| Regex::new(super::WORD_REGEX).unwrap())
 }
@@ -83,11 +102,6 @@ pub struct MaybePath {
     hovered_word_match: Match,
 }
 
-pub trait MaybePathVariantsIterator:
-    Iterator<Item = Box<dyn Iterator<Item = MaybePathVariant>>> + Clone
-{
-}
-
 impl MaybePath {
     /// For file IRIs, the IRI is always the 'line'
     pub(super) fn from_file_url(file_iri: &str, file_iri_match: Match) -> Self {
@@ -95,18 +109,6 @@ impl MaybePath {
             line: file_iri.to_string(),
             hovered_word_range: 0..file_iri.len(),
             hovered_word_match: file_iri_match,
-        }
-    }
-
-    pub(self) fn from_line(
-        line: String,
-        hovered_word_range: Range<usize>,
-        hovered_word_match: Match,
-    ) -> Self {
-        Self {
-            line,
-            hovered_word_range,
-            hovered_word_match,
         }
     }
 
@@ -145,6 +147,18 @@ impl MaybePath {
             hovered_word_match,
         );
         maybe_path
+    }
+
+    fn from_line(
+        line: String,
+        hovered_word_range: Range<usize>,
+        hovered_word_match: Match,
+    ) -> Self {
+        Self {
+            line,
+            hovered_word_range,
+            hovered_word_match,
+        }
     }
 
     pub(super) fn hovered_word(&self) -> &str {
@@ -241,8 +255,9 @@ impl MaybePath {
     /// All [PathHyperlinkNavigation::Default] maybe path variants. These
     /// need to be kept to a small well-defined set of variants.
     ///
-    /// On the main thread, these will be checked against worktrees only. Additionally, for local
-    /// workspaces only, they will also be checked for existence in the workspace's real file
+    /// On the main thread, these will be checked against worktrees only.
+    ///
+    /// *Local Only*--If no worktree match found they will also be checked for existence in the workspace's real file
     /// system on the background thread.
     pub fn default_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
         let maybe_path_variants =
@@ -250,7 +265,6 @@ impl MaybePath {
                 .into_iter()
                 .chain(iter::once_with(|| {
                     self.longest_surrounding_symbols_match()
-                        // A surrounded `self.word` is already covered above in the first maybe path's variations
                         .take_if(|surrounding_range| *surrounding_range != self.hovered_word_range)
                         .map(|surrounding_range| {
                             surrounding_range.start + 1..surrounding_range.end - 1
@@ -268,11 +282,10 @@ impl MaybePath {
     pub fn advanced_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
         const MAX_BACKGROUND_THREAD_PREFIX_WORDS: usize = usize::MAX;
 
-        self.regex_maybe_path_variants()
-            .chain(self.line_ends_in_a_path_maybe_path_variants(MAX_BACKGROUND_THREAD_PREFIX_WORDS))
+        self.line_ends_in_a_path_maybe_path_variants(MAX_BACKGROUND_THREAD_PREFIX_WORDS)
     }
 
-    /// [PathHyperlinkNavigation::Advanced] maybe path variants that start on [self.hovered_word] or a
+    /// [PathHyperlinkNavigation::Advanced] maybe path variants that start on the hovered word or a
     /// word before it and end at the end of the line.
     ///
     /// # Notes
@@ -288,23 +301,8 @@ impl MaybePath {
             .map(|match_| MaybePathVariant::new(&self.line, match_.start()..self.line.len()))
     }
 
-    /// [PathHyperlinkNavigation::Advanced] maybe path variants that match the
-    /// `terminal.path_hyperlink_navigation_regexes` list of path regexes.
-    ///
-    /// # Notes
-    /// Iterators are used to enable checking for timeout and stopping early.
-    // TOOD: Merge code from path_hyperlink_navigation_regexes prototype here.
-    fn regex_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
-        // TODO(davewa): Some way to assert we are not called on the main thread...
-        Vec::<Vec<MaybePathVariant>>::new()
-            .into_iter()
-            .map(|maybe_path_variants| maybe_path_variants.into_iter())
-            .into_iter()
-            .flatten()
-    }
-
-    /// [PathHyperlinkNavigation::Exhaustive] maybe path variants that start on [self.hovered_word] or a
-    /// word before it and end [self.hovered_word] or a word after it.
+    /// All [PathHyperlinkNavigation::Exhaustive] maybe path variants that start on the hovered word or a
+    /// word before it and end the hovered word or a word after it.
     ///
     /// # Notes
     /// Iterators are used to enable checking for timeout and stopping early.
@@ -359,80 +357,6 @@ impl MaybePath {
 
         longest
     }
-
-    /// Returns the range of the longest contiguous sequence of words on [line] that
-    /// start and end with a word that contains MAIN_SEPARATOR and which contains [word].
-    ///
-    /// - The start is expanded to the start of the first word in [line] which contains a path separator.
-    /// - The and is expanded to the end of the last word in [line] which contains a path separator.
-    ///
-    /// This is a quick way to catch the case where there is a path on the line that is
-    /// - not surrounded by common symbols,
-    /// - whose first component **does not** contain spaces
-    /// - whose last component **does not** contain spaces
-    /// - a least one interior component **does** contain spaces
-    ///
-    /// # Example
-    /// _(maybe_path is_ **bold** _)_
-    ///
-    /// _before:_ this is\ an **example\of** how\this works
-    ///
-    /// _after:_ this **is\ an example\of how\this** works
-    ///
-    /// # To Do
-    /// This seems like it would be a relatively common case, thus this special handling is enabled in
-    /// PathHyperlinkNavigation::Advanced. If it is not that common in reality, this could be removed. It would
-    /// still be handled correctly by PathHyperlinkNavigation::Exhaustive even without this.
-    // TODO(davewa): Use looks_like_a_path_match()
-    #[allow(dead_code)]
-    fn expanded_maybe_path_by_interior_spaces(&self) -> Option<Range<usize>> {
-        const PATH_WHITESPACE_CHARS: &str = "\t\u{c}\u{b} ";
-
-        let mut range = self.hovered_word_range.clone();
-
-        if let Some(first_separator) = self.line.find(MAIN_SEPARATORS) {
-            if first_separator < range.start {
-                let word_start = first_separator
-                    - self.line[..first_separator]
-                        .chars()
-                        .rev()
-                        .take_until(|&c| PATH_WHITESPACE_CHARS.contains(c))
-                        .count();
-
-                if word_start == 0 {
-                    // We stopped at the start of the text, that is the word_start.
-                    range.start = word_start;
-                } else {
-                    // We stopped at a whitespace character, advance by 1
-                    range.start = word_start + 1;
-                }
-
-                trace!(
-                    "Terminal: Expanded maybe path left: {}",
-                    self.text_at(&range)
-                );
-            }
-        }
-
-        if let Some(last_separator) = self.line.rfind(MAIN_SEPARATORS) {
-            if last_separator >= range.end {
-                let word_end = self.line[last_separator..]
-                    .find(PATH_WHITESPACE_CHARS)
-                    .unwrap_or(self.line.len());
-                range.end = word_end;
-                trace!(
-                    "Terminal: Expanded maybe path right: {}",
-                    self.text_at(&range)
-                );
-            }
-        }
-
-        if range != self.hovered_word_range {
-            Some(range)
-        } else {
-            None
-        }
-    }
 }
 
 impl Display for MaybePath {
@@ -445,15 +369,15 @@ impl Display for MaybePath {
     }
 }
 
-/// Line and column suffix information, including the suffix length
+/// Line and column suffix information
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct RowColumn {
     pub row: u32,
     pub column: Option<u32>,
     /// [MaybePathWithPosition::range] stores the range of the path after any line and column
-    /// suffix has been stripped. Storing the [self.suffix_length] here allows us to linkify it
+    /// suffix has been stripped. Storing the length of the suffix here allows us to linkify it
     /// correctly.
-    pub suffix_length: usize,
+    suffix_length: usize,
 }
 
 /// Like [PathWithPosition], with enhancements for [MaybePath] processing
@@ -461,27 +385,13 @@ pub struct RowColumn {
 /// Specifically, we:
 /// - Don't require allocation
 /// - Model row and column restrictions directly (cannot have a column without a row)
-/// - Include the [self.range] within our source [MaybePath], and the length of the line and column suffix
+/// - Include our range within our source [MaybePath], and the length of the line and column suffix
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct MaybePathWithPosition<'a> {
+    // TODO(davewa): Un-pub
     pub range: Range<usize>,
     pub path: Cow<'a, Path>,
     pub position: Option<RowColumn>,
-}
-
-impl<'a> Into<PathWithPosition> for MaybePathWithPosition<'a> {
-    fn into(self) -> PathWithPosition {
-        let (row, column) = if let Some(RowColumn { row, column, .. }) = self.position {
-            (Some(row), column)
-        } else {
-            (None, None)
-        };
-        PathWithPosition {
-            path: self.path.into_owned(),
-            row,
-            column,
-        }
-    }
 }
 
 impl<'a> MaybePathWithPosition<'a> {
@@ -501,12 +411,15 @@ impl<'a> MaybePathWithPosition<'a> {
     }
 }
 
-/// Contains well defined substring variations of a MaybePath
+/// A contiguous sequence of words which includes the hovered word of a [MaybePath]
+///
+/// Yields all substring variations of the contained path:
 /// - With and without stripped common surrounding symbols: `"` `'` `(` `)` `[` `]`
 /// - With and without line and column suffix: `:4:2` or `(4,2)`
 /// - With and without git diff prefixes: `a/` or `b/`
 ///
 /// # Notes
+/// - The original path is always the first variation
 /// - Surrounding symbols (if any) are stripped before processing the other variations
 /// - Git diff prefixes are only processed if surrounding symbols are not present
 /// - Row and column are never processed on a git diff variation
@@ -519,9 +432,7 @@ impl<'a> MaybePathWithPosition<'a> {
 /// | [a/some/path.rs:4:2] | a/some/path.rs:4:2 |                  | a/some/path.rs<br>*row = 4, column = 2*   |
 /// | a/some/path.rs:4:2   |                    | some/path.rs:4:2 | a/some/path.rs<br>*row = 4, column = 2*   |
 ///
-// TODO(davewa): Ideas for improvements
-// - In Advance and Exhaustive, only match git diff if line starts with "+++ a/" and treat the whole line as the path.
-//
+// Note: The above table renders perfectly in docs, but currenlty does not render correctly in the tooltip in Zed.
 #[derive(Debug)]
 pub struct MaybePathVariant {
     variations: Vec<Range<usize>>,
@@ -531,9 +442,9 @@ pub struct MaybePathVariant {
 }
 
 impl MaybePathVariant {
-    pub fn new(text: &str, mut path: Range<usize>) -> Self {
+    pub fn new(line: &str, mut path: Range<usize>) -> Self {
         // We add variations from longest to shortest
-        let mut maybe_path = &text[path.clone()];
+        let mut maybe_path = &line[path.clone()];
         let mut positioned_variation = None::<(Range<usize>, RowColumn)>;
         let mut common_symbols_stripped = false;
         let mut absolutize_home_dir = true;
@@ -555,7 +466,7 @@ impl MaybePathVariant {
                 common_symbols_stripped = true;
                 path = path.start + 1..path.end - 1;
                 variations.push(path.clone());
-                maybe_path = &text[path.clone()];
+                maybe_path = &line[path.clone()];
             }
 
             // Git diff parsing--only if we did not strip common symbols

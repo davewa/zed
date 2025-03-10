@@ -1022,22 +1022,21 @@
       //    "never"
       "show": null
     },
-    /// Hover and cmd-click hyperlink navigation for paths
+    /// Hover and Cmd-click hyperlink navigation for paths
     /// This setting can take five values:
     ///
     /// 1. null (default): Inherit editor settings
     /// 2. Disable navigation:
     ///    "none"
-    /// 3. Enable navigation for single word paths:
-    ///    "word"
-    /// 4. Enable for common paths with spaces cases
+    /// 3. Enable navigation for single word paths, and some very common paths with spaces cases:
+    ///    "default"
+    /// 4. Enable for most common paths with spaces cases
     ///    "advanced"
     /// 5. Enable for rare paths with spaces cases
     ///    "exhaustive"
-    "path_hyperlink_navigation": "advanced",
-    /// Timeout for hover and cmd-click navigation for paths in milliseconds.
-    /// This limits the maximum time to search for a path hyperlink navigation target.
-    "path_hyperlink_timeout": 250
+    "path_hyperlink_navigation": "default",
+    /// Timeout for hover and Cmd-click path hyperlink discovery in milliseconds.
+    "path_hyperlink_timeout": 1000
     // Set the terminal's font size. If this option is not included,
     // the terminal will default to matching the buffer's font size.
     // "font_size": 15,
