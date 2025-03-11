@@ -14,8 +14,6 @@
 // TODO(davewa) TASK LIST
 //
 // - [ ] Significantly simplify Terminal::maybe_update_last_hovered_word()
-// - [ ] Un-pub MaybePathVariant::range.
-// - [ ] Add `line: &'a str` to MaybePathVariant<'a>
 // - [ ] Add Exhaustive expected to unit test
 // - [ ] Add a ton more targeted unit test cases
 // - [ ] Fix tests on Windows
@@ -58,7 +56,11 @@ pub struct MaybePath {
 impl Display for MaybePath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.hovered_word_range.start != 0 || self.hovered_word_range.end != self.line.len() {
-            formatter.write_fmt(format_args!("{:?} «{}»", self, self.hovered_word()))
+            formatter.write_fmt(format_args!(
+                "{:?} «{}»",
+                self,
+                &self.line[self.hovered_word_range.clone()]
+            ))
         } else {
             formatter.write_fmt(format_args!("{:?}", self))
         }
@@ -80,13 +82,6 @@ impl MaybePath {
             hovered_word_range,
         }
     }
-    pub(super) fn hovered_word(&self) -> &str {
-        &self.line[self.hovered_word_range.clone()]
-    }
-
-    pub(super) fn text_at(&self, range: &Range<usize>) -> &str {
-        &self.line[range.clone()]
-    }
 
     const MAX_MAIN_THREAD_PREFIX_WORDS: usize = 2;
     const MAX_BACKGROUND_THREAD_PREFIX_WORDS: usize = usize::MAX;
@@ -98,7 +93,7 @@ impl MaybePath {
     ///
     /// *Local Only*--If no worktree match found they will also be checked for existence in the workspace's real file
     /// system on the background thread.
-    pub fn default_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
+    pub fn default_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
         [MaybePathVariant::new(
             &self.line,
             self.hovered_word_range.clone(),
@@ -118,7 +113,7 @@ impl MaybePath {
     }
 
     /// All [PathHyperlinkNavigation::Advanced] maybe path variants.
-    pub fn advanced_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
+    pub fn advanced_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
         self.line_ends_in_a_path_maybe_path_variants(
             Self::MAX_MAIN_THREAD_PREFIX_WORDS,
             Self::MAX_BACKGROUND_THREAD_PREFIX_WORDS,
@@ -126,7 +121,9 @@ impl MaybePath {
     }
 
     /// [PathHyperlinkNavigation::Default] variant for the longest surrounding symbols match, if any
-    fn longest_surrounding_symbols_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
+    fn longest_surrounding_symbols_variants(
+        &self,
+    ) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
         if let Some(surrounding_range) =
             longest_surrounding_symbols_match(&self.line, &self.hovered_word_range)
         {
@@ -151,7 +148,7 @@ impl MaybePath {
         &self,
         start_prefix_words: usize,
         max_prefix_words: usize,
-    ) -> impl Iterator<Item = MaybePathVariant> + '_ {
+    ) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
         // TODO(davewa): Some way to assert we are not called on the main thread...
         word_regex()
             .find_iter(&self.line[..self.hovered_word_range.end])
@@ -165,7 +162,9 @@ impl MaybePath {
     ///
     /// # Notes
     /// Iterators are used to enable checking for timeout and stopping early.
-    pub fn exhaustive_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant> + '_ {
+    pub fn exhaustive_maybe_path_variants(
+        &self,
+    ) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
         // TODO(davewa): Some way to assert we are not called on the main thread...
         let starts = word_regex()
             .find_iter(&self.line[..self.hovered_word_range.end])
@@ -207,18 +206,28 @@ pub struct RowColumn {
 /// - Include our range within our source [MaybePath], and the length of the line and column suffix
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct MaybePathWithPosition<'a> {
-    // TODO(davewa): Un-pub
-    pub range: Range<usize>,
     pub path: Cow<'a, Path>,
     pub position: Option<RowColumn>,
+    range: Range<usize>,
 }
 
 impl<'a> MaybePathWithPosition<'a> {
-    pub fn new(range: &Range<usize>, path: Cow<'a, Path>, position: Option<RowColumn>) -> Self {
+    fn new(range: &Range<usize>, path: Cow<'a, Path>, position: Option<RowColumn>) -> Self {
         Self {
-            range: range.clone(),
             path,
             position,
+            range: range.clone(),
+        }
+    }
+
+    pub fn into_owned_with_path(self, path: Cow<'static, Path>) -> MaybePathWithPosition<'static> {
+        MaybePathWithPosition { path, ..self }
+    }
+
+    pub fn into_owned(self) -> MaybePathWithPosition<'static> {
+        MaybePathWithPosition {
+            path: Cow::Owned(self.path.into_owned()),
+            ..self
         }
     }
 
@@ -253,15 +262,16 @@ impl<'a> MaybePathWithPosition<'a> {
 ///
 // Note: The above table renders perfectly in docs, but currenlty does not render correctly in the tooltip in Zed.
 #[derive(Debug)]
-pub struct MaybePathVariant {
+pub struct MaybePathVariant<'a> {
+    line: &'a str,
     variations: Vec<Range<usize>>,
     positioned_variation: Option<(Range<usize>, RowColumn)>,
     /// `a/~/foo.rs` is a valid path on it's own. If we parsed a git diff path like `+++ a/~/foo.rs`, never absolutize it.
     absolutize_home_dir: bool,
 }
 
-impl MaybePathVariant {
-    pub fn new(line: &str, mut path: Range<usize>) -> Self {
+impl<'a> MaybePathVariant<'a> {
+    pub fn new(line: &'a str, mut path: Range<usize>) -> Self {
         // We add variations from longest to shortest
         let mut maybe_path = &line[path.clone()];
         let mut positioned_variation = None::<(Range<usize>, RowColumn)>;
@@ -324,15 +334,15 @@ impl MaybePathVariant {
         }
 
         Self {
+            line,
             variations,
             positioned_variation,
             absolutize_home_dir,
         }
     }
 
-    pub fn relative_variations<'a>(
+    pub fn relative_variations(
         &self,
-        maybe_path: &'a MaybePath,
         prefix_to_strip: Option<&Path>,
     ) -> Vec<MaybePathWithPosition<'a>> {
         let mut variations = Vec::new();
@@ -349,7 +359,7 @@ impl MaybePathVariant {
         variations
             .into_iter()
             .filter_map(|(range, position)| {
-                let maybe_path = Path::new(maybe_path.text_at(&range));
+                let maybe_path = Path::new(&self.line[range.clone()]);
                 maybe_path.is_relative().then(|| {
                     MaybePathWithPosition::new(
                         range,
@@ -365,15 +375,14 @@ impl MaybePathVariant {
             .collect()
     }
 
-    fn absolutize<'a, 'b>(
+    fn absolutize<'b>(
         &self,
-        maybe_path: &'a MaybePath,
         roots: impl Iterator<Item = &'b Path> + Clone + 'b,
         home_dir: &PathBuf,
         variation_range: &Range<usize>,
         position: Option<RowColumn>,
     ) -> Vec<MaybePathWithPosition<'a>> {
-        let variation_path = Path::new(maybe_path.text_at(&variation_range));
+        let variation_path = Path::new(&self.line[variation_range.clone()]);
         let mut absolutized = Vec::new();
         if variation_path.is_absolute() {
             absolutized.push(MaybePathWithPosition::new(
@@ -405,16 +414,14 @@ impl MaybePathVariant {
         absolutized
     }
 
-    pub fn absolutized_variations<'a, 'b>(
+    pub fn absolutized_variations<'b>(
         &self,
-        maybe_path: &'a MaybePath,
         roots: impl Iterator<Item = &'b Path> + Clone + 'b,
         home_dir: &PathBuf,
     ) -> Vec<MaybePathWithPosition<'a>> {
         let mut variations = Vec::new();
         for variation_range in &self.variations {
             variations.append(&mut self.absolutize(
-                maybe_path,
                 roots.clone(),
                 home_dir,
                 &variation_range,
@@ -424,7 +431,6 @@ impl MaybePathVariant {
 
         if let Some((variation_range, position)) = &self.positioned_variation {
             variations.append(&mut self.absolutize(
-                maybe_path,
                 roots.clone(),
                 home_dir,
                 variation_range,
@@ -856,7 +862,7 @@ mod tests {
         variants: impl Fn() -> VariantIterator,
         expected: &ExpectedMaybePathVariations<'a>,
     ) where
-        VariantIterator: Iterator<Item = MaybePathVariant> + 'a,
+        VariantIterator: Iterator<Item = MaybePathVariant<'a>> + 'a,
     {
         //assert_eq!(variants().len(), 3);
 
@@ -864,7 +870,7 @@ mod tests {
             "\nVariants: {:#?}",
             variants()
                 .map(|maybe_path_variant| maybe_path_variant
-                    .relative_variations(maybe_path, None)
+                    .relative_variations(None)
                     .into_iter()
                     .map(|variation| maybe_path.text_at(&variation.range))
                     .collect::<Vec<_>>())
@@ -874,9 +880,7 @@ mod tests {
         println!("\nTesting Relative: strip_prefix = {worktree_root:?}");
 
         let actual_relative: Vec<_> = variants()
-            .map(|maybe_path_variant| {
-                maybe_path_variant.relative_variations(&maybe_path, Some(worktree_root))
-            })
+            .map(|maybe_path_variant| maybe_path_variant.relative_variations(Some(worktree_root)))
             .flatten()
             .collect();
 
@@ -892,7 +896,7 @@ mod tests {
 
         let actual_absolutized: Vec<_> = variants()
             .map(|maybe_path_variant| {
-                maybe_path_variant.absolutized_variations(&maybe_path, roots.into_iter(), &home_dir)
+                maybe_path_variant.absolutized_variations(roots.into_iter(), &home_dir)
             })
             .flatten()
             .collect();

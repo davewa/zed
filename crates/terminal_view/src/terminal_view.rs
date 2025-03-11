@@ -918,7 +918,12 @@ fn subscribe_for_terminal_events(
                     Some(MaybeNavigationTarget::Url(_)) => true,
                     Some(MaybeNavigationTarget::PathLike(path_like_target)) => {
                         let open_target_task =
-                            possible_open_target(&workspace, path_like_target.terminal_dir.clone(), &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path), this.path_hyperlink_navigation, cx);
+                            possible_open_target(
+                                &workspace,
+                                path_like_target.terminal_dir.clone(),
+                                &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path),
+                                this.path_hyperlink_navigation, cx
+                            );
                         if let Some(open_target) = smol::block_on(open_target_task) {
                             this.update_terminal_maybe_path(path_like_target, Some(open_target), cx);
                             true
@@ -1113,24 +1118,18 @@ fn possible_open_target(
             // When we get a hit here, just return it and skip any further processing.
             let worktree_root = worktree.read(cx).abs_path();
 
-            for MaybePathWithPosition {
-                range,
-                path,
-                position,
-            } in maybe_path_variant.relative_variations(&maybe_path, Some(&worktree_root))
+            for maybe_path_with_position in
+                maybe_path_variant.relative_variations(Some(&worktree_root))
             {
                 for entry in worktree
                     .read(cx)
                     .traverse_from_path(true, true, false, "".as_ref())
                 {
-                    if entry.path.ends_with(&path) {
+                    if entry.path.ends_with(&maybe_path_with_position.path) {
                         trace!("Terminal View: MaybePath found for worktree: {worktree_root:?}, entry: {:?}", entry.path);
                         return Task::ready(Some((
-                            MaybePathWithPosition::new(
-                                &range,
-                                Cow::Owned(worktree_root.join(&entry.path)),
-                                position,
-                            ),
+                            maybe_path_with_position
+                                .into_owned_with_path(Cow::Owned(worktree_root.join(&entry.path))),
                             OpenTarget::Worktree(entry.clone()),
                         )));
                     }
@@ -1169,16 +1168,13 @@ fn possible_open_target_from_fs(
         fs: Arc<dyn Fs>,
         home_dir: &PathBuf,
         roots: &Vec<Arc<Path>>,
-        maybe_path: &'a MaybePath,
-        maybe_path_variants: impl Iterator<Item = MaybePathVariant> + 'a,
+        maybe_path_variants: impl Iterator<Item = MaybePathVariant<'a>> + 'a,
     ) -> Option<(MaybePathWithPosition<'static>, OpenTarget)> {
         for maybe_path_variant in maybe_path_variants {
             // TODO(davewa): check for timeout here (and return Error::Timeout, e.g. Result<Option<(...)>>)
-            for maybe_path_with_position in maybe_path_variant.absolutized_variations(
-                &maybe_path,
-                roots.iter().map(Deref::deref),
-                home_dir,
-            ) {
+            for maybe_path_with_position in
+                maybe_path_variant.absolutized_variations(roots.iter().map(Deref::deref), home_dir)
+            {
                 if let Some(metadata) = fs
                     .metadata(&maybe_path_with_position.path)
                     .await
@@ -1190,10 +1186,7 @@ fn possible_open_target_from_fs(
                         maybe_path_with_position.path
                     );
                     return Some((
-                        MaybePathWithPosition {
-                            path: Cow::Owned(maybe_path_with_position.path.into_owned()),
-                            ..maybe_path_with_position
-                        },
+                        maybe_path_with_position.into_owned(),
                         OpenTarget::File(metadata),
                     ));
                 } else {
@@ -1218,7 +1211,6 @@ fn possible_open_target_from_fs(
             Arc::clone(&fs),
             home_dir,
             &sorted_worktree_roots,
-            &maybe_path,
             maybe_path.default_maybe_path_variants(),
         )
         .await
@@ -1229,7 +1221,6 @@ fn possible_open_target_from_fs(
                 Arc::clone(&fs),
                 home_dir,
                 &sorted_worktree_roots,
-                &maybe_path,
                 maybe_path.advanced_maybe_path_variants(),
             )
             .await
@@ -1240,7 +1231,6 @@ fn possible_open_target_from_fs(
                     Arc::clone(&fs),
                     home_dir,
                     &sorted_worktree_roots,
-                    &maybe_path,
                     maybe_path.exhaustive_maybe_path_variants(),
                 )
                 .await

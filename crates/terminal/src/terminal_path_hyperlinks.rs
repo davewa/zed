@@ -94,7 +94,11 @@ pub struct HoveredMaybePath {
 impl Display for HoveredMaybePath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.hovered_word_range.start != 0 || self.hovered_word_range.end != self.line.len() {
-            formatter.write_fmt(format_args!("{:?} «{}»", self, self.hovered_word()))
+            formatter.write_fmt(format_args!(
+                "{:?} «{}»",
+                self,
+                &self.line[self.hovered_word_range.clone()]
+            ))
         } else {
             formatter.write_fmt(format_args!("{:?}", self))
         }
@@ -160,10 +164,6 @@ impl HoveredMaybePath {
         }
     }
 
-    pub(super) fn hovered_word(&self) -> &str {
-        &self.line[self.hovered_word_range.clone()]
-    }
-
     pub(super) fn text_at(&self, range: &Range<usize>) -> &str {
         &self.line[range.clone()]
     }
@@ -191,10 +191,10 @@ impl HoveredMaybePath {
         } else if self.looks_like_a_path_match(&self.hovered_word_range) {
             debug!(
                 "Terminal: path hueristic 'looks like a path' match: {:?}",
-                self.hovered_word()
+                &self.line[self.hovered_word_range.clone()]
             );
             Some((
-                self.hovered_word().to_string(),
+                self.line[self.hovered_word_range.clone()].to_string(),
                 self.hovered_word_match.clone(),
             ))
         } else {
