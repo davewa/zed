@@ -32,8 +32,6 @@
 // TODO(davewa) TASK LIST
 //
 // - [ ] Add Tests
-// - [ ] Re-implement the fix for https://github.com/zed-industries/zed/issues/25086
-// using path_hyperlink_regexes...
 
 #[cfg(doc)]
 use super::WORD_REGEX;

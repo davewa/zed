@@ -19,7 +19,6 @@
 // - [ ] Fix tests on Windows
 // - [ ] Test file:// Urls
 // - [ ] Test non-file:// Urls
-// - [ ] Test Match APIs (e.g., RangeInclusive<AlacPoint>)
 // - [ ] Implement background (and main thread?) timeout for searching variations
 //   - Use the executor's? timer so that test virtual time works correctly
 
