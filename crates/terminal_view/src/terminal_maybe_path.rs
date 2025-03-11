@@ -872,7 +872,7 @@ mod tests {
                 .map(|maybe_path_variant| maybe_path_variant
                     .relative_variations(None)
                     .into_iter()
-                    .map(|variation| maybe_path.text_at(&variation.range))
+                    .map(|variation| &maybe_path.line[variation.range.clone()])
                     .collect::<Vec<_>>())
                 .collect::<Vec<_>>()
         );
