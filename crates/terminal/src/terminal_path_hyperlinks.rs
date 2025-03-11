@@ -35,13 +35,16 @@
 // - [ ] Re-implement the fix for https://github.com/zed-industries/zed/issues/25086
 // using path_hyperlink_regexes...
 
+#[cfg(doc)]
+use super::WORD_REGEX;
 use crate::ZedListener;
 use alacritty_terminal::{index::Boundary, term::search::Match, Term};
 use log::debug;
-use std::{fmt::Display, ops::Range, path::Path};
+use regex::Regex;
+use std::{fmt::Display, ops::Range, path::Path, sync::LazyLock};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// These are valid in paths and are not matched by [WORD_REGEX](terminal::WORD_REGEX).
+/// These are valid in paths and are not matched by [WORD_REGEX].
 /// We use them to find potential path words within a line.
 ///
 /// - **`\u{c}`** is **`\f`** (form feed - new page)
@@ -50,11 +53,11 @@ use unicode_segmentation::UnicodeSegmentation;
 /// See [C++ Escape sequences](https://en.cppreference.com/w/cpp/language/escape)
 pub const MAIN_SEPARATORS: [char; 2] = ['\\', '/'];
 
+/// Common symbols which often surround a path, e.g., `"` `'` `[` `]` `(` `)`
 pub const COMMON_PATH_SURROUNDING_SYMBOLS: &[(char, char)] =
     &[('"', '"'), ('\'', '\''), ('[', ']'), ('(', ')')];
 
-/// Returns the longest range of matching surrounding symbols on [line] which contains [word].
-/// This is arguably the most common case by far, so we enable it in PathHyperlinkNavigation::Default.
+/// Returns the longest range of matching surrounding symbols on `line` which contains `word_range`
 pub fn longest_surrounding_symbols_match(
     line: &str,
     word_range: &Range<usize>,
@@ -85,6 +88,59 @@ pub fn longest_surrounding_symbols_match(
     longest
 }
 
+pub(super) const PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 1] = [
+    // If there is a word on the line that contains a colon that word up to (but not including)
+    // its last colon, it is treated as a maybe path.
+    // e.g., Ruby (see https://github.com/zed-industries/zed/issues/25086)
+    //
+    // Note that unlike the original fix for that issue, we don't check the characters before
+    // and after the colon for digit-ness so that in case the line and column suffix is in
+    // MSVC-style (<line>,<column>):message or some other style. Line and column suffixes are
+    // processed later in termainl_view.
+    concat!("(?<path>", crate::word_regex!(), "):"),
+];
+
+/// Returns a list of the preapproved path hyperlink regexes
+pub fn preapproved_path_hyperlink_regexes() -> &'static Vec<Regex> {
+    static PREAPPROVED_MAYBE_PATH_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+        let mut regexes = Vec::new();
+        for regex in PREAPPROVED_PATH_HYPERLINK_REGEXES {
+            regexes.push(Regex::new(regex).unwrap());
+        }
+        regexes
+    });
+    &PREAPPROVED_MAYBE_PATH_REGEXES
+}
+
+/// If `hovered_word_range` overlaps the regex match, returns the matched range
+pub fn path_regex_match(
+    line: &str,
+    hovered_word_range: &Range<usize>,
+    path_regexes: &Vec<Regex>,
+) -> Option<Range<usize>> {
+    for regex in path_regexes.iter().chain(path_regexes.iter()) {
+        let Some(captures) = regex.captures(&line) else {
+            debug!("Regex should succeed if RegexSearch succeeded already");
+            continue;
+        };
+        // Note: Do NOT use captures[CUSTOM_PATH_HYPERLINK_REGEX_CAPTURE_NAME] here because
+        // it can panic. This is extra paranoid because we don't load path regexes that do not
+        // contain a path named capture group in the first place (see [init_path_regexes]).
+        let Some(path_capture) = captures.name("path") else {
+            debug!("'path' capture not matched in regex");
+            continue;
+        };
+
+        if hovered_word_range.contains(&path_capture.start())
+            || hovered_word_range.contains(&path_capture.end())
+        {
+            return Some(path_capture.range());
+        }
+    }
+
+    None
+}
+
 /// The original matched maybe path from hover or Cmd-click in the terminal
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HoveredMaybePath {
@@ -109,17 +165,17 @@ impl Display for HoveredMaybePath {
 
 impl HoveredMaybePath {
     /// For file IRIs, the IRI is always the 'line'
-    pub(super) fn from_file_url(file_iri: &str, file_iri_match: Match) -> Self {
+    pub(super) fn from_file_url(file_iri: &str, file_iri_match: &Match) -> Self {
         Self {
             line: file_iri.to_string(),
             hovered_word_range: 0..file_iri.len(),
-            hovered_word_match: file_iri_match,
+            hovered_word_match: file_iri_match.clone(),
         }
     }
 
-    pub(super) fn from_hovered_word_match(
-        term: &mut Term<ZedListener>,
-        hovered_word_match: Match,
+    pub(super) fn from_hovered_word_match<T>(
+        term: &mut Term<T>,
+        hovered_word_match: &Match,
     ) -> Self {
         let maybe_path_word =
             term.bounds_to_string(*hovered_word_match.start(), *hovered_word_match.end());
@@ -157,12 +213,12 @@ impl HoveredMaybePath {
     fn from_line(
         line: String,
         hovered_word_range: Range<usize>,
-        hovered_word_match: Match,
+        hovered_word_match: &Match,
     ) -> Self {
         Self {
             line,
             hovered_word_range,
-            hovered_word_match,
+            hovered_word_match: hovered_word_match.clone(),
         }
     }
 
@@ -198,6 +254,17 @@ impl HoveredMaybePath {
             Some((
                 self.line[self.hovered_word_range.clone()].to_string(),
                 self.hovered_word_match.clone(),
+            ))
+        } else if let Some(path_range) =
+            path_regex_match(&self.line, &self.hovered_word_range, &Vec::new())
+        {
+            debug!(
+                "Terminal: path hueristic 'path regex' match: {:?}",
+                self.text_at(&path_range)
+            );
+            Some((
+                self.text_at(&path_range).to_string(),
+                self.match_from_text_range(term, &path_range),
             ))
         } else {
             None

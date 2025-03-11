@@ -30,27 +30,28 @@ use std::{
     iter,
     ops::Range,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, LazyLock},
 };
 use terminal::terminal_path_hyperlinks::{
-    longest_surrounding_symbols_match, HoveredMaybePath, COMMON_PATH_SURROUNDING_SYMBOLS,
-    MAIN_SEPARATORS,
+    longest_surrounding_symbols_match, path_regex_match, preapproved_path_hyperlink_regexes,
+    HoveredMaybePath, COMMON_PATH_SURROUNDING_SYMBOLS, MAIN_SEPARATORS,
 };
 #[cfg(doc)]
 use terminal::terminal_settings::PathHyperlinkNavigation;
 use util::paths::PathWithPosition;
 
-/// Returns the word_regex.
 fn word_regex() -> &'static Regex {
-    static WORD_REGEX: OnceLock<Regex> = OnceLock::new();
-    WORD_REGEX.get_or_init(|| Regex::new(terminal::WORD_REGEX).unwrap())
+    static WORD_REGEX: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(terminal::WORD_REGEX).unwrap());
+    &WORD_REGEX
 }
 
 /// The original matched maybe path from hover or Cmd-click in the terminal
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct MaybePath {
     line: String,
     hovered_word_range: Range<usize>,
+    path_hyperlink_regexes: Arc<Vec<Regex>>,
 }
 
 impl Display for MaybePath {
@@ -68,18 +69,23 @@ impl Display for MaybePath {
 }
 
 impl MaybePath {
-    pub(super) fn from_hovered_maybe_path(hovered_maybe_path: &HoveredMaybePath) -> Self {
+    pub(super) fn from_hovered_maybe_path(
+        hovered_maybe_path: &HoveredMaybePath,
+        path_regexes: Arc<Vec<Regex>>,
+    ) -> Self {
         Self {
             line: hovered_maybe_path.line.clone(),
             hovered_word_range: hovered_maybe_path.hovered_word_range.clone(),
+            path_hyperlink_regexes: path_regexes,
         }
     }
 
     #[cfg(test)]
-    fn new(line: &str, hovered_word_range: Range<usize>) -> Self {
+    fn new(line: &str, hovered_word_range: Range<usize>, path_regexes: Arc<Vec<Regex>>) -> Self {
         Self {
             line: line.to_string(),
             hovered_word_range,
+            path_hyperlink_regexes: path_regexes,
         }
     }
 
@@ -102,6 +108,13 @@ impl MaybePath {
         .chain(iter::once_with(|| self.longest_surrounding_symbols_variants()).flatten())
         .chain(
             iter::once_with(|| {
+                self.path_regex_variants(preapproved_path_hyperlink_regexes())
+                    .into_iter()
+            })
+            .flatten(),
+        )
+        .chain(
+            iter::once_with(|| {
                 self.line_ends_in_a_path_maybe_path_variants(0, Self::MAX_MAIN_THREAD_PREFIX_WORDS)
                     .collect::<Vec<_>>()
                     .into_iter()
@@ -114,10 +127,12 @@ impl MaybePath {
 
     /// All [PathHyperlinkNavigation::Advanced] maybe path variants.
     pub fn advanced_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
-        self.line_ends_in_a_path_maybe_path_variants(
-            Self::MAX_MAIN_THREAD_PREFIX_WORDS,
-            Self::MAX_BACKGROUND_THREAD_PREFIX_WORDS,
-        )
+        self.path_regex_variants(&self.path_hyperlink_regexes)
+            .into_iter()
+            .chain(self.line_ends_in_a_path_maybe_path_variants(
+                Self::MAX_MAIN_THREAD_PREFIX_WORDS,
+                Self::MAX_BACKGROUND_THREAD_PREFIX_WORDS,
+            ))
     }
 
     /// [PathHyperlinkNavigation::Default] variant for the longest surrounding symbols match, if any
@@ -139,11 +154,16 @@ impl MaybePath {
         vec![].into_iter()
     }
 
+    fn path_regex_variants(&self, path_regexes: &Vec<Regex>) -> Option<MaybePathVariant<'_>> {
+        if let Some(path) = path_regex_match(&self.line, &self.hovered_word_range, path_regexes) {
+            Some(MaybePathVariant::new(&self.line, path.clone()))
+        } else {
+            None
+        }
+    }
+
     /// [PathHyperlinkNavigation::Advanced] maybe path variants that start on the hovered word or a
     /// word before it and end at the end of the line.
-    ///
-    /// # Notes
-    /// Iterators are used to enable checking for timeout and stopping early.
     fn line_ends_in_a_path_maybe_path_variants(
         &self,
         start_prefix_words: usize,
@@ -159,9 +179,6 @@ impl MaybePath {
 
     /// All [PathHyperlinkNavigation::Exhaustive] maybe path variants that start on the hovered word or a
     /// word before it and end the hovered word or a word after it.
-    ///
-    /// # Notes
-    /// Iterators are used to enable checking for timeout and stopping early.
     pub fn exhaustive_maybe_path_variants(
         &self,
     ) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
@@ -626,6 +643,9 @@ mod tests {
                         "b/path", 4, 2;
                         "b/path:4:2";
                         "path:4:2";
+                        "b/path", 4;
+                        "b/path:4";
+                        "path:4";
                         "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
@@ -637,6 +657,12 @@ mod tests {
                         "/Some/cool/place/path:4:2";
                         "/root 2/b/path", 4, 2;
                         "/Some/cool/place/b/path", 4, 2;
+                        "/root 2/b/path:4";
+                        "/Some/cool/place/b/path:4";
+                        "/root 2/path:4";
+                        "/Some/cool/place/path:4";
+                        "/root 2/b/path", 4;
+                        "/Some/cool/place/b/path", 4;
                         "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
                         "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
@@ -795,9 +821,11 @@ mod tests {
         line: &str,
         expected: &ExpectedMap<'a>,
     ) {
+        let custom_path_regexes = Arc::new(Vec::new());
         let word_expected = expected.get(&PathHyperlinkNavigation::Default).unwrap();
         for (matched, expected) in word_regex().find_iter(&line).zip(word_expected) {
-            let maybe_path = MaybePath::new(line, matched.range());
+            let maybe_path =
+                MaybePath::new(line, matched.range(), Arc::clone(&custom_path_regexes));
             println!("\n\nTesting Default: {}", maybe_path);
 
             test_maybe_path(
@@ -812,7 +840,8 @@ mod tests {
 
         let advanced_expected = expected.get(&PathHyperlinkNavigation::Advanced).unwrap();
         for (matched, expected) in word_regex().find_iter(&line).zip(advanced_expected) {
-            let maybe_path = MaybePath::new(line, matched.range());
+            let maybe_path =
+                MaybePath::new(line, matched.range(), Arc::clone(&custom_path_regexes));
             println!("\n\nTesting Default: {}", maybe_path);
 
             test_maybe_path(

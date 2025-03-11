@@ -25,7 +25,18 @@ pub struct Toolbar {
 }
 
 #[derive(
-    Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum PathHyperlinkNavigation {
@@ -41,6 +52,7 @@ pub enum PathHyperlinkNavigation {
     /// - Paths with spaces surrounded in common symbols are supported
     /// - Paths with spaces which are preceeded by up to 2 tokens, and take up the rest of
     /// the line are supported
+    #[default]
     Default,
     /// Enables advanced path hyperlink support. All of [Default](PathHyperlinkNavigation::Default),
     /// plus:
@@ -78,6 +90,7 @@ pub struct TerminalSettings {
     pub toolbar: Toolbar,
     pub scrollbar: ScrollbarSettings,
     pub path_hyperlink_navigation: PathHyperlinkNavigation,
+    pub path_hyperlink_regexes: Vec<String>,
     pub path_hyperlink_timeout: usize,
 }
 
@@ -255,6 +268,10 @@ pub struct TerminalSettingsContent {
     /// Scrollbar-related settings
     pub scrollbar: Option<ScrollbarSettingsContent>,
     pub path_hyperlink_navigation: Option<PathHyperlinkNavigation>,
+    /// Regexes used to identify path for hyperlink navigation
+    ///
+    /// Default: []
+    pub path_hyperlink_regexes: Option<Vec<String>>,
     /// Timeout for hover and Cmd-click path hyperlink discovery in milliseconds.
     ///
     /// Default: 1000

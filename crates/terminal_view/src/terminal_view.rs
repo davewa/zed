@@ -16,6 +16,7 @@ use log::{info, trace};
 use persistence::TERMINAL_DB;
 use project::Entry;
 use project::{search::SearchQuery, terminals::TerminalKind, Fs, Metadata, Project};
+use regex::Regex;
 use schemars::JsonSchema;
 use terminal::terminal_settings::PathHyperlinkNavigation;
 use terminal::{
@@ -131,6 +132,7 @@ pub struct TerminalView {
     can_navigate_to_selected_word: bool,
     selected_word_maybe_path_target: Option<MaybePathOpenTarget>,
     path_hyperlink_navigation: terminal_settings::PathHyperlinkNavigation,
+    path_hyperlink_regexes: Arc<Vec<Regex>>,
     workspace_id: Option<WorkspaceId>,
     show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
@@ -215,6 +217,13 @@ impl TerminalView {
             can_navigate_to_selected_word: false,
             selected_word_maybe_path_target: None,
             path_hyperlink_navigation: TerminalSettings::get_global(cx).path_hyperlink_navigation,
+            path_hyperlink_regexes: Arc::new(
+                TerminalSettings::get_global(cx)
+                    .path_hyperlink_regexes
+                    .iter()
+                    .map(|regex| Regex::new(regex).unwrap())
+                    .collect::<Vec<_>>(),
+            ),
             workspace_id,
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
@@ -921,7 +930,7 @@ fn subscribe_for_terminal_events(
                             possible_open_target(
                                 &workspace,
                                 path_like_target.terminal_dir.clone(),
-                                &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path),
+                                &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path, Arc::clone(&this.path_hyperlink_regexes)),
                                 this.path_hyperlink_navigation, cx
                             );
                         if let Some(open_target) = smol::block_on(open_target_task) {
@@ -958,7 +967,7 @@ fn subscribe_for_terminal_events(
                                     possible_open_target(
                                         &task_workspace,
                                         path_like_target.terminal_dir.clone(),
-                                        &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path),
+                                        &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path, Arc::clone(&this.path_hyperlink_regexes)),
                                         this.path_hyperlink_navigation,
                                         cx,
                                     )

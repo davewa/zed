@@ -322,7 +322,14 @@ const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
 /// Paths can contain almost any unicode characters. Here we use whitespace to separate paths
 /// into "words" so that the common case of paths without spaces can be processed more efficiently.
-pub const WORD_REGEX: &str = r#"[^\s]+"#;
+/// See [WORD_REGEX]
+#[macro_export]
+macro_rules! word_regex {
+    () => {
+        r#"[^\s]+"#
+    };
+}
+pub const WORD_REGEX: &str = word_regex!();
 
 pub struct TerminalBuilder {
     terminal: Terminal,
@@ -947,10 +954,8 @@ impl Terminal {
                             // Treat "file://" URLs like file paths to ensure that
                             // line numbers at the end of the path are handled correctly
                             if let Some(file_url_as_path) = url.strip_prefix("file://") {
-                                let maybe_path = HoveredMaybePath::from_file_url(
-                                    file_url_as_path,
-                                    url_match.clone(),
-                                );
+                                let maybe_path =
+                                    HoveredMaybePath::from_file_url(file_url_as_path, &url_match);
                                 debug!("Terminal: {maybe_path}",);
                                 Some((Some((url, url_match)), Some(maybe_path)))
                             } else {
@@ -959,7 +964,7 @@ impl Terminal {
                         } else {
                             regex_match_at(term, point, &mut self.word_regex).map(|word_match| {
                                 let maybe_path =
-                                    HoveredMaybePath::from_hovered_word_match(term, word_match);
+                                    HoveredMaybePath::from_hovered_word_match(term, &word_match);
                                 debug!("Terminal: {maybe_path}",);
                                 (maybe_path.best_hueristic_path(term), Some(maybe_path))
                             })
@@ -2374,12 +2379,17 @@ mod tests {
             "a Main.cs:20:5 b",
             vec!["a", "Main.cs:20:5", "b"],
         );
-        // Some tools output "filename:line:col:message", which currently isn't
-        // handled correctly, but might be in the future
+        // Some tools output "filename:line:col:message"
         re_test(
-            crate::WORD_REGEX,
+            crate::terminal_path_hyperlinks::PREAPPROVED_PATH_HYPERLINK_REGEXES[0],
             "Main.cs:20:5:Error desc",
-            vec!["Main.cs:20:5:Error", "desc"],
+            vec!["Main.cs:20:5:"],
+        );
+        // Some tools output "filename(line,col):message"
+        re_test(
+            crate::terminal_path_hyperlinks::PREAPPROVED_PATH_HYPERLINK_REGEXES[0],
+            "Main.cs(20,5):Error desc",
+            vec!["Main.cs(20,5):"],
         );
     }
 }
