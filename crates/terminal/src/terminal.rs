@@ -1166,15 +1166,17 @@ impl Terminal {
         }) = &mut self.last_content.last_hovered_word
         {
             if *id == path_like_target.id {
-                if let Some(confirmed_path_range) = confirmed_hyperlink_range {
+                if let Some(confirmed_hyperlink_range) = confirmed_hyperlink_range {
                     if path_like_target.maybe_path != *maybe_path {
                         error!("Expected: confirmed maybe_path to equal the last_hovered_word's maybe_path");
                         return;
                     }
                     trace!("Terminal: Confirmed path hyperlink: Updating");
-                    *word = maybe_path.text_at(&confirmed_path_range).to_string();
-                    *word_match = maybe_path
-                        .match_from_text_range(&mut self.term.lock_unfair(), &confirmed_path_range);
+                    *word = maybe_path.text_at(&confirmed_hyperlink_range).to_string();
+                    *word_match = maybe_path.match_from_text_range(
+                        &mut self.term.lock_unfair(),
+                        &confirmed_hyperlink_range,
+                    );
                 } else {
                     trace!("Terminal: Confirmed path hyperlink: Clearing");
                     *word = "".to_string();
@@ -1186,13 +1188,17 @@ impl Terminal {
 
                 cx.notify()
             }
-        } else if let Some(path_range) = confirmed_hyperlink_range {
+        } else if let Some(confirmed_hyperlink_range) = confirmed_hyperlink_range {
             trace!("Terminal: Confirmed path hyperlink: Setting");
             self.last_content.last_hovered_word = Some(HoveredWord {
-                word: path_like_target.maybe_path.text_at(&path_range).to_string(),
-                word_match: path_like_target
+                word: path_like_target
                     .maybe_path
-                    .match_from_text_range(&mut self.term.lock_unfair(), &path_range),
+                    .text_at(&confirmed_hyperlink_range)
+                    .to_string(),
+                word_match: path_like_target.maybe_path.match_from_text_range(
+                    &mut self.term.lock_unfair(),
+                    &confirmed_hyperlink_range,
+                ),
                 id: path_like_target.id,
                 maybe_path: Some(path_like_target.maybe_path.clone()),
             });
