@@ -32,6 +32,8 @@
 // TODO(davewa) TASK LIST
 //
 // - [ ] Add Tests
+// - [ ] Re-implement the fix for https://github.com/zed-industries/zed/issues/25086
+// using path_hyperlink_regexes...
 
 use crate::ZedListener;
 use alacritty_terminal::{index::Boundary, term::search::Match, Term};
