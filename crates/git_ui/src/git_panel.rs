@@ -367,6 +367,7 @@ pub(crate) fn commit_message_editor(
     commit_editor.set_show_gutter(false, cx);
     commit_editor.set_show_wrap_guides(false, cx);
     commit_editor.set_show_indent_guides(false, cx);
+    commit_editor.set_hard_wrap(Some(72), cx);
     let placeholder = placeholder.unwrap_or("Enter commit message");
     commit_editor.set_placeholder_text(placeholder, cx);
     commit_editor
@@ -702,7 +703,10 @@ impl GitPanel {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("GitPanel");
 
-        if self.is_focused(window, cx) {
+        if window
+            .focused(cx)
+            .map_or(false, |focused| self.focus_handle == focused)
+        {
             dispatch_context.add("menu");
             dispatch_context.add("ChangesList");
         }
@@ -712,12 +716,6 @@ impl GitPanel {
         }
 
         dispatch_context
-    }
-
-    fn is_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
-        window
-            .focused(cx)
-            .map_or(false, |focused| self.focus_handle == focused)
     }
 
     fn close_panel(&mut self, _: &Close, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1504,15 +1502,17 @@ impl GitPanel {
         telemetry::event!("Git Uncommitted");
 
         let confirmation = self.check_for_pushed_commits(window, cx);
-        let prior_head = self.load_commit_details("HEAD", cx);
+        let prior_head = self.load_commit_details("HEAD".to_string(), cx);
 
         let task = cx.spawn_in(window, |this, mut cx| async move {
             let result = maybe!(async {
                 if let Ok(true) = confirmation.await {
                     let prior_head = prior_head.await?;
 
-                    repo.update(&mut cx, |repo, cx| repo.reset("HEAD^", ResetMode::Soft, cx))?
-                        .await??;
+                    repo.update(&mut cx, |repo, cx| {
+                        repo.reset("HEAD^".to_string(), ResetMode::Soft, cx)
+                    })?
+                    .await??;
 
                     Ok(Some(prior_head))
                 } else {
@@ -3404,7 +3404,7 @@ impl GitPanel {
 
     fn load_commit_details(
         &self,
-        sha: &str,
+        sha: String,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<CommitDetails>> {
         let Some(repo) = self.active_repository.clone() else {
@@ -3811,8 +3811,12 @@ impl Render for GitPanel {
 }
 
 impl Focusable for GitPanel {
-    fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
+        if self.entries.is_empty() {
+            self.commit_editor.focus_handle(cx)
+        } else {
+            self.focus_handle.clone()
+        }
     }
 }
 
@@ -3910,7 +3914,7 @@ impl GitPanelMessageTooltip {
             cx.spawn_in(window, |this, mut cx| async move {
                 let details = git_panel
                     .update(&mut cx, |git_panel, cx| {
-                        git_panel.load_commit_details(&sha, cx)
+                        git_panel.load_commit_details(sha.to_string(), cx)
                     })?
                     .await?;
 

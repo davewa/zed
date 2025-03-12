@@ -1124,8 +1124,6 @@ fn possible_open_target(
         })
         .collect::<Vec<_>>();
 
-    // TODO(davewa): Any reason not to use `worktree.read(cx).entry_for_path(path)` here?
-
     // Outer loops should be maybe path variants and variations so that we stop as soon as
     // a match is found. Variants and variations are ordered by most common to least common.
     for maybe_path_variant in maybe_path.default_maybe_path_variants() {
@@ -1137,6 +1135,16 @@ fn possible_open_target(
             for maybe_path_with_position in
                 maybe_path_variant.relative_variations(Some(&worktree_root))
             {
+                if worktree_root.ends_with(&maybe_path_with_position.path) {
+                    if let Some(root_entry) = worktree.read(cx).root_entry() {
+                        return Task::ready(Some(OpenTarget::Worktree(
+                            maybe_path_with_position
+                                .into_owned_with_path(Cow::Owned(worktree_root.to_path_buf())),
+                            root_entry.clone(),
+                        )));
+                    }
+                }
+
                 for entry in worktree
                     .read(cx)
                     .traverse_from_path(true, true, false, "".as_ref())
