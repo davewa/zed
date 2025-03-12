@@ -188,6 +188,9 @@ impl MaybePath {
             .map(move |start| {
                 word_regex()
                     .find_iter(&self.line[self.hovered_word_range.start..])
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
                     .map(|match_| match_.end())
                     .map(move |end| {
                         MaybePathVariant::new(
