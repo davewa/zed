@@ -7,13 +7,11 @@
 // away, it is still highlighting whatever new text is where the original link was.
 // - [ ] When holding Cmd, and the terminal contents are not scrolling, but a command is running that is adding
 // output off screen, the hovered link move down one line for each new line of content added off screen
-// - [x] When hovering, initially a link flashes, then goes away
 // - [ ] Tooltips don't render markdown tables correctly
 //
 
 // TODO(davewa) TASK LIST
 //
-// - [ ] Significantly simplify Terminal::maybe_update_last_hovered_word()
 // - [ ] Add Exhaustive expected to unit test
 // - [ ] Add a ton more targeted unit test cases
 // - [ ] Fix tests on Windows

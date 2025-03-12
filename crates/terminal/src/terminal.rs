@@ -32,7 +32,7 @@ use futures::{
     FutureExt,
 };
 
-use log::{debug, error, info, trace};
+use log::{debug, info, trace};
 use mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
@@ -48,7 +48,7 @@ use task::{HideStrategy, Shell, TaskId};
 use terminal_path_hyperlinks::HoveredMaybePath;
 use terminal_settings::{AlternateScroll, CursorShape, PathHyperlinkNavigation, TerminalSettings};
 use theme::{ActiveTheme, Theme};
-use util::{paths::home_dir, truncate_and_trailoff};
+use util::{debug_panic, paths::home_dir, truncate_and_trailoff};
 
 use std::{
     cmp::{self, min},
@@ -586,14 +586,14 @@ pub struct TerminalContent {
     pub cursor_char: char,
     pub terminal_bounds: TerminalBounds,
     pub last_hovered_word: Option<HoveredWord>,
+    last_hovered_maybe_path: Option<HoveredMaybePath>,
+    last_hovered_id: usize,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HoveredWord {
     pub word: String,
     pub word_match: RangeInclusive<AlacPoint>,
-    pub(self) id: usize,
-    pub(self) maybe_path: Option<HoveredMaybePath>,
 }
 
 impl Default for TerminalContent {
@@ -611,6 +611,8 @@ impl Default for TerminalContent {
             cursor_char: Default::default(),
             terminal_bounds: Default::default(),
             last_hovered_word: None,
+            last_hovered_maybe_path: None,
+            last_hovered_id: usize::MAX,
         }
     }
 }
@@ -899,17 +901,12 @@ impl Terminal {
                 term.vi_motion(*motion);
             }
             InternalEvent::FindHyperlink(position, open) => {
-                let prev_hovered_word = self.last_content.last_hovered_word.take();
-
                 let point = grid_point(
                     *position,
                     self.last_content.terminal_bounds,
                     term.grid().display_offset(),
                 )
                 .grid_clamp(term, Boundary::Grid);
-
-                // TODO(davewa): if point is within `prev_hovered_word`, we don't need
-                // to check anything terminal's content has also not changed...
 
                 let link = term.grid().index(point).hyperlink();
                 let found_url = if link.is_some() {
@@ -973,32 +970,67 @@ impl Terminal {
                         None
                     };
 
-                let Some((hovered_word_match, maybe_path)) = found_url_or_maybe_path else {
+                let point_within_last_hovered =
+                    if let Some(last_hovered_word) = &self.last_content.last_hovered_word {
+                        last_hovered_word.word_match.contains(&point)
+                    } else {
+                        false
+                    };
+
+                let Some((word_match, hovered_maybe_path)) = found_url_or_maybe_path else {
+                    if point_within_last_hovered {
+                        // Just leave things as they are...
+                        return;
+                    }
+
                     self.last_content.last_hovered_word = None;
+                    self.last_content.last_hovered_maybe_path = None;
+                    self.last_content.last_hovered_id = self.next_link_id();
                     cx.notify();
                     cx.emit(Event::NewNavigationTarget(None));
                     return;
                 };
 
-                let (id, new_navigation_target) = self.maybe_update_last_hovered_word(
-                    prev_hovered_word,
-                    &hovered_word_match,
-                    &maybe_path,
+                let hovered_word =
+                    word_match.map(|(word, word_match)| HoveredWord { word, word_match });
+
+                if hovered_word.is_none() && hovered_maybe_path.is_none() {
+                    debug_panic!("Terminal: Expected hovered maybe path or hovered word");
+                    return;
+                }
+
+                let (hovered_maybe_path_id, new_navigation_target) = self.update_last_hovered(
+                    &hovered_word,
+                    &hovered_maybe_path,
+                    point_within_last_hovered,
                     cx,
                 );
 
-                let target = if let Some(maybe_path) = maybe_path {
+                let target = if let Some(hovered_maybe_path) = hovered_maybe_path {
+                    if new_navigation_target {
+                        info!("Terminal: New path like navigation target, {hovered_maybe_path}",);
+                    }
+
+                    let Some(hovered_maybe_path_id) = hovered_maybe_path_id else {
+                        debug_panic!(
+                            "Terminal: Expected hovered maybe path id for {hovered_maybe_path}"
+                        );
+                        return;
+                    };
+
                     Some(MaybeNavigationTarget::PathLike(PathLikeTarget {
-                        maybe_path,
+                        maybe_path: hovered_maybe_path,
                         terminal_dir: self.working_directory(),
-                        id,
+                        id: hovered_maybe_path_id,
                     }))
-                } else if let Some((hovered_word, _)) = hovered_word_match {
-                    Some(MaybeNavigationTarget::Url(hovered_word))
+                } else if let Some(HoveredWord { word, .. }) = hovered_word {
+                    if new_navigation_target {
+                        info!("Terminal: New url navigation target, url = {word}");
+                    }
+                    Some(MaybeNavigationTarget::Url(word))
                 } else {
-                    // Should never happen, log an error, but don't panic.
-                    error!("Termainal: Expected either hovered_word_match or maybe_path");
-                    None
+                    debug_panic!("Terminal: Expected hovered maybe path or hovered word");
+                    return;
                 };
 
                 if let Some(target) = target {
@@ -1006,15 +1038,6 @@ impl Terminal {
                         debug!("Terminal: Opening target: {target:?}",);
                         cx.emit(Event::Open(target));
                     } else if new_navigation_target {
-                        match &target {
-                            MaybeNavigationTarget::PathLike(path_like_target) => {
-                                info!(
-                                    "Terminal: New path like navigation target, maybe_path = {}",
-                                    path_like_target.maybe_path
-                                );
-                            }
-                            _ => {}
-                        }
                         cx.emit(Event::NewNavigationTarget(Some(target)));
                     }
                 }
@@ -1022,137 +1045,41 @@ impl Terminal {
         }
     }
 
-    fn maybe_update_last_hovered_word(
+    fn update_last_hovered(
         &mut self,
-        prev_word: Option<HoveredWord>,
-        hovered_word_match: &Option<(String, Match)>,
-        maybe_path: &Option<HoveredMaybePath>,
+        hovered_word: &Option<HoveredWord>,
+        hovered_maybe_path: &Option<HoveredMaybePath>,
+        point_within_last_hovered: bool,
         cx: &mut Context<Self>,
-    ) -> (usize, bool) {
-        if let Some(prev_word) = prev_word {
-            if let Some(maybe_path) = maybe_path {
-                if let Some(prev_maybe_path) = &prev_word.maybe_path {
-                    if maybe_path == prev_maybe_path {
-                        trace!("Terminal: Update prev last hovered word: Restoring");
-                        let id = prev_word.id;
-                        self.last_content.last_hovered_word = Some(prev_word);
-                        // If we have the same maybe path as before, there's nothing to do, even if
-                        // the hovered_word_match is not the same, we don't care.
-                        return (id, false);
-                    }
-                }
-
-                // Otherwise we have a new maybe_path which doesn't match an existing prev_maybe_path.
-                // In this case, It doesn't matter what the hovered_word_match is or was, we just start processing
-                // the new maybe_path (which may or may not come with a hovered_word). If it did not
-                // come with a hovered_word_match, we don't set a last_hovered_word because it is likely to end up
-                // not being a path. See also Self::set_path_hyperlink().
-                if let Some((word, word_match)) = hovered_word_match {
-                    trace!("Terminal: Update prev last hovered word: Maybe path, with word");
-
-                    // The maybe_path came with a hovered_word_match that we've hueristically decided that is likely
-                    // to be a path. See also HoveredMaybePath::best_hueristic_path(), so set a new
-                    // last_hovered_word now. This is also always true for a 'file://' url which we
-                    // treat as path.
-                    let id = self.next_link_id();
-                    self.last_content.last_hovered_word = Some(HoveredWord {
-                        word: word.clone(),
-                        word_match: word_match.clone(),
-                        id,
-                        maybe_path: Some(maybe_path.clone()),
-                    });
-
+    ) -> (Option<usize>, bool) {
+        if hovered_maybe_path.is_some() {
+            if &self.last_content.last_hovered_maybe_path != hovered_maybe_path {
+                if &self.last_content.last_hovered_word != hovered_word
+                    && !point_within_last_hovered
+                {
+                    self.last_content.last_hovered_word = hovered_word.clone();
                     cx.notify();
-                    return (id, true);
-                } else {
-                    trace!("Terminal: Update prev last hovered word: Maybe path, no word");
-                    // We don't yet know if this will become a real path, but it is still considered
-                    // a new navigation target event, so optimistically bump the  link_id, which indicates
-                    // to callers that a new navigation target event should be sent.
-                    let id = self.next_link_id();
-                    self.last_content.last_hovered_word = Some(HoveredWord {
-                        word: "".to_string(),
-                        word_match: Match::new(
-                            AlacPoint::new(0.into(), 0.into()),
-                            AlacPoint::new(0.into(), 0.into()),
-                        ),
-                        id,
-                        maybe_path: Some(maybe_path.clone()),
-                    });
-
-                    cx.notify();
-                    return (id, true);
                 }
-            } else if let Some((word, word_match)) = hovered_word_match {
-                // We don't have a new maybe_path, only set a new last_hover_word
-                // if we have a new word that is different from the prev_word.
-                if prev_word.word == *word && prev_word.word_match == *word_match {
-                    trace!("Terminal: Update prev last hovered word: No maybe path, with word");
-
-                    // Note: we don't cx.notify() here because we are just restoring
-                    // the previous value, except for maybe_path, which is private
-                    self.last_content.last_hovered_word = Some(HoveredWord {
-                        maybe_path: None,
-                        ..prev_word
-                    });
-                    return (prev_word.id, false);
-                }
-
-                trace!("Terminal: Update prev last hovered word: No maybe path, no word");
-
-                // The new word is different, new last_hovered_word
-                let id = self.next_link_id();
-                self.last_content.last_hovered_word = Some(HoveredWord {
-                    word: word.clone(),
-                    word_match: word_match.clone(),
-                    id,
-                    maybe_path: None,
-                });
-
+                self.last_content.last_hovered_maybe_path = hovered_maybe_path.clone();
+                self.last_content.last_hovered_id = self.next_link_id();
+                (Some(self.last_content.last_hovered_id), true)
+            } else {
+                (Some(self.last_content.last_hovered_id), false)
+            }
+        } else if hovered_word.is_some() {
+            self.last_content.last_hovered_maybe_path = None;
+            if &self.last_content.last_hovered_word != hovered_word {
+                self.last_content.last_hovered_word = hovered_word.clone();
                 cx.notify();
-                return (id, true);
+
+                self.last_content.last_hovered_id = self.next_link_id();
+                (None, true)
             } else {
-                // Should never happen, log an error, but don't panic.
-                error!("Termainal: Expected either hovered_word_match or maybe_path");
-                return (0, false);
+                (None, false)
             }
-        } else if let Some((word, word_match)) = hovered_word_match {
-            if maybe_path.is_some() {
-                trace!("Terminal: Update last hovered word: Maybe path, with word");
-            } else {
-                trace!("Terminal: Update last hovered word: No maybe path, With word");
-            }
-
-            let id = self.next_link_id();
-            self.last_content.last_hovered_word = Some(HoveredWord {
-                word: word.clone(),
-                word_match: word_match.clone(),
-                id,
-                maybe_path: maybe_path.clone(),
-            });
-
-            cx.notify();
-            return (id, true);
-        } else if maybe_path.is_some() {
-            trace!("Terminal: Update last hovered word: Maybe path, no word");
-
-            let id = self.next_link_id();
-            self.last_content.last_hovered_word = Some(HoveredWord {
-                word: "".to_string(),
-                word_match: Match::new(
-                    AlacPoint::new(0.into(), 0.into()),
-                    AlacPoint::new(0.into(), 0.into()),
-                ),
-                id,
-                maybe_path: maybe_path.clone(),
-            });
-
-            cx.notify();
-            return (id, true);
         } else {
-            // Should never happen, log an error, but don't panic.
-            error!("Termainal: Expected either hovered_word_match or maybe_path");
-            return (0, false);
+            debug_panic!("Terminal: Expected hovered maybe path or hovered word");
+            (None, false)
         }
     }
 
@@ -1162,39 +1089,29 @@ impl Terminal {
         confirmed_hyperlink_range: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(HoveredWord {
-            word,
-            word_match,
-            id,
-            maybe_path: Some(maybe_path),
-        }) = &mut self.last_content.last_hovered_word
-        {
-            if *id == path_like_target.id {
-                if let Some(confirmed_hyperlink_range) = confirmed_hyperlink_range {
-                    if path_like_target.maybe_path != *maybe_path {
-                        error!("Expected: confirmed maybe_path to equal the last_hovered_word's maybe_path");
-                        return;
-                    }
-                    trace!("Terminal: Confirmed path hyperlink: Updating");
-                    *word = maybe_path.text_at(&confirmed_hyperlink_range).to_string();
-                    *word_match = maybe_path.match_from_text_range(
-                        &mut self.term.lock_unfair(),
-                        &confirmed_hyperlink_range,
-                    );
-                } else {
-                    trace!("Terminal: Confirmed path hyperlink: Clearing");
-                    *word = "".to_string();
-                    *word_match = Match::new(
-                        AlacPoint::new(0.into(), 0.into()),
-                        AlacPoint::new(0.into(), 0.into()),
-                    )
-                }
+        if self.last_content.last_hovered_id != path_like_target.id {
+            trace!("Terminal: Confirmed path hyperlink: Ignoring");
+            // We've moved on, this can be safely ignored
+            return;
+        }
 
-                cx.notify()
+        let Some(last_hovered_maybe_path) = self.last_content.last_hovered_maybe_path.as_mut()
+        else {
+            debug_panic!(
+                "Expected: confirmed maybe_path to equal the last_hovered_word's maybe_path"
+            );
+            return;
+        };
+
+        if let Some(confirmed_hyperlink_range) = confirmed_hyperlink_range {
+            if path_like_target.maybe_path != *last_hovered_maybe_path {
+                debug_panic!(
+                    "Expected: confirmed maybe_path to equal the last_hovered_word's maybe_path"
+                );
+                return;
             }
-        } else if let Some(confirmed_hyperlink_range) = confirmed_hyperlink_range {
-            trace!("Terminal: Confirmed path hyperlink: Setting");
-            self.last_content.last_hovered_word = Some(HoveredWord {
+            trace!("Terminal: Confirmed path hyperlink: Updating");
+            let confirmed_hovered_word = Some(HoveredWord {
                 word: path_like_target
                     .maybe_path
                     .text_at(&confirmed_hyperlink_range)
@@ -1203,10 +1120,15 @@ impl Terminal {
                     &mut self.term.lock_unfair(),
                     &confirmed_hyperlink_range,
                 ),
-                id: path_like_target.id,
-                maybe_path: Some(path_like_target.maybe_path.clone()),
             });
 
+            if self.last_content.last_hovered_word != confirmed_hovered_word {
+                self.last_content.last_hovered_word = confirmed_hovered_word;
+                cx.notify()
+            }
+        } else {
+            trace!("Terminal: Confirmed path hyperlink: Clearing");
+            self.last_content.last_hovered_word = None;
             cx.notify()
         }
     }
@@ -1536,6 +1458,8 @@ impl Terminal {
             cursor_char: term.grid()[content.cursor.point].c,
             terminal_bounds: last_content.terminal_bounds,
             last_hovered_word: last_content.last_hovered_word.clone(),
+            last_hovered_maybe_path: last_content.last_hovered_maybe_path.clone(),
+            last_hovered_id: last_content.last_hovered_id,
         }
     }
 
