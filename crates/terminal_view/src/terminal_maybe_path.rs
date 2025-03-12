@@ -14,7 +14,6 @@
 //
 // - [ ] Add Exhaustive expected to unit test
 // - [ ] Add a ton more targeted unit test cases
-// - [ ] Fix tests on Windows
 // - [ ] Test file:// Urls
 // - [ ] Test non-file:// Urls
 // - [ ] Implement background (and main thread?) timeout for searching variations
