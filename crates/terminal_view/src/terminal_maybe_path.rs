@@ -957,11 +957,15 @@ mod tests {
             println!("\nActual:");
             actual
                 .iter()
-                .for_each(|MaybePathWithPosition { path, .. }| println!("    {path:?};"));
+                .for_each(|MaybePathWithPosition { path, .. }| {
+                    println!("    {};", path.to_string_lossy())
+                });
             println!("\nExpected:");
             expected
                 .iter()
-                .for_each(|MaybePathWithPosition { path, .. }| println!("    {path:?};"));
+                .for_each(|MaybePathWithPosition { path, .. }| {
+                    println!("    {};", path.to_string_lossy())
+                });
             assert!(false);
         }
     }
