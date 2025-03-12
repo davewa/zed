@@ -110,8 +110,7 @@ pub struct BlockContext<'a, 'b> {
 
 #[derive(Clone, Debug)]
 struct MaybePathOpenTarget {
-    pub target: PathLikeTarget,
-    pub maybe_path_with_position: MaybePathWithPosition<'static>,
+    pub path_like_target: PathLikeTarget,
     pub open_target: OpenTarget,
 }
 
@@ -129,7 +128,7 @@ pub struct TerminalView {
     blinking_terminal_enabled: bool,
     blinking_paused: bool,
     blink_epoch: usize,
-    can_navigate_to_selected_word: bool,
+    hover_target_tooltip: Option<String>,
     selected_word_maybe_path_target: Option<MaybePathOpenTarget>,
     path_hyperlink_navigation: terminal_settings::PathHyperlinkNavigation,
     path_hyperlink_regexes: Arc<Vec<Regex>>,
@@ -214,7 +213,7 @@ impl TerminalView {
             blinking_terminal_enabled: false,
             blinking_paused: false,
             blink_epoch: 0,
-            can_navigate_to_selected_word: false,
+            hover_target_tooltip: None,
             selected_word_maybe_path_target: None,
             path_hyperlink_navigation: TerminalSettings::get_global(cx).path_hyperlink_navigation,
             path_hyperlink_regexes: Arc::new(
@@ -860,29 +859,22 @@ impl TerminalView {
 
     fn update_terminal_maybe_path(
         &mut self,
-        target: &PathLikeTarget,
-        path_to_open: Option<(MaybePathWithPosition<'static>, OpenTarget)>,
+        path_like_target: &PathLikeTarget,
+        open_target: Option<&OpenTarget>,
         cx: &mut Context<Self>,
     ) {
         self.terminal.update(cx, |term, cx| {
             term.confirm_maybe_path(
-                target,
-                path_to_open.as_ref().map(|(maybe_path_with_position, _)| {
-                    maybe_path_with_position.hyperlink_range()
-                }),
+                path_like_target,
+                open_target.map(|open_target| open_target.path().hyperlink_range()),
                 cx,
             )
         });
 
-        if let Some((maybe_path_with_position, open_target)) = path_to_open {
-            self.selected_word_maybe_path_target = Some(MaybePathOpenTarget {
-                target: target.clone(),
-                maybe_path_with_position,
-                open_target,
-            });
-        } else {
-            self.selected_word_maybe_path_target = None;
-        }
+        self.selected_word_maybe_path_target = open_target.map(|open_target| MaybePathOpenTarget {
+            path_like_target: path_like_target.clone(),
+            open_target: open_target.clone(),
+        });
     }
 }
 
@@ -923,26 +915,24 @@ fn subscribe_for_terminal_events(
             }
 
             Event::NewNavigationTarget(maybe_navigation_target) => {
-                this.can_navigate_to_selected_word = match maybe_navigation_target {
-                    Some(MaybeNavigationTarget::Url(_)) => true,
-                    Some(MaybeNavigationTarget::PathLike(path_like_target)) => {
-                        let open_target_task =
-                            possible_open_target(
-                                &workspace,
-                                path_like_target.terminal_dir.clone(),
-                                &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path, Arc::clone(&this.path_hyperlink_regexes)),
-                                this.path_hyperlink_navigation, cx
-                            );
-                        if let Some(open_target) = smol::block_on(open_target_task) {
-                            this.update_terminal_maybe_path(path_like_target, Some(open_target), cx);
-                            true
-                        } else {
-                            this.update_terminal_maybe_path(path_like_target, None, cx);
-                            false
-                        }
-                    }
-                    None => false,
-                };
+                this.hover_target_tooltip =
+                    maybe_navigation_target
+                        .as_ref()
+                        .and_then(|navigation_target| match navigation_target {
+                            MaybeNavigationTarget::Url(url) => Some(url.clone()),
+                            MaybeNavigationTarget::PathLike(path_like_target) => {
+                                let open_target_task =
+                                    possible_open_target(
+                                        &workspace,
+                                        path_like_target.terminal_dir.clone(),
+                                        &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path, Arc::clone(&this.path_hyperlink_regexes)),
+                                        this.path_hyperlink_navigation, cx
+                                    );
+                                let open_target = smol::block_on(open_target_task);
+                                this.update_terminal_maybe_path(path_like_target, open_target.as_ref(), cx);
+                                open_target.map(|open_target| open_target.tooltip())
+                            }
+                        });
                 cx.notify()
             }
 
@@ -955,12 +945,12 @@ fn subscribe_for_terminal_events(
                     let selected_word_open_target =
                         this.selected_word_maybe_path_target.clone();
                     cx.spawn_in(window, |terminal_view, mut cx| async move {
-                        let Some(((path_to_open, open_target), newly_confirmed_maybe_path)) = (match selected_word_open_target {
-                            Some(MaybePathOpenTarget{ target, maybe_path_with_position, open_target })
-                                if target.id == path_like_target.id =>
+                        let Some((open_target, newly_confirmed_maybe_path)) = (match selected_word_open_target {
+                            Some(MaybePathOpenTarget{ path_like_target: prev_path_like_target, open_target: prev_open_target })
+                                if prev_path_like_target.id == path_like_target.id =>
                             {
                                 trace!("Terminal View: Event::Open: Reusing hovered valid files to open");
-                                Some(((maybe_path_with_position, open_target), false))
+                                Some((prev_open_target, false))
                             }
                             _ => {
                                 terminal_view.update(&mut cx, |this, cx| {
@@ -977,12 +967,13 @@ fn subscribe_for_terminal_events(
                         }) else {
                             terminal_view.update(&mut cx, |this, cx| {
                                 this.update_terminal_maybe_path(&path_like_target, None, cx);
-                                this.can_navigate_to_selected_word = false;
+                                this.hover_target_tooltip = None;
                             })?;
 
                             return anyhow::Ok(());
                         };
 
+                        let path_to_open = open_target.path();
                         let opened_items = task_workspace
                             .update_in(&mut cx, |workspace, window, cx| {
                                 workspace.open_paths(
@@ -1040,8 +1031,8 @@ fn subscribe_for_terminal_events(
 
                         if newly_confirmed_maybe_path {
                             terminal_view.update(&mut cx, |this, cx| {
-                                this.update_terminal_maybe_path(&path_like_target, Some((path_to_open, open_target)), cx);
-                                this.can_navigate_to_selected_word = true;
+                                this.update_terminal_maybe_path(&path_like_target, Some(&open_target), cx);
+                                this.hover_target_tooltip = Some(open_target.tooltip());
                             })?;
                         }
 
@@ -1063,23 +1054,35 @@ fn subscribe_for_terminal_events(
 
 #[derive(Debug, Clone)]
 enum OpenTarget {
-    Worktree(Entry),
-    File(Metadata),
+    Worktree(MaybePathWithPosition<'static>, Entry),
+    File(MaybePathWithPosition<'static>, Metadata),
 }
 
 impl OpenTarget {
     fn is_file(&self) -> bool {
         match self {
-            OpenTarget::Worktree(entry) => entry.is_file(),
-            OpenTarget::File(metadata) => !metadata.is_dir,
+            OpenTarget::Worktree(_, entry) => entry.is_file(),
+            OpenTarget::File(_, metadata) => !metadata.is_dir,
         }
     }
 
     fn is_dir(&self) -> bool {
         match self {
-            OpenTarget::Worktree(entry) => entry.is_dir(),
-            OpenTarget::File(metadata) => metadata.is_dir,
+            OpenTarget::Worktree(_, entry) => entry.is_dir(),
+            OpenTarget::File(_, metadata) => metadata.is_dir,
         }
+    }
+
+    fn path(&self) -> &MaybePathWithPosition<'static> {
+        match self {
+            OpenTarget::Worktree(path, _) => path,
+            OpenTarget::File(path, _) => path,
+        }
+    }
+
+    fn tooltip(&self) -> String {
+        self.path()
+            .to_string(|path| path.to_string_lossy().to_string())
     }
 }
 
@@ -1089,7 +1092,7 @@ fn possible_open_target(
     maybe_path: &MaybePath,
     path_hyperlink_navigation: PathHyperlinkNavigation,
     cx: &mut Context<TerminalView>,
-) -> Task<Option<(MaybePathWithPosition<'static>, OpenTarget)>> {
+) -> Task<Option<OpenTarget>> {
     let Some(workspace) = workspace.upgrade() else {
         return Task::ready(None);
     };
@@ -1102,7 +1105,7 @@ fn possible_open_target(
     // 3. The owner of the input provides events for items being added or removed.
     // Those make it seem ideal for sorting once on load, then subscribing to events to
     // maintain the sorted result. This would complete remove sorting from this code path.
-    let sorted_worktrees: Vec<_> = workspace
+    let worktree_candidates = workspace
         .read(cx)
         .worktrees(cx)
         .sorted_by_key(|worktree| {
@@ -1115,14 +1118,14 @@ fn possible_open_target(
                 None => usize::MAX,
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     // TODO(davewa): Any reason not to use `worktree.read(cx).entry_for_path(path)` here?
 
     // Outer loops should be maybe path variants and variations so that we stop as soon as
     // a match is found. Variants and variations are ordered by most common to least common.
     for maybe_path_variant in maybe_path.default_maybe_path_variants() {
-        for worktree in &sorted_worktrees {
+        for worktree in &worktree_candidates {
             // The only work we can not do in the background is read the worktrees, if any.
             // When we get a hit here, just return it and skip any further processing.
             let worktree_root = worktree.read(cx).abs_path();
@@ -1136,10 +1139,10 @@ fn possible_open_target(
                 {
                     if entry.path.ends_with(&maybe_path_with_position.path) {
                         trace!("Terminal View: MaybePath found for worktree: {worktree_root:?}, entry: {:?}", entry.path);
-                        return Task::ready(Some((
+                        return Task::ready(Some(OpenTarget::Worktree(
                             maybe_path_with_position
                                 .into_owned_with_path(Cow::Owned(worktree_root.join(&entry.path))),
-                            OpenTarget::Worktree(entry.clone()),
+                            entry.clone(),
                         )));
                     }
                 }
@@ -1156,7 +1159,7 @@ fn possible_open_target(
         project.fs().clone(),
         cwd,
         maybe_path.clone(),
-        sorted_worktrees
+        worktree_candidates
             .into_iter()
             .map(|worktree| worktree.read(cx).abs_path())
             .collect(),
@@ -1172,13 +1175,13 @@ fn possible_open_target_from_fs(
     mut sorted_worktree_roots: Vec<Arc<Path>>,
     path_hyperlink_navigation: PathHyperlinkNavigation,
     cx: &mut Context<TerminalView>,
-) -> Task<Option<(MaybePathWithPosition<'static>, OpenTarget)>> {
+) -> Task<Option<OpenTarget>> {
     async fn search_absolutized_maybe_path_variants<'a>(
         fs: Arc<dyn Fs>,
         home_dir: &PathBuf,
         roots: &Vec<Arc<Path>>,
         maybe_path_variants: impl Iterator<Item = MaybePathVariant<'a>> + 'a,
-    ) -> Option<(MaybePathWithPosition<'static>, OpenTarget)> {
+    ) -> Option<OpenTarget> {
         for maybe_path_variant in maybe_path_variants {
             // TODO(davewa): check for timeout here (and return Error::Timeout, e.g. Result<Option<(...)>>)
             for maybe_path_with_position in
@@ -1194,9 +1197,9 @@ fn possible_open_target_from_fs(
                         "Terminal: MaybePath found absolutized variation: {:?}",
                         maybe_path_with_position.path
                     );
-                    return Some((
+                    return Some(OpenTarget::File(
                         maybe_path_with_position.into_owned(),
-                        OpenTarget::File(metadata),
+                        metadata,
                     ));
                 } else {
                     trace!(
@@ -1367,7 +1370,6 @@ impl Render for TerminalView {
                         self.focus_handle.clone(),
                         focused,
                         self.should_show_cursor(focused, cx),
-                        self.can_navigate_to_selected_word,
                         self.block_below_cursor.clone(),
                     ))
                     .when_some(self.render_scrollbar(cx), |div, scrollbar| {

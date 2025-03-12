@@ -250,6 +250,20 @@ impl<'a> MaybePathWithPosition<'a> {
             None => self.range.clone(),
         }
     }
+
+    // TODO(davewa): Add `line: Cow<'a, str> to RowColumn, and git the originally matched string
+    pub fn to_string(&self, path_to_string: impl Fn(&Path) -> String) -> String {
+        let path_string = path_to_string(&self.path);
+        if let Some(RowColumn { row, column, .. }) = self.position.as_ref() {
+            if let Some(column) = column {
+                format!("{path_string}:{row}:{column}")
+            } else {
+                format!("{path_string}:{row}")
+            }
+        } else {
+            path_string
+        }
+    }
 }
 
 /// A contiguous sequence of words which includes the hovered word of a [MaybePath]

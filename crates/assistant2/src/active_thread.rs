@@ -447,7 +447,7 @@ impl ActiveThread {
         };
 
         self.thread.update(cx, |thread, cx| {
-            thread.send_to_model(model, RequestKind::Chat, false, cx)
+            thread.send_to_model(model, RequestKind::Chat, cx)
         });
         cx.notify();
     }
@@ -652,7 +652,7 @@ impl ActiveThread {
                         )
                         .child(message_content),
                 ),
-            Role::Assistant => div()
+            Role::Assistant => v_flex()
                 .id(("message-container", ix))
                 .child(message_content)
                 .map(|parent| {
