@@ -12,7 +12,7 @@ use gpui::{
     Pixels, Render, ScrollWheelEvent, Stateful, Styled, Subscription, Task, WeakEntity,
 };
 use itertools::Itertools;
-use log::{info, trace};
+use log::{debug, info, trace};
 use persistence::TERMINAL_DB;
 use project::Entry;
 use project::{search::SearchQuery, terminals::TerminalKind, Fs, Metadata, Project};
@@ -55,6 +55,7 @@ use smol::Timer;
 use zed_actions::assistant::InlineAssist;
 
 use std::ops::Deref;
+use std::time::Instant;
 use std::{
     borrow::Cow,
     cmp,
@@ -70,8 +71,6 @@ const REGEX_SPECIAL_CHARS: &[char] = &[
 ];
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
-
-const _DEFAULT_ENHANCED_PATH_HYPERLINK_TIMEOUT: usize = 250;
 
 /// Event to transmit the scroll from the element to the view
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +131,7 @@ pub struct TerminalView {
     selected_word_maybe_path_target: Option<MaybePathOpenTarget>,
     path_hyperlink_navigation: terminal_settings::PathHyperlinkNavigation,
     path_hyperlink_regexes: Arc<Vec<Regex>>,
+    path_hyperlink_timeout: Duration,
     workspace_id: Option<WorkspaceId>,
     show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
@@ -222,6 +222,9 @@ impl TerminalView {
                     .iter()
                     .map(|regex| Regex::new(regex).unwrap())
                     .collect::<Vec<_>>(),
+            ),
+            path_hyperlink_timeout: Duration::from_millis(
+                TerminalSettings::get_global(cx).path_hyperlink_timeout,
             ),
             workspace_id,
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
@@ -926,7 +929,7 @@ fn subscribe_for_terminal_events(
                                         &workspace,
                                         path_like_target.terminal_dir.clone(),
                                         &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path, Arc::clone(&this.path_hyperlink_regexes)),
-                                        this.path_hyperlink_navigation, cx
+                                        this.path_hyperlink_navigation, this.path_hyperlink_timeout, cx
                                     );
                                 let open_target = smol::block_on(open_target_task);
                                 this.update_terminal_maybe_path(path_like_target, open_target.as_ref(), cx);
@@ -958,7 +961,7 @@ fn subscribe_for_terminal_events(
                                         &task_workspace,
                                         path_like_target.terminal_dir.clone(),
                                         &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path, Arc::clone(&this.path_hyperlink_regexes)),
-                                        this.path_hyperlink_navigation,
+                                        this.path_hyperlink_navigation, this.path_hyperlink_timeout,
                                         cx,
                                     )
                                 })?
@@ -1091,6 +1094,7 @@ fn possible_open_target(
     cwd: Option<PathBuf>,
     maybe_path: &MaybePath,
     path_hyperlink_navigation: PathHyperlinkNavigation,
+    path_hyperlink_timeout: Duration,
     cx: &mut Context<TerminalView>,
 ) -> Task<Option<OpenTarget>> {
     let Some(workspace) = workspace.upgrade() else {
@@ -1164,6 +1168,7 @@ fn possible_open_target(
             .map(|worktree| worktree.read(cx).abs_path())
             .collect(),
         path_hyperlink_navigation,
+        path_hyperlink_timeout,
         cx,
     )
 }
@@ -1174,6 +1179,7 @@ fn possible_open_target_from_fs(
     maybe_path: MaybePath,
     mut sorted_worktree_roots: Vec<Arc<Path>>,
     path_hyperlink_navigation: PathHyperlinkNavigation,
+    path_hyperlink_timeout: Duration,
     cx: &mut Context<TerminalView>,
 ) -> Task<Option<OpenTarget>> {
     async fn search_absolutized_maybe_path_variants<'a>(
@@ -1181,19 +1187,23 @@ fn possible_open_target_from_fs(
         home_dir: &PathBuf,
         roots: &Vec<Arc<Path>>,
         maybe_path_variants: impl Iterator<Item = MaybePathVariant<'a>> + 'a,
+        timed_out: impl Fn() -> bool,
     ) -> Option<OpenTarget> {
         for maybe_path_variant in maybe_path_variants {
-            // TODO(davewa): check for timeout here (and return Error::Timeout, e.g. Result<Option<(...)>>)
             for maybe_path_with_position in
                 maybe_path_variant.absolutized_variations(roots.iter().map(Deref::deref), home_dir)
             {
+                if timed_out() {
+                    return None;
+                }
+
                 if let Some(metadata) = fs
                     .metadata(&maybe_path_with_position.path)
                     .await
                     .ok()
                     .flatten()
                 {
-                    info!(
+                    debug!(
                         "Terminal: MaybePath found absolutized variation: {:?}",
                         maybe_path_with_position.path
                     );
@@ -1214,36 +1224,46 @@ fn possible_open_target_from_fs(
     }
 
     cx.background_spawn(async move {
+        let search_start_time = Instant::now();
+        let timed_out = || {
+            Instant::now().saturating_duration_since(search_start_time) > path_hyperlink_timeout
+        };
+
         let home_dir = paths::home_dir();
         if let Some(cwd) = cwd {
             sorted_worktree_roots.push(cwd.into());
         };
 
-        if let Some(default) = search_absolutized_maybe_path_variants(
+        // TODO(davewa): Maybe keep a HashSet of variations checked so far to avoid repeating?
+        // But, it might acutally be slower than checking a few repeats.
+        let open_target = if let Some(default) = search_absolutized_maybe_path_variants(
             Arc::clone(&fs),
             home_dir,
             &sorted_worktree_roots,
             maybe_path.default_maybe_path_variants(),
+            timed_out,
         )
         .await
         {
             Some(default)
-        } else if path_hyperlink_navigation > PathHyperlinkNavigation::Default {
+        } else if !timed_out() && path_hyperlink_navigation > PathHyperlinkNavigation::Default {
             if let Some(advanced) = search_absolutized_maybe_path_variants(
                 Arc::clone(&fs),
                 home_dir,
                 &sorted_worktree_roots,
                 maybe_path.advanced_maybe_path_variants(),
+                timed_out,
             )
             .await
             {
                 Some(advanced)
-            } else if path_hyperlink_navigation > PathHyperlinkNavigation::Advanced {
+            } else if !timed_out() && path_hyperlink_navigation > PathHyperlinkNavigation::Advanced {
                 search_absolutized_maybe_path_variants(
                     Arc::clone(&fs),
                     home_dir,
                     &sorted_worktree_roots,
                     maybe_path.exhaustive_maybe_path_variants(),
+                    timed_out,
                 )
                 .await
             } else {
@@ -1251,7 +1271,19 @@ fn possible_open_target_from_fs(
             }
         } else {
             None
+        };
+
+        let duration = Instant::now().saturating_duration_since(search_start_time);
+
+        if timed_out() {
+            info!("TerminalView: {path_hyperlink_navigation:?} search timed out searching for real file for maybe path variations after {}ms", duration.as_millis());
+        } else if open_target.is_some() {
+            debug!("TerminalView: {path_hyperlink_navigation:?} search found real file for maybe path in {}ms", duration.as_millis());
+        } else {
+            trace!("TerminalView: {path_hyperlink_navigation:?} search did not find a real file for maybe_path in {}ms", duration.as_millis());
         }
+
+        open_target
     })
 }
 

@@ -1,4 +1,3 @@
-// TODO(davewa): Change most (all?) info! messages into debug! or trace!
 // TODO(davewa): Bugs found while testing this feature:
 // - Navigation to line and column navigates to the wrong column when line
 // contains unicode. I suspect it is using char's instead of graphemes.
@@ -16,8 +15,6 @@
 // - [ ] Add a ton more targeted unit test cases
 // - [ ] Test file:// Urls
 // - [ ] Test non-file:// Urls
-// - [ ] Implement background (and main thread?) timeout for searching variations
-//   - Use the executor's? timer so that test virtual time works correctly
 
 use regex::Regex;
 use std::{

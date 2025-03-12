@@ -32,7 +32,7 @@ use futures::{
     FutureExt,
 };
 
-use log::{debug, info, trace};
+use log::{debug, trace};
 use mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
@@ -953,7 +953,6 @@ impl Terminal {
                             if let Some(file_url_as_path) = url.strip_prefix("file://") {
                                 let maybe_path =
                                     HoveredMaybePath::from_file_url(file_url_as_path, &url_match);
-                                debug!("Terminal: {maybe_path}",);
                                 Some((Some((url, url_match)), Some(maybe_path)))
                             } else {
                                 Some((Some((url, url_match)), None))
@@ -962,7 +961,6 @@ impl Terminal {
                             regex_match_at(term, point, &mut self.word_regex).map(|word_match| {
                                 let maybe_path =
                                     HoveredMaybePath::from_hovered_word_match(term, &word_match);
-                                debug!("Terminal: {maybe_path}",);
                                 (maybe_path.best_hueristic_path(term), Some(maybe_path))
                             })
                         }
@@ -1008,7 +1006,7 @@ impl Terminal {
 
                 let target = if let Some(hovered_maybe_path) = hovered_maybe_path {
                     if new_navigation_target {
-                        info!("Terminal: New path like navigation target, {hovered_maybe_path}",);
+                        debug!("Terminal: New path like navigation target, {hovered_maybe_path}",);
                     }
 
                     let Some(hovered_maybe_path_id) = hovered_maybe_path_id else {
@@ -1025,7 +1023,7 @@ impl Terminal {
                     }))
                 } else if let Some(HoveredWord { word, .. }) = hovered_word {
                     if new_navigation_target {
-                        info!("Terminal: New url navigation target, url = {word}");
+                        debug!("Terminal: New url navigation target, url = {word}");
                     }
                     Some(MaybeNavigationTarget::Url(word))
                 } else {
@@ -1098,7 +1096,7 @@ impl Terminal {
         let Some(last_hovered_maybe_path) = self.last_content.last_hovered_maybe_path.as_mut()
         else {
             debug_panic!(
-                "Expected: confirmed maybe_path to equal the last_hovered_word's maybe_path"
+                "Expected: last_hovered_maybe_path should exist for valid confirmed maybe path"
             );
             return;
         };

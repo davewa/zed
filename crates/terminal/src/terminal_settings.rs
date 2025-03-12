@@ -91,7 +91,7 @@ pub struct TerminalSettings {
     pub scrollbar: ScrollbarSettings,
     pub path_hyperlink_navigation: PathHyperlinkNavigation,
     pub path_hyperlink_regexes: Vec<String>,
-    pub path_hyperlink_timeout: usize,
+    pub path_hyperlink_timeout: u64,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -275,7 +275,7 @@ pub struct TerminalSettingsContent {
     /// Timeout for hover and Cmd-click path hyperlink discovery in milliseconds.
     ///
     /// Default: 1000
-    pub path_hyperlink_timeout: Option<usize>,
+    pub path_hyperlink_timeout: Option<u64>,
 }
 
 impl settings::Settings for TerminalSettings {
