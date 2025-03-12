@@ -29,7 +29,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
-use terminal::terminal_path_hyperlinks::{
+use terminal::terminal_hovered_maybe_path::{
     longest_surrounding_symbols_match, path_regex_match, preapproved_path_hyperlink_regexes,
     HoveredMaybePath, COMMON_PATH_SURROUNDING_SYMBOLS, MAIN_SEPARATORS,
 };

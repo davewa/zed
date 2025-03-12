@@ -3,7 +3,7 @@ pub mod mappings;
 pub use alacritty_terminal;
 
 mod pty_info;
-pub mod terminal_path_hyperlinks;
+pub mod terminal_hovered_maybe_path;
 pub mod terminal_settings;
 
 use alacritty_terminal::{
@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use smol::channel::{Receiver, Sender};
 use task::{HideStrategy, Shell, TaskId};
-use terminal_path_hyperlinks::HoveredMaybePath;
+use terminal_hovered_maybe_path::HoveredMaybePath;
 use terminal_settings::{AlternateScroll, CursorShape, PathHyperlinkNavigation, TerminalSettings};
 use theme::{ActiveTheme, Theme};
 use util::{debug_panic, paths::home_dir, truncate_and_trailoff};
@@ -2305,13 +2305,13 @@ mod tests {
         );
         // Some tools output "filename:line:col:message"
         re_test(
-            crate::terminal_path_hyperlinks::PREAPPROVED_PATH_HYPERLINK_REGEXES[0],
+            crate::terminal_hovered_maybe_path::PREAPPROVED_PATH_HYPERLINK_REGEXES[0],
             "Main.cs:20:5:Error desc",
             vec!["Main.cs:20:5:"],
         );
         // Some tools output "filename(line,col):message"
         re_test(
-            crate::terminal_path_hyperlinks::PREAPPROVED_PATH_HYPERLINK_REGEXES[0],
+            crate::terminal_hovered_maybe_path::PREAPPROVED_PATH_HYPERLINK_REGEXES[0],
             "Main.cs(20,5):Error desc",
             vec!["Main.cs(20,5):"],
         );
