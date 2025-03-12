@@ -281,6 +281,7 @@ pub struct MaybePathVariant<'a> {
     variations: Vec<Range<usize>>,
     positioned_variation: Option<(Range<usize>, RowColumn)>,
     /// `a/~/foo.rs` is a valid path on it's own. If we parsed a git diff path like `+++ a/~/foo.rs`, never absolutize it.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     absolutize_home_dir: bool,
 }
 
@@ -415,6 +416,37 @@ impl<'a> MaybePathVariant<'a> {
             ));
         }
 
+        self.absolutize_home_dir(
+            variation_path,
+            home_dir,
+            variation_range,
+            position,
+            &mut absolutized,
+        );
+
+        absolutized
+    }
+
+    #[cfg(target_os = "windows")]
+    fn absolutize_home_dir(
+        &self,
+        _variation_path: &Path,
+        _home_dir: &PathBuf,
+        _variation_range: &Range<usize>,
+        _position: Option<RowColumn>,
+        _absolutized: &mut Vec<MaybePathWithPosition<'a>>,
+    ) -> () {
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn absolutize_home_dir(
+        &self,
+        variation_path: &Path,
+        home_dir: &PathBuf,
+        variation_range: &Range<usize>,
+        position: Option<RowColumn>,
+        absolutized: &mut Vec<MaybePathWithPosition<'a>>,
+    ) -> () {
         if self.absolutize_home_dir {
             if let Ok(tildeless_path) = variation_path.strip_prefix("~") {
                 absolutized.push(MaybePathWithPosition::new(
@@ -424,8 +456,6 @@ impl<'a> MaybePathVariant<'a> {
                 ));
             }
         }
-
-        absolutized
     }
 
     pub fn absolutized_variations<'b>(
@@ -465,6 +495,7 @@ mod tests {
     use serde_json::json;
     use std::{path::Path, sync::Arc};
     use terminal::terminal_settings::PathHyperlinkNavigation;
+    use util::{path, separator};
 
     struct ExpectedMaybePathVariations<'a> {
         relative: Vec<MaybePathWithPosition<'a>>,
@@ -474,20 +505,58 @@ mod tests {
 
     type ExpectedMap<'a> = HashMap<PathHyperlinkNavigation, Vec<ExpectedMaybePathVariations<'a>>>;
 
+    #[cfg(target_os = "windows")]
+    macro_rules! maybe_home_path_with_positions {
+        ($variations:ident, [ $($path:expr),+ ], $row:literal, $column:literal; $($tail:tt)*) => {
+            maybe_path_with_positions!($variations, $($tail)*);
+        };
+
+        ($variations:ident, [ $($path:expr),+ ], $row:literal; $($tail:tt)*) => {
+            maybe_path_with_positions!($variations, $($tail)*);
+        };
+
+        ($variations:ident, [ $($path:expr),+ ]; $($tail:tt)*) => {
+            maybe_path_with_positions!($variations, $($tail)*);
+        };
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    macro_rules! maybe_home_path_with_positions {
+        ($variations:ident, [ $($path:expr),+ ] $($tail:tt)*) => {
+            maybe_path_with_positions!($variations, [ $($path),+ ] $($tail)*);
+        };
+    }
+
     macro_rules! maybe_path_with_positions {
-        ($variations:ident, $path:literal, $row:literal, $column:literal; $($tail:tt)*) => {
-            $variations.push(MaybePathWithPosition::new(&(0..0), Cow::Borrowed(Path::new($path)), Some(RowColumn{ row: $row, column: Some($column), suffix_length: 4 })));
+        ($variations:ident, [ $($path:expr),+ ], $row:literal, $column:literal; $($tail:tt)*) => {
+            $variations.push(MaybePathWithPosition::new(
+                &(0..0),
+                Cow::Borrowed(Path::new(concat!($($path),+))),
+                Some(RowColumn{ row: $row, column: Some($column), suffix_length: 4 })
+            ));
             maybe_path_with_positions!($variations, $($tail)*);
         };
 
-        ($variations:ident, $path:literal, $row:literal; $($tail:tt)*) => {
-            $variations.push(MaybePathWithPosition::new(&(0..0), Cow::Borrowed(Path::new($path)), Some(RowColumn{ row: $row, column: None, suffix_length: 2 })));
+        ($variations:ident, [ $($path:expr),+ ], $row:literal; $($tail:tt)*) => {
+            $variations.push(MaybePathWithPosition::new(
+                &(0..0),
+                Cow::Borrowed(Path::new(concat!($($path),+))),
+                Some(RowColumn{ row: $row, column: None, suffix_length: 2 })
+            ));
             maybe_path_with_positions!($variations, $($tail)*);
         };
 
-        ($variations:ident, $path:literal; $($tail:tt)*) => {
-            $variations.push(MaybePathWithPosition::new(&(0..0), Cow::Borrowed(Path::new($path)), None));
+        ($variations:ident, [ $($path:expr),+ ]; $($tail:tt)*) => {
+            $variations.push(MaybePathWithPosition::new(
+                &(0..0),
+                Cow::Borrowed(Path::new(concat!($($path),+))),
+                None
+            ));
             maybe_path_with_positions!($variations, $($tail)*);
+        };
+
+        ($variations:ident, [ @home $($path:expr),+ ] $($tail:tt)*) => {
+            maybe_home_path_with_positions!($variations, [ $($path),+ ] $($tail)*);
         };
 
         ($variations:ident,) => {
@@ -514,7 +583,7 @@ mod tests {
         ($path:literal, $row:literal, $column:literal) => {
             Some(MaybePathWithPosition::new(
                 &(0..0),
-                Cow::Borrowed(Path::new($path)),
+                Cow::Borrowed(Path::new(path!($path))),
                 Some(RowColumn {
                     row: $row,
                     column: Some($column),
@@ -525,7 +594,7 @@ mod tests {
         ($path:literal, $row:literal) => {
             Some(MaybePathWithPosition::new(
                 &(0..0),
-                Cow::Borrowed(Path::new($path)),
+                Cow::Borrowed(Path::new(path!($path))),
                 Some(RowColumn {
                     row: $row,
                     column: None,
@@ -536,7 +605,7 @@ mod tests {
         ($path:literal) => {
             Some(MaybePathWithPosition::new(
                 &(0..0),
-                Cow::Borrowed(Path::new($path)),
+                Cow::Borrowed(Path::new(path!($path))),
                 None,
             ))
         };
@@ -560,11 +629,23 @@ mod tests {
         };
     }
 
+    macro_rules! abs {
+        ($path:literal) => {
+            path!($path)
+        };
+    }
+
+    macro_rules! rel {
+        ($path:literal) => {
+            separator!($path)
+        };
+    }
+
     #[gpui::test]
     async fn simple_maybe_paths(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
-            "/root1",
+            path!("/root1"),
             json!({
                 "one.txt": "",
                 "two.txt": "",
@@ -572,7 +653,7 @@ mod tests {
         )
         .await;
         fs.insert_tree(
-            "/root 2",
+            path!("/root 2"),
             json!({
                 "שיתופית.rs": "",
             }),
@@ -585,126 +666,126 @@ mod tests {
             Vec::from_iter([
                 expected!{
                     relative![
-                        "+++";
-                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ rel!("+++") ];
+                        [ rel!("+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ],
                     absolutized![
-                        "/root 2/+++";
-                        "/Some/cool/place/+++";
-                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ abs!("/root 2/+++") ];
+                        [ abs!("/Some/cool/place/+++") ];
+                        [ abs!("/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ]
                 },
                 expected!{
                     relative![
-                        "a/~/협동조합";
-                        "~/협동조합";
-                        "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ rel!("a/~/협동조합") ];
+                        [ rel!("~/협동조합") ];
+                        [ rel!("a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ rel!("~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ rel!("+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ],
                     absolutized![
-                        "/root 2/a/~/협동조합";
-                        "/Some/cool/place/a/~/협동조합";
-                        "/root 2/~/협동조합";
-                        "/Some/cool/place/~/협동조합";
-                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ abs!("/root 2/a/~/협동조합") ];
+                        [ abs!("/Some/cool/place/a/~/협동조합") ];
+                        [ abs!("/root 2/~/협동조합") ];
+                        [ abs!("/Some/cool/place/~/협동조합") ];
+                        [ abs!("/root 2/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/root 2/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ]
                 },
                 expected!{
                     relative![
-                        "~/super/cool";
-                        "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ rel!("~/super/cool") ];
+                        [ rel!("a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ rel!("~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ rel!("+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ],
                     absolutized![
-                        "/root 2/~/super/cool";
-                        "/Some/cool/place/~/super/cool";
-                        "/Usors/uzer/super/cool";
-                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ abs!("/root 2/~/super/cool") ];
+                        [ abs!("/Some/cool/place/~/super/cool") ];
+                        [ @home abs!("/Usors/uzer/super/cool") ];
+                        [ abs!("/root 2/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/root 2/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ]
                 },
                 expected!{
                     relative![
-                        "b/path", 4, 2;
-                        "b/path:4:2";
-                        "path:4:2";
-                        "b/path", 4;
-                        "b/path:4";
-                        "path:4";
-                        "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ rel!("b/path") ], 4, 2;
+                        [ rel!("b/path:4:2") ];
+                        [ rel!("path:4:2") ];
+                        [ rel!("b/path") ], 4;
+                        [ rel!("b/path:4") ];
+                        [ rel!("path:4") ];
+                        [ rel!("a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ rel!("~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ rel!("+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         ],
                     absolutized![
-                        "/root 2/b/path:4:2";
-                        "/Some/cool/place/b/path:4:2";
-                        "/root 2/path:4:2";
-                        "/Some/cool/place/path:4:2";
-                        "/root 2/b/path", 4, 2;
-                        "/Some/cool/place/b/path", 4, 2;
-                        "/root 2/b/path:4";
-                        "/Some/cool/place/b/path:4";
-                        "/root 2/path:4";
-                        "/Some/cool/place/path:4";
-                        "/root 2/b/path", 4;
-                        "/Some/cool/place/b/path", 4;
-                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ abs!("/root 2/b/path:4:2") ];
+                        [ abs!("/Some/cool/place/b/path:4:2") ];
+                        [ abs!("/root 2/path:4:2") ];
+                        [ abs!("/Some/cool/place/path:4:2") ];
+                        [ abs!("/root 2/b/path") ], 4, 2;
+                        [ abs!("/Some/cool/place/b/path") ], 4, 2;
+                        [ abs!("/root 2/b/path:4") ];
+                        [ abs!("/Some/cool/place/b/path:4") ];
+                        [ abs!("/root 2/path:4") ];
+                        [ abs!("/Some/cool/place/path:4") ];
+                        [ abs!("/root 2/b/path") ], 4;
+                        [ abs!("/Some/cool/place/b/path") ], 4;
+                        [ abs!("/root 2/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/root 2/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ]
                 },
                 expected!{
                     relative![
-                        "(/root";
-                        "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ "(", abs!("/root") ];
+                        [ rel!("a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ rel!("~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ rel!("+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ],
                     absolutized![
-                        "/root 2/(/root";
-                        "/Some/cool/place/(/root";
-                        "/root 2/שיתופית.rs";
-                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ abs!("/root 2/("), abs!("/root") ];
+                        [ abs!("/Some/cool/place/("), abs!("/root") ];
+                        [ abs!("/root 2/שיתופית.rs") ];
+                        [ abs!("/root 2/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/root 2/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ],
                     open_target!("/root 2/שיתופית.rs")
                 },
                 expected!{
                     relative![
-                        "2/שיתופית.rs)";
-                        "a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ rel!("2/שיתופית.rs)") ];
+                        [ rel!("a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ rel!("~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ rel!("+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ],
                     absolutized![
-                        "/root 2/2/שיתופית.rs)";
-                        "/Some/cool/place/2/שיתופית.rs)";
-                        "/root 2/שיתופית.rs";
-                        "/root 2/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/root 2/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                        "/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                        [ abs!("/root 2/2/שיתופית.rs)") ];
+                        [ abs!("/Some/cool/place/2/שיתופית.rs)") ];
+                        [ abs!("/root 2/שיתופית.rs") ];
+                        [ abs!("/root 2/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/root 2/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/root 2/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                        [ abs!("/Some/cool/place/+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                     ],
                     open_target!("/root 2/שיתופית.rs")
                 }
@@ -729,72 +810,72 @@ mod tests {
                     },
                     expected! {
                         relative![
-                            "~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                            [ rel!("~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         ],
                         absolutized![
-                            "/root 2/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/Some/cool/place/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/Usors/uzer/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
+                            [ abs!("/root 2/~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ @home abs!("/Usors/uzer/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         ]
                     },
                     expected! {
                         relative![
-                            "~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "b/path:4:2 (/root 2/שיתופית.rs)";
-                            "path:4:2 (/root 2/שיתופית.rs)";
+                            [ rel!("~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ rel!("b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ rel!("path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         ],
                         absolutized![
-                            "/root 2/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/Some/cool/place/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/Usors/uzer/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/root 2/b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/Some/cool/place/b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/root 2/path:4:2 (/root 2/שיתופית.rs)";
-                            "/Some/cool/place/path:4:2 (/root 2/שיתופית.rs)";
+                            [ abs!("/root 2/~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ @home abs!("/Usors/uzer/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/root 2/b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/root 2/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         ]
                     },
                     expected! {
                         relative![
-                            "~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "b/path:4:2 (/root 2/שיתופית.rs)";
-                            "path:4:2 (/root 2/שיתופית.rs)";
-                            "(/root 2/שיתופית.rs)";
+                            [ rel!("~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ rel!("b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ rel!("path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ "(", abs!("/root 2/שיתופית.rs)") ];
                         ],
                         absolutized![
-                            "/root 2/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/Some/cool/place/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/Usors/uzer/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/root 2/b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/Some/cool/place/b/path:4:2 (/root 2/שיתופית.rs)";
-                            "/root 2/path:4:2 (/root 2/שיתופית.rs)";
-                            "/Some/cool/place/path:4:2 (/root 2/שיתופית.rs)";
-                            "/root 2/שיתופית.rs";
-                            "/root 2/(/root 2/שיתופית.rs)";
-                            "/Some/cool/place/(/root 2/שיתופית.rs)";
+                            [ abs!("/root 2/~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ @home abs!("/Usors/uzer/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/root 2/b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/root 2/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/root 2/שיתופית.rs") ];
+                            [ abs!("/root 2/("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/("), abs!("/root 2/שיתופית.rs"), ")" ];
                         ],
                         open_target!("/root 2/שיתופית.rs")
                     },
                     expected! {
                         relative![
-                            "~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                            "b/path:4:2 (/root 2/שיתופית.rs)";
-                            "path:4:2 (/root 2/שיתופית.rs)";
-                            "(/root 2/שיתופית.rs)";
-                            "2/שיתופית.rs)";
+                            [ rel!("~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ rel!("b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ rel!("path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ "(", abs!("/root 2/שיתופית.rs)") ];
+                            [ rel!("2/שיתופית.rs)") ];
                             ],
-                            absolutized![
-                                "/root 2/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                                "/Some/cool/place/~/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                                "/Usors/uzer/super/cool b/path:4:2 (/root 2/שיתופית.rs)";
-                                "/root 2/b/path:4:2 (/root 2/שיתופית.rs)";
-                                "/Some/cool/place/b/path:4:2 (/root 2/שיתופית.rs)";
-                                "/root 2/path:4:2 (/root 2/שיתופית.rs)";
-                                "/Some/cool/place/path:4:2 (/root 2/שיתופית.rs)";
-                                "/root 2/שיתופית.rs";
-                                "/root 2/(/root 2/שיתופית.rs)";
-                                "/Some/cool/place/(/root 2/שיתופית.rs)";
-                                "/root 2/2/שיתופית.rs)";
-                                "/Some/cool/place/2/שיתופית.rs)";
+                        absolutized![
+                            [ abs!("/root 2/~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ @home abs!("/Usors/uzer/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/root 2/b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/root 2/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/root 2/שיתופית.rs") ];
+                            [ abs!("/root 2/("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/Some/cool/place/("), abs!("/root 2/שיתופית.rs"), ")" ];
+                            [ abs!("/root 2/2/שיתופית.rs)") ];
+                            [ abs!("/Some/cool/place/2/שיתופית.rs)") ];
                         ],
                         open_target!("/root 2/שיתופית.rs")
                     },
@@ -805,8 +886,12 @@ mod tests {
 
         test_line_maybe_path_variants(
             fs,
-            &Path::new("/root 2"),
-            "+++ a/~/협동조합   ~/super/cool b/path:4:2 (/root 2/שיתופית.rs)",
+            &Path::new(abs!("/root 2")),
+            concat!(
+                rel!("+++ a/~/협동조합   ~/super/cool b/path:4:2 ("),
+                abs!("/root 2/שיתופית.rs"),
+                rel!(")")
+            ),
             &expected,
         )
         .await
@@ -912,8 +997,8 @@ mod tests {
 
         check_variations(&actual_relative, &expected.relative);
 
-        const HOME_DIR: &str = "/Usors/uzer";
-        const CWD: &str = "/Some/cool/place";
+        const HOME_DIR: &str = path!("/Usors/uzer");
+        const CWD: &str = path!("/Some/cool/place");
 
         let home_dir = Path::new(HOME_DIR).to_path_buf();
         let roots = [worktree_root, Path::new(CWD)];
