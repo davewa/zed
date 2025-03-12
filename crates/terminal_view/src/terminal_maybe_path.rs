@@ -839,7 +839,7 @@ mod tests {
         for (matched, expected) in word_regex().find_iter(&line).zip(advanced_expected) {
             let maybe_path =
                 MaybePath::new(line, matched.range(), Arc::clone(&custom_path_regexes));
-            println!("\n\nTesting Default: {}", maybe_path);
+            println!("\n\nTesting Advanced: {}", maybe_path);
 
             test_maybe_path(
                 Arc::clone(&fs),
