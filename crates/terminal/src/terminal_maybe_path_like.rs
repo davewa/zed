@@ -39,7 +39,7 @@
 //! - [ ] PREAPPROVED_PATH_HYPERLINK_REGEXES should probably find a `util::paths::ROW_COL_CAPTURE_REGEX` followed
 //! by a `:`, or whatever else usualy follows a line & column (need to check MSVC output).
 //! - [ ] Clear `last_hovered_*` when terminal content changes. See comment at `point_within_last_hovered`
-//! - [ ] best_hueristic_hovered_word currently causes false positives to flicker e.g., they get linkified
+//! - [ ] best_heuristic_hovered_word currently causes false positives to flicker e.g., they get linkified
 //! immediately, then get clear once we confirm they are not paths. Maybe this is fine? But I think we
 //! should just not hyperlink maybe path like things until they are confirmed.
 //! - [ ] Add many more tests
@@ -224,11 +224,11 @@ impl MaybePathLike {
         &self.line[range.clone()]
     }
 
-    /// Computes the best hueristic match for link highlighting in the terminal. This
+    /// Computes the best heuristic match for link highlighting in the terminal. This
     /// will be linkified immediately even though we don't yet know if it is a real path.
     /// Once we've determined (in the background) is it is a real path, the hyperlink
     /// will be updated to the real path if a real path was found, or cleared if not.
-    pub(super) fn best_hueristic_hovered_word(
+    pub(super) fn best_heuristic_hovered_word(
         &self,
         term: &mut Term<ZedListener>,
     ) -> Option<HoveredWord> {
@@ -237,7 +237,7 @@ impl MaybePathLike {
         {
             let stripped_range = surrounding_range.start + 1..surrounding_range.end - 1;
             debug!(
-                "Terminal: path hueristic 'longest surrounding symbols' match: {:?}",
+                "Terminal: path heuristic 'longest surrounding symbols' match: {:?}",
                 self.text_at(&stripped_range)
             );
             Some(HoveredWord {
@@ -246,7 +246,7 @@ impl MaybePathLike {
             })
         } else if self.looks_like_a_path_match(&self.word_range) {
             debug!(
-                "Terminal: path hueristic 'looks like a path' match: {:?}",
+                "Terminal: path heuristic 'looks like a path' match: {:?}",
                 &self.line[self.word_range.clone()]
             );
             Some(HoveredWord {
@@ -256,7 +256,7 @@ impl MaybePathLike {
         } else if let Some(path_range) = path_regex_match(&self.line, &self.word_range, &Vec::new())
         {
             debug!(
-                "Terminal: path hueristic 'path regex' match: {:?}",
+                "Terminal: path heuristic 'path regex' match: {:?}",
                 self.text_at(&path_range)
             );
             Some(HoveredWord {

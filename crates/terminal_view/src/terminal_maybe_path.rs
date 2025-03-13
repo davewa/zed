@@ -1,4 +1,4 @@
-//! Hueristics which define variations of a [MaybePathLike] from [terminal]
+//! heuristics which define variations of a [MaybePathLike] from [terminal]
 //!
 //! # TODOs
 //! ## [Cmd+click to linkify file in terminal doesn't work when there are whitespace or certain separators in the filename](https://github.com/zed-industries/zed/issues/12338)

@@ -988,7 +988,7 @@ impl Terminal {
                             let maybe_path_like =
                                 MaybePathLike::from_hovered_word_match(term, &word_match);
                             MaybeHyperlink::PathLike(
-                                maybe_path_like.best_hueristic_hovered_word(term),
+                                maybe_path_like.best_heuristic_hovered_word(term),
                                 maybe_path_like,
                             )
                         })

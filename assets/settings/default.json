@@ -1035,16 +1035,16 @@
     ///    "none"
     /// 3. Enable navigation for single word paths, and some very common paths with spaces cases:
     ///    "default"
-    /// 4. Enable for most common paths with spaces cases
+    /// 4. Enable navigation for most common paths with spaces cases
     ///    "advanced"
-    /// 5. Enable for rare paths with spaces cases
+    /// 5. Enable navigation for rare paths with spaces cases
     ///    "exhaustive"
     "path_hyperlink_navigation": "default",
     /// Regexes with "path" named capture group for path hyperlink navigation
     /// Only processed if `path_hyperlink_navigation is "advanced" or higher.
     "path_hyperlink_regexes": [],
     /// Timeout for hover and Cmd-click path hyperlink discovery in milliseconds.
-    "path_hyperlink_timeout": 1000
+    "path_hyperlink_timeout": 100
     // Set the terminal's font size. If this option is not included,
     // the terminal will default to matching the buffer's font size.
     // "font_size": 15,
