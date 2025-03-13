@@ -1097,13 +1097,6 @@ fn possible_open_target(
     };
 
     // We can be on FS remote part, without real FS, so cannot check for existence the path right away.
-
-    // TODO(davewa): This sort seems undesirable to do on every hover, specifically because it
-    // 1. Is likely to have non-trivial input length
-    // 2. Its input rarely changes
-    // 3. The owner of the input provides events for items being added or removed.
-    // Those make it seem ideal for sorting once on load, then subscribing to events to
-    // maintain the sorted result. This would complete remove sorting from this code path.
     let worktree_candidates = workspace
         .read(cx)
         .worktrees(cx)
