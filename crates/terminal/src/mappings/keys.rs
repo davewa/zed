@@ -264,7 +264,7 @@ pub fn to_esc_str(keystroke: &Keystroke, mode: &TermMode, alt_is_meta: bool) -> 
 ///    7     | Alt + Control
 ///    8     | Shift + Alt + Control
 /// ---------+---------------------------
-/// from: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-PC-Style-Function-Keys
+/// from: <https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-PC-Style-Function-Keys>
 fn modifier_code(keystroke: &Keystroke) -> u32 {
     let mut modifier_code = 0;
     if keystroke.modifiers.shift {

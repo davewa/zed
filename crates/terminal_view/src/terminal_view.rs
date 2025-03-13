@@ -128,7 +128,7 @@ pub struct TerminalView {
     blinking_paused: bool,
     blink_epoch: usize,
     hover_target_tooltip: Option<String>,
-    selected_word_maybe_path_target: Option<MaybePathOpenTarget>,
+    maybe_path_open_target: Option<MaybePathOpenTarget>,
     path_hyperlink_navigation: terminal_settings::PathHyperlinkNavigation,
     path_hyperlink_regexes: Arc<Vec<Regex>>,
     path_hyperlink_timeout: Duration,
@@ -214,7 +214,7 @@ impl TerminalView {
             blinking_paused: false,
             blink_epoch: 0,
             hover_target_tooltip: None,
-            selected_word_maybe_path_target: None,
+            maybe_path_open_target: None,
             path_hyperlink_navigation: TerminalSettings::get_global(cx).path_hyperlink_navigation,
             path_hyperlink_regexes: Arc::new(
                 TerminalSettings::get_global(cx)
@@ -860,21 +860,21 @@ impl TerminalView {
         )
     }
 
-    fn update_terminal_maybe_path(
+    fn update_maybe_path_open_target(
         &mut self,
         path_like_target: &PathLikeTarget,
         open_target: Option<&OpenTarget>,
         cx: &mut Context<Self>,
     ) {
         self.terminal.update(cx, |term, cx| {
-            term.confirm_maybe_path(
+            term.confirm_path_like_target(
                 path_like_target,
                 open_target.map(|open_target| open_target.path().hyperlink_range()),
                 cx,
             )
         });
 
-        self.selected_word_maybe_path_target = open_target.map(|open_target| MaybePathOpenTarget {
+        self.maybe_path_open_target = open_target.map(|open_target| MaybePathOpenTarget {
             path_like_target: path_like_target.clone(),
             open_target: open_target.clone(),
         });
@@ -928,12 +928,12 @@ fn subscribe_for_terminal_events(
                                     possible_open_target(
                                         &workspace,
                                         path_like_target.terminal_dir.clone(),
-                                        &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path, Arc::clone(&this.path_hyperlink_regexes)),
+                                        &MaybePath::from_maybe_path_like(&path_like_target.maybe_path_like, Arc::clone(&this.path_hyperlink_regexes)),
                                         this.path_hyperlink_navigation, this.path_hyperlink_timeout, cx
                                     );
                                 let open_target = smol::block_on(open_target_task);
-                                this.update_terminal_maybe_path(path_like_target, open_target.as_ref(), cx);
-                                open_target.map(|open_target| open_target.tooltip())
+                                this.update_maybe_path_open_target(path_like_target, open_target.as_ref(), cx);
+                                open_target.map(|open_target| path_like_target.maybe_path_like.text_at(&open_target.path().hyperlink_range()).to_string())
                             }
                         });
                 cx.notify()
@@ -946,7 +946,7 @@ fn subscribe_for_terminal_events(
                     let task_workspace = workspace.clone();
                     let path_like_target = path_like_target.clone();
                     let selected_word_open_target =
-                        this.selected_word_maybe_path_target.clone();
+                        this.maybe_path_open_target.clone();
                     cx.spawn_in(window, |terminal_view, mut cx| async move {
                         let Some((open_target, newly_confirmed_maybe_path)) = (match selected_word_open_target {
                             Some(MaybePathOpenTarget{ path_like_target: prev_path_like_target, open_target: prev_open_target })
@@ -960,7 +960,7 @@ fn subscribe_for_terminal_events(
                                     possible_open_target(
                                         &task_workspace,
                                         path_like_target.terminal_dir.clone(),
-                                        &MaybePath::from_hovered_maybe_path(&path_like_target.maybe_path, Arc::clone(&this.path_hyperlink_regexes)),
+                                        &MaybePath::from_maybe_path_like(&path_like_target.maybe_path_like, Arc::clone(&this.path_hyperlink_regexes)),
                                         this.path_hyperlink_navigation, this.path_hyperlink_timeout,
                                         cx,
                                     )
@@ -969,7 +969,7 @@ fn subscribe_for_terminal_events(
                             }
                         }) else {
                             terminal_view.update(&mut cx, |this, cx| {
-                                this.update_terminal_maybe_path(&path_like_target, None, cx);
+                                this.update_maybe_path_open_target(&path_like_target, None, cx);
                                 this.hover_target_tooltip = None;
                             })?;
 
@@ -1034,8 +1034,8 @@ fn subscribe_for_terminal_events(
 
                         if newly_confirmed_maybe_path {
                             terminal_view.update(&mut cx, |this, cx| {
-                                this.update_terminal_maybe_path(&path_like_target, Some(&open_target), cx);
-                                this.hover_target_tooltip = Some(open_target.tooltip());
+                                this.update_maybe_path_open_target(&path_like_target, Some(&open_target), cx);
+                                this.hover_target_tooltip = Some(path_like_target.maybe_path_like.text_at(&open_target.path().hyperlink_range()).to_string());
                             })?;
                         }
 
@@ -1082,11 +1082,6 @@ impl OpenTarget {
             OpenTarget::File(path, _) => path,
         }
     }
-
-    fn tooltip(&self) -> String {
-        self.path()
-            .to_string(|path| path.to_string_lossy().to_string())
-    }
 }
 
 fn possible_open_target(
@@ -1126,7 +1121,7 @@ fn possible_open_target(
 
     // Outer loops should be maybe path variants and variations so that we stop as soon as
     // a match is found. Variants and variations are ordered by most common to least common.
-    for maybe_path_variant in maybe_path.default_maybe_path_variants() {
+    for maybe_path_variant in maybe_path.default_variants() {
         for worktree in &worktree_candidates {
             // The only work we can not do in the background is read the worktrees, if any.
             // When we get a hit here, just return it and skip any further processing.
@@ -1169,11 +1164,11 @@ fn possible_open_target(
 
     possible_open_target_from_fs(
         project.fs().clone(),
-        cwd,
         maybe_path.clone(),
         worktree_candidates
             .into_iter()
             .map(|worktree| worktree.read(cx).abs_path())
+            .chain(cwd.map(Into::into).into_iter())
             .collect(),
         path_hyperlink_navigation,
         path_hyperlink_timeout,
@@ -1183,9 +1178,8 @@ fn possible_open_target(
 
 fn possible_open_target_from_fs(
     fs: Arc<dyn Fs>,
-    cwd: Option<PathBuf>,
     maybe_path: MaybePath,
-    mut sorted_worktree_roots: Vec<Arc<Path>>,
+    roots: Vec<Arc<Path>>,
     path_hyperlink_navigation: PathHyperlinkNavigation,
     path_hyperlink_timeout: Duration,
     cx: &mut Context<TerminalView>,
@@ -1194,7 +1188,7 @@ fn possible_open_target_from_fs(
         fs: Arc<dyn Fs>,
         home_dir: &PathBuf,
         roots: &Vec<Arc<Path>>,
-        maybe_path_variants: impl Iterator<Item = MaybePathVariant<'a>> + 'a,
+        maybe_path_variants: Box<dyn Iterator<Item = MaybePathVariant<'a>> + Send + 'a>,
         timed_out: impl Fn() -> bool,
     ) -> Option<OpenTarget> {
         for maybe_path_variant in maybe_path_variants {
@@ -1236,43 +1230,22 @@ fn possible_open_target_from_fs(
         let timed_out = || {
             Instant::now().saturating_duration_since(search_start_time) > path_hyperlink_timeout
         };
-
         let home_dir = paths::home_dir();
-        if let Some(cwd) = cwd {
-            sorted_worktree_roots.push(cwd.into());
+        let search_absolutized = |variants| {
+            search_absolutized_maybe_path_variants(Arc::clone(&fs), home_dir, &roots, variants, timed_out)
         };
 
         // TODO(davewa): Maybe keep a HashSet of variations checked so far to avoid repeating?
         // But, it might acutally be slower than checking a few repeats.
-        let open_target = if let Some(default) = search_absolutized_maybe_path_variants(
-            Arc::clone(&fs),
-            home_dir,
-            &sorted_worktree_roots,
-            maybe_path.default_maybe_path_variants(),
-            timed_out,
-        )
-        .await
-        {
+        let open_target = if let Some(default) = search_absolutized(Box::new(maybe_path.default_variants())).await {
             Some(default)
         } else if !timed_out() && path_hyperlink_navigation > PathHyperlinkNavigation::Default {
-            if let Some(advanced) = search_absolutized_maybe_path_variants(
-                Arc::clone(&fs),
-                home_dir,
-                &sorted_worktree_roots,
-                maybe_path.advanced_maybe_path_variants(),
-                timed_out,
-            )
+            if let Some(advanced) = search_absolutized(Box::new(maybe_path.advanced_variants()))
             .await
             {
                 Some(advanced)
             } else if !timed_out() && path_hyperlink_navigation > PathHyperlinkNavigation::Advanced {
-                search_absolutized_maybe_path_variants(
-                    Arc::clone(&fs),
-                    home_dir,
-                    &sorted_worktree_roots,
-                    maybe_path.exhaustive_maybe_path_variants(),
-                    timed_out,
-                )
+                search_absolutized(Box::new(maybe_path.exhaustive_variants()))
                 .await
             } else {
                 None

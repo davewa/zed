@@ -3,7 +3,7 @@ pub mod mappings;
 pub use alacritty_terminal;
 
 mod pty_info;
-pub mod terminal_hovered_maybe_path;
+pub mod terminal_maybe_path_like;
 pub mod terminal_settings;
 
 use alacritty_terminal::{
@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use settings::Settings;
 use smol::channel::{Receiver, Sender};
 use task::{HideStrategy, Shell, TaskId};
-use terminal_hovered_maybe_path::HoveredMaybePath;
+use terminal_maybe_path_like::MaybePathLike;
 use terminal_settings::{AlternateScroll, CursorShape, PathHyperlinkNavigation, TerminalSettings};
 use theme::{ActiveTheme, Theme};
 use util::{debug_panic, paths::home_dir, truncate_and_trailoff};
@@ -119,7 +119,7 @@ pub struct PathLikeTarget {
     /// File system path, absolute or relative, existing or not.
     /// Might have line and column number(s) attached as `file.rs:1:23`
     /// or `file.rs(1,23)`
-    pub maybe_path: HoveredMaybePath,
+    pub maybe_path_like: MaybePathLike,
     /// Current working directory of the terminal
     pub terminal_dir: Option<PathBuf>,
     /// The id of the hovered word
@@ -586,14 +586,18 @@ pub struct TerminalContent {
     pub cursor_char: char,
     pub terminal_bounds: TerminalBounds,
     pub last_hovered_word: Option<HoveredWord>,
-    last_hovered_maybe_path: Option<HoveredMaybePath>,
-    last_hovered_id: usize,
+    last_hovered_path_like_target: Option<PathLikeTarget>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct HoveredWord {
     pub word: String,
     pub word_match: RangeInclusive<AlacPoint>,
+}
+
+enum MaybeHyperlink {
+    Url(HoveredWord),
+    PathLike(Option<HoveredWord>, MaybePathLike),
 }
 
 impl Default for TerminalContent {
@@ -611,8 +615,7 @@ impl Default for TerminalContent {
             cursor_char: Default::default(),
             terminal_bounds: Default::default(),
             last_hovered_word: None,
-            last_hovered_maybe_path: None,
-            last_hovered_id: usize::MAX,
+            last_hovered_path_like_target: None,
         }
     }
 }
@@ -908,6 +911,20 @@ impl Terminal {
                 )
                 .grid_clamp(term, Boundary::Grid);
 
+                // TODO(davewa): In order for this to be valid, it must become
+                // `point_within_last_hovered_match_and_content_has_not_changed`
+                // Which can be achieved by clearing last_hovered_word when the
+                // content changes, e.g. make_content(), Which by the way would
+                // also fix some bugs with hyperlinks (we currently keep the link
+                // when content changes which results in random text turning into
+                // a hyperlink).
+                let point_within_last_hovered =
+                    if let Some(last_hovered_word) = &self.last_content.last_hovered_word {
+                        last_hovered_word.word_match.contains(&point)
+                    } else {
+                        false
+                    };
+
                 let link = term.grid().index(point).hyperlink();
                 let found_url = if link.is_some() {
                     let mut min_index = point;
@@ -937,105 +954,59 @@ impl Terminal {
                     let url = link.unwrap().uri().to_owned();
                     let url_match = min_index..=max_index;
 
-                    Some((url, url_match))
+                    Some(MaybeHyperlink::Url(HoveredWord {
+                        word: url,
+                        word_match: url_match,
+                    }))
                 } else if let Some(url_match) = regex_match_at(term, point, &mut self.url_regex) {
                     let url = term.bounds_to_string(*url_match.start(), *url_match.end());
-                    Some((url, url_match))
+                    Some(MaybeHyperlink::Url(HoveredWord {
+                        word: url,
+                        word_match: url_match,
+                    }))
                 } else {
                     None
                 };
 
-                let found_url_or_maybe_path =
-                    if self.path_hyperlink_navigation != PathHyperlinkNavigation::None {
-                        if let Some((url, url_match)) = found_url {
-                            // Treat "file://" URLs like file paths to ensure that
-                            // line numbers at the end of the path are handled correctly
-                            if let Some(file_url_as_path) = url.strip_prefix("file://") {
-                                let maybe_path =
-                                    HoveredMaybePath::from_file_url(file_url_as_path, &url_match);
-                                Some((Some((url, url_match)), Some(maybe_path)))
-                            } else {
-                                Some((Some((url, url_match)), None))
-                            }
+                let maybe_hyperlink = if self.path_hyperlink_navigation
+                    != PathHyperlinkNavigation::None
+                {
+                    if let Some(MaybeHyperlink::Url(hovered_url)) = found_url {
+                        // Treat "file://" URLs like file paths to ensure that
+                        // line numbers at the end of the path are handled correctly
+                        if let Some(file_url_as_path) = hovered_url.word.strip_prefix("file://") {
+                            let maybe_path_like = MaybePathLike::from_file_url(
+                                file_url_as_path,
+                                &hovered_url.word_match,
+                            );
+                            Some(MaybeHyperlink::PathLike(Some(hovered_url), maybe_path_like))
                         } else {
-                            regex_match_at(term, point, &mut self.word_regex).map(|word_match| {
-                                let maybe_path =
-                                    HoveredMaybePath::from_hovered_word_match(term, &word_match);
-                                (maybe_path.best_hueristic_path(term), Some(maybe_path))
-                            })
+                            Some(MaybeHyperlink::Url(hovered_url))
                         }
                     } else {
-                        None
-                    };
-
-                let point_within_last_hovered =
-                    if let Some(last_hovered_word) = &self.last_content.last_hovered_word {
-                        last_hovered_word.word_match.contains(&point)
-                    } else {
-                        false
-                    };
-
-                let Some((word_match, hovered_maybe_path)) = found_url_or_maybe_path else {
-                    if point_within_last_hovered {
-                        // Just leave things as they are...
-                        return;
+                        regex_match_at(term, point, &mut self.word_regex).map(|word_match| {
+                            let maybe_path_like =
+                                MaybePathLike::from_hovered_word_match(term, &word_match);
+                            MaybeHyperlink::PathLike(
+                                maybe_path_like.best_hueristic_hovered_word(term),
+                                maybe_path_like,
+                            )
+                        })
                     }
-
-                    self.last_content.last_hovered_word = None;
-                    self.last_content.last_hovered_maybe_path = None;
-                    self.last_content.last_hovered_id = self.next_link_id();
-                    cx.notify();
-                    cx.emit(Event::NewNavigationTarget(None));
-                    return;
-                };
-
-                let hovered_word =
-                    word_match.map(|(word, word_match)| HoveredWord { word, word_match });
-
-                if hovered_word.is_none() && hovered_maybe_path.is_none() {
-                    debug_panic!("Terminal: Expected hovered maybe path or hovered word");
-                    return;
-                }
-
-                let (hovered_maybe_path_id, new_navigation_target) = self.update_last_hovered(
-                    &hovered_word,
-                    &hovered_maybe_path,
-                    point_within_last_hovered,
-                    cx,
-                );
-
-                let target = if let Some(hovered_maybe_path) = hovered_maybe_path {
-                    if new_navigation_target {
-                        debug!("Terminal: New path like navigation target, {hovered_maybe_path}",);
-                    }
-
-                    let Some(hovered_maybe_path_id) = hovered_maybe_path_id else {
-                        debug_panic!(
-                            "Terminal: Expected hovered maybe path id for {hovered_maybe_path}"
-                        );
-                        return;
-                    };
-
-                    Some(MaybeNavigationTarget::PathLike(PathLikeTarget {
-                        maybe_path: hovered_maybe_path,
-                        terminal_dir: self.working_directory(),
-                        id: hovered_maybe_path_id,
-                    }))
-                } else if let Some(HoveredWord { word, .. }) = hovered_word {
-                    if new_navigation_target {
-                        debug!("Terminal: New url navigation target, url = {word}");
-                    }
-                    Some(MaybeNavigationTarget::Url(word))
                 } else {
-                    debug_panic!("Terminal: Expected hovered maybe path or hovered word");
-                    return;
+                    None
                 };
 
-                if let Some(target) = target {
+                if let Some((target, is_new_target)) = self.update_last_hovered(
+                    maybe_hyperlink,
+                    point_within_last_hovered,
+                    self.working_directory(),
+                    cx,
+                ) {
                     if *open {
                         debug!("Terminal: Opening target: {target:?}",);
                         cx.emit(Event::Open(target));
-                    } else if new_navigation_target {
+                    } else if is_new_target {
                         cx.emit(Event::NewNavigationTarget(Some(target)));
                     }
                 }
@@ -1045,90 +1016,125 @@ impl Terminal {
 
     fn update_last_hovered(
         &mut self,
-        hovered_word: &Option<HoveredWord>,
-        hovered_maybe_path: &Option<HoveredMaybePath>,
+        maybe_hyperlink: Option<MaybeHyperlink>,
         point_within_last_hovered: bool,
+        terminal_dir: Option<PathBuf>,
         cx: &mut Context<Self>,
-    ) -> (Option<usize>, bool) {
-        if hovered_maybe_path.is_some() {
-            if &self.last_content.last_hovered_maybe_path != hovered_maybe_path {
-                if &self.last_content.last_hovered_word != hovered_word
-                    && !point_within_last_hovered
-                {
-                    self.last_content.last_hovered_word = hovered_word.clone();
-                    cx.notify();
-                }
-                self.last_content.last_hovered_maybe_path = hovered_maybe_path.clone();
-                self.last_content.last_hovered_id = self.next_link_id();
-                (Some(self.last_content.last_hovered_id), true)
-            } else {
-                (Some(self.last_content.last_hovered_id), false)
-            }
-        } else if hovered_word.is_some() {
-            self.last_content.last_hovered_maybe_path = None;
-            if &self.last_content.last_hovered_word != hovered_word {
-                self.last_content.last_hovered_word = hovered_word.clone();
+    ) -> Option<(MaybeNavigationTarget, bool)> {
+        let Some(maybe_hyperlink) = maybe_hyperlink else {
+            // No MaybeHyperlink was found
+            if !point_within_last_hovered {
+                self.last_content.last_hovered_word = None;
                 cx.notify();
 
-                self.last_content.last_hovered_id = self.next_link_id();
-                (None, true)
-            } else {
-                (None, false)
+                self.last_content.last_hovered_path_like_target = None;
+                cx.emit(Event::NewNavigationTarget(None));
             }
-        } else {
-            debug_panic!("Terminal: Expected hovered maybe path or hovered word");
-            (None, false)
+            return None;
+        };
+
+        match maybe_hyperlink {
+            MaybeHyperlink::Url(hovered_word) => {
+                self.last_content.last_hovered_path_like_target = None;
+                if let Some(last_hovered_word) = self.last_content.last_hovered_word.as_ref() {
+                    if last_hovered_word == &hovered_word {
+                        return Some((MaybeNavigationTarget::Url(hovered_word.word), false));
+                    }
+                }
+
+                self.last_content.last_hovered_word = Some(hovered_word.clone());
+                cx.notify();
+
+                Some((MaybeNavigationTarget::Url(hovered_word.word), true))
+            }
+            MaybeHyperlink::PathLike(hovered_word, maybe_path_like) => {
+                if let Some(last_hovered_path_like_target) =
+                    self.last_content.last_hovered_path_like_target.as_ref()
+                {
+                    if last_hovered_path_like_target.maybe_path_like == maybe_path_like
+                        && last_hovered_path_like_target.terminal_dir == terminal_dir
+                    {
+                        return Some((
+                            MaybeNavigationTarget::PathLike(last_hovered_path_like_target.clone()),
+                            false,
+                        ));
+                    }
+                }
+
+                if self.last_content.last_hovered_word != hovered_word
+                    // This test prevents flickering of the link when moving
+                    // through whitespace that was previously identified as a path
+                    && !point_within_last_hovered
+                {
+                    self.last_content.last_hovered_word = hovered_word;
+                    cx.notify();
+                }
+
+                let path_like_target = PathLikeTarget {
+                    maybe_path_like,
+                    terminal_dir: self.working_directory(),
+                    id: self.next_link_id(),
+                };
+
+                self.last_content.last_hovered_path_like_target = Some(path_like_target.clone());
+
+                Some((MaybeNavigationTarget::PathLike(path_like_target), true))
+            }
         }
     }
 
-    pub fn confirm_maybe_path(
+    pub fn confirm_path_like_target(
         &mut self,
         path_like_target: &PathLikeTarget,
         confirmed_hyperlink_range: Option<Range<usize>>,
         cx: &mut Context<Self>,
     ) {
-        if self.last_content.last_hovered_id != path_like_target.id {
-            trace!("Terminal: Confirmed path hyperlink: Ignoring");
-            // We've moved on, this can be safely ignored
-            return;
-        }
-
-        let Some(last_hovered_maybe_path) = self.last_content.last_hovered_maybe_path.as_mut()
+        let Some(last_path_like_target) = self.last_content.last_hovered_path_like_target.as_ref()
         else {
-            debug_panic!(
-                "Expected: last_hovered_maybe_path should exist for valid confirmed maybe path"
-            );
+            trace!("Terminal: Confirmed path hyperlink: Ignoring");
             return;
         };
 
-        if let Some(confirmed_hyperlink_range) = confirmed_hyperlink_range {
-            if path_like_target.maybe_path != *last_hovered_maybe_path {
-                debug_panic!(
-                    "Expected: confirmed maybe_path to equal the last_hovered_word's maybe_path"
-                );
+        if last_path_like_target.id != path_like_target.id {
+            trace!("Terminal: Confirmed path hyperlink: Ignoring");
+            return;
+        } else if path_like_target.maybe_path_like != last_path_like_target.maybe_path_like {
+            debug_panic!("id's matched, but path_like_targets did not");
+            return;
+        }
+
+        let Some(confirmed_hyperlink_range) = confirmed_hyperlink_range else {
+            if self.last_content.last_hovered_word.is_none() {
+                trace!("Terminal: Confirmed path hyperlink: Noop");
+                return;
+            } else {
+                trace!("Terminal: Confirmed path hyperlink: Clearing");
+                self.last_content.last_hovered_word = None;
+                cx.notify();
                 return;
             }
-            trace!("Terminal: Confirmed path hyperlink: Updating");
-            let confirmed_hovered_word = Some(HoveredWord {
-                word: path_like_target
-                    .maybe_path
-                    .text_at(&confirmed_hyperlink_range)
-                    .to_string(),
-                word_match: path_like_target.maybe_path.match_from_text_range(
-                    &mut self.term.lock_unfair(),
-                    &confirmed_hyperlink_range,
-                ),
-            });
+        };
 
-            if self.last_content.last_hovered_word != confirmed_hovered_word {
-                self.last_content.last_hovered_word = confirmed_hovered_word;
-                cx.notify()
+        let confirmed_hovered_word = HoveredWord {
+            word: path_like_target
+                .maybe_path_like
+                .text_at(&confirmed_hyperlink_range)
+                .to_string(),
+            word_match: path_like_target
+                .maybe_path_like
+                .match_from_text_range(&mut self.term.lock_unfair(), &confirmed_hyperlink_range),
+        };
+
+        if let Some(last_hovered_word) = self.last_content.last_hovered_word.as_ref() {
+            if last_hovered_word == &confirmed_hovered_word {
+                trace!("Terminal: Confirmed path hyperlink: Noop");
+                return;
             }
-        } else {
-            trace!("Terminal: Confirmed path hyperlink: Clearing");
-            self.last_content.last_hovered_word = None;
-            cx.notify()
         }
+
+        trace!("Terminal: Confirmed path hyperlink: Updating");
+        self.last_content.last_hovered_word = Some(confirmed_hovered_word);
+        cx.notify()
     }
 
     fn next_link_id(&mut self) -> usize {
@@ -1456,8 +1462,7 @@ impl Terminal {
             cursor_char: term.grid()[content.cursor.point].c,
             terminal_bounds: last_content.terminal_bounds,
             last_hovered_word: last_content.last_hovered_word.clone(),
-            last_hovered_maybe_path: last_content.last_hovered_maybe_path.clone(),
-            last_hovered_id: last_content.last_hovered_id,
+            last_hovered_path_like_target: last_content.last_hovered_path_like_target.clone(),
         }
     }
 
@@ -2087,7 +2092,7 @@ pub fn get_color_at_index(index: usize, theme: &Theme) -> Hsla {
 ///
 /// Wikipedia gives a formula for calculating the index for a given color:
 ///
-/// ```
+/// ```zsh
 /// index = 16 + 36 × r + 6 × g + b (0 ≤ r, g, b ≤ 5)
 /// ```
 ///
@@ -2256,7 +2261,7 @@ mod tests {
         }
     }
 
-    fn re_test(re: &str, hay: &str, expected: Vec<&str>) {
+    pub(crate) fn re_test(re: &str, hay: &str, expected: Vec<&str>) {
         let results: Vec<_> = regex::Regex::new(re)
             .unwrap()
             .find_iter(hay)
@@ -2264,6 +2269,7 @@ mod tests {
             .collect();
         assert_eq!(results, expected);
     }
+
     #[test]
     fn test_url_regex() {
         re_test(
@@ -2300,18 +2306,6 @@ mod tests {
             crate::WORD_REGEX,
             "a Main.cs:20:5 b",
             vec!["a", "Main.cs:20:5", "b"],
-        );
-        // Some tools output "filename:line:col:message"
-        re_test(
-            crate::terminal_hovered_maybe_path::PREAPPROVED_PATH_HYPERLINK_REGEXES[0],
-            "Main.cs:20:5:Error desc",
-            vec!["Main.cs:20:5:"],
-        );
-        // Some tools output "filename(line,col):message"
-        re_test(
-            crate::terminal_hovered_maybe_path::PREAPPROVED_PATH_HYPERLINK_REGEXES[0],
-            "Main.cs(20,5):Error desc",
-            vec!["Main.cs(20,5):"],
         );
     }
 }

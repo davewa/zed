@@ -1,20 +1,24 @@
-// TODO(davewa): Bugs found while testing this feature:
-// - Navigation to line and column navigates to the wrong column when line
-// contains unicode. I suspect it is using char's instead of graphemes.
-// - [ ] When sending NewNaviagationTarget(None), we were not also clearning last_hovered_word, but we should.
-// - [ ] When holding Cmd, and the terminal output is scrolling, the link is highlighted, but after scrolling
-// away, it is still highlighting whatever new text is where the original link was.
-// - [ ] When holding Cmd, and the terminal contents are not scrolling, but a command is running that is adding
-// output off screen, the hovered link move down one line for each new line of content added off screen
-// - [ ] Tooltips don't render markdown tables correctly
-//
-
-// TODO(davewa) TASK LIST
-//
-// - [ ] Add Exhaustive expected to unit test
-// - [ ] Add a ton more targeted unit test cases
-// - [ ] Test file:// Urls
-// - [ ] Test non-file:// Urls
+//! Hueristics which define variations of a [MaybePathLike] from [terminal]
+//!
+//! # TODOs
+//! ## [Cmd+click to linkify file in terminal doesn't work when there are whitespace or certain separators in the filename](https://github.com/zed-industries/zed/issues/12338)
+//!
+//! - [ ] Add Exhaustive expected to unit test
+//! - [ ] Add many more tests
+//!     - [ ] `file://` Urls
+//!     - [ ] Lots of edge cases
+//!
+//! ### Issues found while testing this feature
+//! - [ ] Navigation to line and column navigates to the wrong column when line
+//! contains unicode. I suspect it is using char's instead of graphemes.
+//! - [x] When sending NewNaviagationTarget(None), we were not also clearning last_hovered_word, but we should.
+//! - [ ] When holding Cmd, and the terminal output is scrolling, the link is highlighted, but after scrolling
+//! away, it is still hyperlinking whatever random text is where the original link was.
+//! - [ ] When holding Cmd, and the terminal contents are not scrolling, but a command is running that is adding
+//! output off screen, the hovered link move down one line for each new line of content added off screen, hyperlinking
+//! whatever random text is there.
+//! - [ ] Zed's tooltips don't render markdown tables correctly
+//! - [ ] On Windows, PS terminal doesn't hyperlink any paths
 
 use regex::Regex;
 use std::{
@@ -25,9 +29,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
-use terminal::terminal_hovered_maybe_path::{
+use terminal::terminal_maybe_path_like::{
     longest_surrounding_symbols_match, path_regex_match, preapproved_path_hyperlink_regexes,
-    HoveredMaybePath, COMMON_PATH_SURROUNDING_SYMBOLS, MAIN_SEPARATORS,
+    MaybePathLike, COMMON_PATH_SURROUNDING_SYMBOLS, MAIN_SEPARATORS,
 };
 #[cfg(doc)]
 use terminal::terminal_settings::PathHyperlinkNavigation;
@@ -39,21 +43,21 @@ fn word_regex() -> &'static Regex {
     &WORD_REGEX
 }
 
-/// The original matched maybe path from hover or Cmd-click in the terminal
+/// The `line` and the `word_range` from hovered or Cmd-clicked [MaybePathLike] from [terminal]
 #[derive(Clone, Debug)]
 pub struct MaybePath {
     line: String,
-    hovered_word_range: Range<usize>,
+    word_range: Range<usize>,
     path_hyperlink_regexes: Arc<Vec<Regex>>,
 }
 
 impl Display for MaybePath {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.hovered_word_range.start != 0 || self.hovered_word_range.end != self.line.len() {
+        if self.word_range.start != 0 || self.word_range.end != self.line.len() {
             formatter.write_fmt(format_args!(
                 "{:?} «{}»",
                 self,
-                &self.line[self.hovered_word_range.clone()]
+                &self.line[self.word_range.clone()]
             ))
         } else {
             formatter.write_fmt(format_args!("{:?}", self))
@@ -62,22 +66,23 @@ impl Display for MaybePath {
 }
 
 impl MaybePath {
-    pub(super) fn from_hovered_maybe_path(
-        hovered_maybe_path: &HoveredMaybePath,
-        path_regexes: Arc<Vec<Regex>>,
+    pub(super) fn from_maybe_path_like(
+        maybe_path_like: &MaybePathLike,
+        path_hyperlink_regexes: Arc<Vec<Regex>>,
     ) -> Self {
+        let (line, word_range) = maybe_path_like.to_line_and_word_range();
         Self {
-            line: hovered_maybe_path.line.clone(),
-            hovered_word_range: hovered_maybe_path.hovered_word_range.clone(),
-            path_hyperlink_regexes: path_regexes,
+            line,
+            word_range,
+            path_hyperlink_regexes,
         }
     }
 
     #[cfg(test)]
-    fn new(line: &str, hovered_word_range: Range<usize>, path_regexes: Arc<Vec<Regex>>) -> Self {
+    fn new(line: &str, word_range: Range<usize>, path_regexes: Arc<Vec<Regex>>) -> Self {
         Self {
             line: line.to_string(),
-            hovered_word_range,
+            word_range,
             path_hyperlink_regexes: path_regexes,
         }
     }
@@ -90,36 +95,37 @@ impl MaybePath {
     ///
     /// On the main thread, these will be checked against worktrees only.
     ///
-    /// *Local Only*--If no worktree match found they will also be checked for existence in the workspace's real file
-    /// system on the background thread.
-    pub fn default_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
-        [MaybePathVariant::new(
-            &self.line,
-            self.hovered_word_range.clone(),
-        )]
-        .into_iter()
-        .chain(iter::once_with(|| self.longest_surrounding_symbols_variants()).flatten())
-        .chain(
-            iter::once_with(|| {
-                self.path_regex_variants(preapproved_path_hyperlink_regexes())
-                    .into_iter()
-            })
-            .flatten(),
-        )
-        .chain(
-            iter::once_with(|| {
-                self.line_ends_in_a_path_maybe_path_variants(0, Self::MAX_MAIN_THREAD_PREFIX_WORDS)
+    /// *Local Only*--If no worktree match is found they will also be checked
+    /// for existence in the workspace's real file system on the background thread.
+    pub fn default_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
+        [MaybePathVariant::new(&self.line, self.word_range.clone())]
+            .into_iter()
+            .chain(iter::once_with(|| self.longest_surrounding_symbols_variants()).flatten())
+            .chain(
+                iter::once_with(|| {
+                    self.path_regex_variants(preapproved_path_hyperlink_regexes())
+                        .into_iter()
+                })
+                .flatten(),
+            )
+            .chain(
+                iter::once_with(|| {
+                    self.line_ends_in_a_path_maybe_path_variants(
+                        0,
+                        Self::MAX_MAIN_THREAD_PREFIX_WORDS,
+                    )
                     .collect::<Vec<_>>()
                     .into_iter()
-                    // One prefix stripped is the most likely path
+                    // One prefix stripped is the most likely path, start there
                     .rev()
-            })
-            .flatten(),
-        )
+                })
+                .flatten(),
+            )
     }
 
     /// All [PathHyperlinkNavigation::Advanced] maybe path variants.
-    pub fn advanced_maybe_path_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
+    pub fn advanced_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
+        // TODO(davewa): Some way to assert we are not called on the main thread...
         self.path_regex_variants(&self.path_hyperlink_regexes)
             .into_iter()
             .chain(self.line_ends_in_a_path_maybe_path_variants(
@@ -128,14 +134,38 @@ impl MaybePath {
             ))
     }
 
+    /// All [PathHyperlinkNavigation::Exhaustive] maybe path variants that start on the hovered word or a
+    /// word before it and end the hovered word or a word after it.
+    pub fn exhaustive_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
+        // TODO(davewa): Some way to assert we are not called on the main thread...
+        let starts = word_regex()
+            .find_iter(&self.line[..self.word_range.end])
+            .map(|match_| match_.start());
+
+        starts
+            .into_iter()
+            .map(move |start| {
+                word_regex()
+                    .find_iter(&self.line[self.word_range.start..])
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(|match_| match_.end())
+                    .map(move |end| {
+                        MaybePathVariant::new(&self.line, start..self.word_range.start + end)
+                    })
+            })
+            .flatten()
+    }
+
     /// [PathHyperlinkNavigation::Default] variant for the longest surrounding symbols match, if any
     fn longest_surrounding_symbols_variants(
         &self,
     ) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
         if let Some(surrounding_range) =
-            longest_surrounding_symbols_match(&self.line, &self.hovered_word_range)
+            longest_surrounding_symbols_match(&self.line, &self.word_range)
         {
-            if surrounding_range != self.hovered_word_range {
+            if surrounding_range != self.word_range {
                 return vec![MaybePathVariant::new(
                     &self.line,
                     surrounding_range.start + 1..surrounding_range.end - 1,
@@ -148,7 +178,7 @@ impl MaybePath {
     }
 
     fn path_regex_variants(&self, path_regexes: &Vec<Regex>) -> Option<MaybePathVariant<'_>> {
-        if let Some(path) = path_regex_match(&self.line, &self.hovered_word_range, path_regexes) {
+        if let Some(path) = path_regex_match(&self.line, &self.word_range, path_regexes) {
             Some(MaybePathVariant::new(&self.line, path.clone()))
         } else {
             None
@@ -164,39 +194,10 @@ impl MaybePath {
     ) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
         // TODO(davewa): Some way to assert we are not called on the main thread...
         word_regex()
-            .find_iter(&self.line[..self.hovered_word_range.end])
+            .find_iter(&self.line[..self.word_range.end])
             .skip(start_prefix_words)
             .take(max_prefix_words)
             .map(|match_| MaybePathVariant::new(&self.line, match_.start()..self.line.len()))
-    }
-
-    /// All [PathHyperlinkNavigation::Exhaustive] maybe path variants that start on the hovered word or a
-    /// word before it and end the hovered word or a word after it.
-    pub fn exhaustive_maybe_path_variants(
-        &self,
-    ) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
-        // TODO(davewa): Some way to assert we are not called on the main thread...
-        let starts = word_regex()
-            .find_iter(&self.line[..self.hovered_word_range.end])
-            .map(|match_| match_.start());
-
-        starts
-            .into_iter()
-            .map(move |start| {
-                word_regex()
-                    .find_iter(&self.line[self.hovered_word_range.start..])
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .map(|match_| match_.end())
-                    .map(move |end| {
-                        MaybePathVariant::new(
-                            &self.line,
-                            start..self.hovered_word_range.start + end,
-                        )
-                    })
-            })
-            .flatten()
     }
 }
 
@@ -250,31 +251,11 @@ impl<'a> MaybePathWithPosition<'a> {
             None => self.range.clone(),
         }
     }
-
-    // TODO(davewa): Add `line: Cow<'a, str> to RowColumn, and git the originally matched string
-    pub fn to_string(&self, path_to_string: impl Fn(&Path) -> String) -> String {
-        let path_string = path_to_string(&self.path);
-        if let Some(RowColumn { row, column, .. }) = self.position.as_ref() {
-            if let Some(column) = column {
-                format!("{path_string}:{row}:{column}")
-            } else {
-                format!("{path_string}:{row}")
-            }
-        } else {
-            path_string
-        }
-    }
 }
 
 /// A contiguous sequence of words which includes the hovered word of a [MaybePath]
 ///
-/// Yields all substring variations of the contained path:
-/// - With and without stripped common surrounding symbols: `"` `'` `(` `)` `[` `]`
-/// - With and without line and column suffix: `:4:2` or `(4,2)`
-/// - With and without git diff prefixes: `a/` or `b/`
-///
-/// # Notes
-/// - The original path is always the first variation
+/// - The original maybe path is always the first variation
 /// - Surrounding symbols (if any) are stripped before processing the other variations
 /// - Git diff prefixes are only processed if surrounding symbols are not present
 /// - Row and column are never processed on a git diff variation
@@ -292,15 +273,17 @@ impl<'a> MaybePathWithPosition<'a> {
 pub struct MaybePathVariant<'a> {
     line: &'a str,
     variations: Vec<Range<usize>>,
+    /// Always exactly 0 or 1 positioned variation
     positioned_variation: Option<(Range<usize>, RowColumn)>,
-    /// `a/~/foo.rs` is a valid path on it's own. If we parsed a git diff path like `+++ a/~/foo.rs`, never absolutize it.
+    /// `a/~/foo.rs` is a valid path on it's own. If we parsed a git diff path like `+++ a/~/foo.rs` into a
+    /// `~/foo.rs` variation, never absolutize it.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     absolutize_home_dir: bool,
 }
 
 impl<'a> MaybePathVariant<'a> {
     pub fn new(line: &'a str, mut path: Range<usize>) -> Self {
-        // We add variations from longest to shortest
+        // We add variations from most common to least common
         let mut maybe_path = &line[path.clone()];
         let mut positioned_variation = None::<(Range<usize>, RowColumn)>;
         let mut common_symbols_stripped = false;
@@ -311,15 +294,17 @@ impl<'a> MaybePathVariant<'a> {
 
         // For all of these, path must be at least 2 characters
         if maybe_path.len() > 2 {
+            let has_common_symbols = || {
+                for (start, end) in COMMON_PATH_SURROUNDING_SYMBOLS {
+                    if maybe_path.starts_with(*start) && maybe_path.ends_with(*end) {
+                        return true;
+                    }
+                }
+                false
+            };
+
             // Strip common surrounding symbols, if any
-            if 1 == COMMON_PATH_SURROUNDING_SYMBOLS
-                .iter()
-                .skip_while(|(start, end)| {
-                    !maybe_path.starts_with(*start) || !maybe_path.ends_with(*end)
-                })
-                .take(1)
-                .count()
-            {
+            if has_common_symbols() {
                 common_symbols_stripped = true;
                 path = path.start + 1..path.end - 1;
                 // Insert at the front, since stripped varation is more likely to be path
@@ -369,53 +354,60 @@ impl<'a> MaybePathVariant<'a> {
         }
     }
 
+    /// Yields all relative substring variations of the contained path:
+    /// - With and without stripped common surrounding symbols: `"` `'` `(` `)` `[` `]`
+    /// - With and without line and column suffix: `:4:2` or `(4,2)`
+    /// - With and without git diff prefixes: `a/` or `b/`
+    ///
+    /// Iff prefix_to_strip is provided, each variation will additionally be stripped of that
+    /// prefix (if it is present).
     pub fn relative_variations(
         &self,
         prefix_to_strip: Option<&Path>,
     ) -> Vec<MaybePathWithPosition<'a>> {
         let mut variations = Vec::new();
 
+        let mut push_relative = |range: &Range<usize>, position: Option<RowColumn>| {
+            let maybe_path = Path::new(&self.line[range.clone()]);
+            if maybe_path.is_relative() {
+                variations.push(MaybePathWithPosition::new(
+                    range,
+                    Cow::Borrowed(prefix_to_strip.map_or(maybe_path, |prefix_to_strip| {
+                        maybe_path
+                            .strip_prefix(prefix_to_strip)
+                            .unwrap_or(maybe_path)
+                    })),
+                    position,
+                ))
+            }
+        };
+
         // The positioned variation, if any, is the most likely path
         if let Some((range, position)) = &self.positioned_variation {
-            variations.push((range, Some(position)));
+            push_relative(range, Some(position.clone()));
         }
 
         for range in &self.variations {
-            variations.push((range, None));
+            push_relative(range, None);
         }
 
         variations
-            .into_iter()
-            .filter_map(|(range, position)| {
-                let maybe_path = Path::new(&self.line[range.clone()]);
-                maybe_path.is_relative().then(|| {
-                    MaybePathWithPosition::new(
-                        range,
-                        Cow::Borrowed(prefix_to_strip.map_or(maybe_path, |prefix_to_strip| {
-                            maybe_path
-                                .strip_prefix(prefix_to_strip)
-                                .unwrap_or(maybe_path)
-                        })),
-                        position.cloned(),
-                    )
-                })
-            })
-            .collect()
     }
 
     fn absolutize<'b>(
         &self,
         roots: impl Iterator<Item = &'b Path> + Clone + 'b,
         home_dir: &PathBuf,
-        variation_range: &Range<usize>,
+        range: &Range<usize>,
         position: Option<RowColumn>,
     ) -> Vec<MaybePathWithPosition<'a>> {
-        let variation_path = Path::new(&self.line[variation_range.clone()]);
         let mut absolutized = Vec::new();
-        if variation_path.is_absolute() {
+
+        let path = Path::new(&self.line[range.clone()]);
+        if path.is_absolute() {
             absolutized.push(MaybePathWithPosition::new(
-                variation_range,
-                Cow::Borrowed(variation_path),
+                range,
+                Cow::Borrowed(path),
                 position,
             ));
             return absolutized;
@@ -423,19 +415,13 @@ impl<'a> MaybePathVariant<'a> {
 
         for root in roots {
             absolutized.push(MaybePathWithPosition::new(
-                variation_range,
-                Cow::Owned(root.join(variation_path)),
+                range,
+                Cow::Owned(root.join(path)),
                 position,
             ));
         }
 
-        self.absolutize_home_dir(
-            variation_path,
-            home_dir,
-            variation_range,
-            position,
-            &mut absolutized,
-        );
+        self.absolutize_home_dir(path, home_dir, range, position, &mut absolutized);
 
         absolutized
     }
@@ -443,27 +429,28 @@ impl<'a> MaybePathVariant<'a> {
     #[cfg(target_os = "windows")]
     fn absolutize_home_dir(
         &self,
-        _variation_path: &Path,
+        _path: &Path,
         _home_dir: &PathBuf,
-        _variation_range: &Range<usize>,
+        _range: &Range<usize>,
         _position: Option<RowColumn>,
         _absolutized: &mut Vec<MaybePathWithPosition<'a>>,
     ) -> () {
     }
 
+    /// Yields all absolutized variations of all relative and absolute variations
     #[cfg(not(target_os = "windows"))]
     fn absolutize_home_dir(
         &self,
-        variation_path: &Path,
+        path: &Path,
         home_dir: &PathBuf,
-        variation_range: &Range<usize>,
+        range: &Range<usize>,
         position: Option<RowColumn>,
         absolutized: &mut Vec<MaybePathWithPosition<'a>>,
     ) -> () {
         if self.absolutize_home_dir {
-            if let Ok(tildeless_path) = variation_path.strip_prefix("~") {
+            if let Ok(tildeless_path) = path.strip_prefix("~") {
                 absolutized.push(MaybePathWithPosition::new(
-                    variation_range,
+                    range,
                     Cow::Owned(home_dir.join(tildeless_path)),
                     position,
                 ));
@@ -477,22 +464,18 @@ impl<'a> MaybePathVariant<'a> {
         home_dir: &PathBuf,
     ) -> Vec<MaybePathWithPosition<'a>> {
         let mut variations = Vec::new();
-        for variation_range in &self.variations {
-            variations.append(&mut self.absolutize(
-                roots.clone(),
-                home_dir,
-                &variation_range,
-                None,
-            ));
+
+        let mut push_absolute = |range: &Range<usize>, position: Option<RowColumn>| {
+            variations.append(&mut self.absolutize(roots.clone(), home_dir, range, position));
+        };
+
+        // The positioned variation, if any, is the most likely path
+        if let Some((range, position)) = &self.positioned_variation {
+            push_absolute(range, Some(*position));
         }
 
-        if let Some((variation_range, position)) = &self.positioned_variation {
-            variations.append(&mut self.absolutize(
-                roots.clone(),
-                home_dir,
-                variation_range,
-                Some(*position),
-            ));
+        for range in &self.variations {
+            push_absolute(range, None);
         }
 
         variations
@@ -742,18 +725,18 @@ mod tests {
                         [ rel!("+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         ],
                     absolutized![
+                        [ abs!("/root 2/b/path") ], 4, 2;
+                        [ abs!("/Some/cool/place/b/path") ], 4, 2;
                         [ abs!("/root 2/b/path:4:2") ];
                         [ abs!("/Some/cool/place/b/path:4:2") ];
                         [ abs!("/root 2/path:4:2") ];
                         [ abs!("/Some/cool/place/path:4:2") ];
-                        [ abs!("/root 2/b/path") ], 4, 2;
-                        [ abs!("/Some/cool/place/b/path") ], 4, 2;
+                        [ abs!("/root 2/b/path") ], 4;
+                        [ abs!("/Some/cool/place/b/path") ], 4;
                         [ abs!("/root 2/b/path:4") ];
                         [ abs!("/Some/cool/place/b/path:4") ];
                         [ abs!("/root 2/path:4") ];
                         [ abs!("/Some/cool/place/path:4") ];
-                        [ abs!("/root 2/b/path") ], 4;
-                        [ abs!("/Some/cool/place/b/path") ], 4;
                         [ abs!("/root 2/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         [ abs!("/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         [ abs!("/root 2/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
@@ -927,7 +910,7 @@ mod tests {
                 Arc::clone(&fs),
                 worktree_root,
                 &maybe_path,
-                || maybe_path.default_maybe_path_variants(),
+                || maybe_path.default_variants(),
                 &expected,
             )
             .await
@@ -943,7 +926,7 @@ mod tests {
                 Arc::clone(&fs),
                 worktree_root,
                 &maybe_path,
-                || maybe_path.advanced_maybe_path_variants(),
+                || maybe_path.advanced_variants(),
                 &expected,
             )
             .await
