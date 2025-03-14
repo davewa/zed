@@ -320,9 +320,23 @@ impl Display for TerminalError {
 const DEFAULT_SCROLL_HISTORY_LINES: usize = 10_000;
 const MAX_SCROLL_HISTORY_LINES: usize = 100_000;
 const URL_REGEX: &str = r#"(ipfs:|ipns:|magnet:|mailto:|gemini://|gopher://|https://|http://|news:|file://|git://|ssh:|ftp://)[^\u{0000}-\u{001F}\u{007F}-\u{009F}<>"\s{-}\^⟨⟩`]+"#;
-/// Paths can contain almost any unicode characters. Here we use whitespace to separate paths
-/// into "words" so that the common case of paths without spaces can be processed more efficiently.
+
+/// Paths can contain almost any unicode characters on Windows with a few exceptions.
+/// See <https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file#naming-conventions>
+/// We use the invalid filename characters plus space, minus the path separators and
+/// the row column suffix delimiters to define "words".
 /// See [WORD_REGEX]
+#[cfg(target_os = "windows")]
+#[macro_export]
+macro_rules! word_regex {
+    () => {
+        r#"[^\s<>"|?*]+"#
+    };
+}
+
+/// Paths can contain almost any unicode characters on linux. We use whitespace to define "words".
+/// See [WORD_REGEX]
+#[cfg(not(target_os = "windows"))]
 #[macro_export]
 macro_rules! word_regex {
     () => {
@@ -2261,7 +2275,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn re_test(re: &str, hay: &str, expected: Vec<&str>) {
+    fn re_test(re: &str, hay: &str, expected: Vec<&str>) {
         let results: Vec<_> = regex::Regex::new(re)
             .unwrap()
             .find_iter(hay)
@@ -2269,7 +2283,7 @@ mod tests {
             .collect();
         assert_eq!(results, expected);
     }
-
+    
     #[test]
     fn test_url_regex() {
         re_test(
@@ -2278,6 +2292,16 @@ mod tests {
             vec!["http://example.com", "mailto:bob@example.com"],
         );
     }
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_word_regex() {
+        re_test(
+            crate::WORD_REGEX,
+            "hello, world! \"What\" is this?",
+            vec!["hello,", "world!", "What", "is", "this"],
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn test_word_regex() {
         re_test(

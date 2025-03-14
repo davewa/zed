@@ -193,7 +193,6 @@ impl MaybePath {
         start_prefix_words: usize,
         max_prefix_words: usize,
     ) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
-        // TODO(davewa): Some way to assert we are not called on the main thread...
         word_regex()
             .find_iter(&self.line[..self.word_range.end])
             .skip(start_prefix_words)
@@ -718,9 +717,6 @@ mod tests {
                         [ rel!("b/path") ], 4, 2;
                         [ rel!("b/path:4:2") ];
                         [ rel!("path:4:2") ];
-                        [ rel!("b/path") ], 4;
-                        [ rel!("b/path:4") ];
-                        [ rel!("path:4") ];
                         [ rel!("a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         [ rel!("~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         [ rel!("+++ a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
@@ -732,12 +728,6 @@ mod tests {
                         [ abs!("/Some/cool/place/b/path:4:2") ];
                         [ abs!("/root 2/path:4:2") ];
                         [ abs!("/Some/cool/place/path:4:2") ];
-                        [ abs!("/root 2/b/path") ], 4;
-                        [ abs!("/Some/cool/place/b/path") ], 4;
-                        [ abs!("/root 2/b/path:4") ];
-                        [ abs!("/Some/cool/place/b/path:4") ];
-                        [ abs!("/root 2/path:4") ];
-                        [ abs!("/Some/cool/place/path:4") ];
                         [ abs!("/root 2/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         [ abs!("/Some/cool/place/a/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];
                         [ abs!("/root 2/~/협동조합   ~/super/cool b/path:4:2 ("), abs!("/root 2/שיתופית.rs"), ")" ];

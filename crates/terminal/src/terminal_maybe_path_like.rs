@@ -36,8 +36,6 @@
 //! # TODOs
 //! ## [Cmd+click to linkify file in terminal doesn't work when there are whitespace or certain separators in the filename](https://github.com/zed-industries/zed/issues/12338)
 //!
-//! - [ ] PREAPPROVED_PATH_HYPERLINK_REGEXES should probably find a `util::paths::ROW_COL_CAPTURE_REGEX` followed
-//! by a `:`, or whatever else usualy follows a line & column (need to check MSVC output).
 //! - [ ] Clear `last_hovered_*` when terminal content changes. See comment at `point_within_last_hovered`
 //! - [ ] best_heuristic_hovered_word currently causes false positives to flicker e.g., they get linkified
 //! immediately, then get clear once we confirm they are not paths. Maybe this is fine? But I think we
@@ -50,7 +48,7 @@ use crate::{HoveredWord, ZedListener};
 use alacritty_terminal::{index::Boundary, term::search::Match, Term};
 use log::debug;
 use regex::Regex;
-use std::{fmt::Display, ops::Range, path::Path, sync::LazyLock};
+use std::{fmt::Display, ops::Range, sync::LazyLock};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// These are valid in paths and are not matched by [WORD_REGEX].
@@ -97,6 +95,34 @@ pub fn longest_surrounding_symbols_match(
     longest
 }
 
+#[cfg(target_os = "windows")]
+macro_rules! path_chars {
+    () => {
+        r#"[^<>"|?*]+?"#
+    };
+}
+
+#[cfg(target_os = "windows")]
+macro_rules! path_chars_msvc {
+    () => {
+        r#"[^<>"|?*\(]+"#
+    };
+}
+
+#[cfg(not(target_os = "windows"))]
+macro_rules! path_chars {
+    () => {
+        r#".+?"#
+    };
+}
+
+#[cfg(not(target_os = "windows"))]
+macro_rules! path_chars_msvc {
+    () => {
+        r#"[^\(]+"#
+    };
+}
+
 // If there is a word on the line that contains a colon that word up to (but not including)
 // its last colon, it is treated as a maybe path.
 // e.g., Ruby (see https://github.com/zed-industries/zed/issues/25086)
@@ -105,9 +131,29 @@ pub fn longest_surrounding_symbols_match(
 // and after the colon for digit-ness so that in case the line and column suffix is in
 // MSVC-style (<line>,<column>):message or some other style. Line and column suffixes are
 // processed later in termainl_view.
-const ROW_COLUMN_DESCRIPTION_REGEX: &str = concat!("(?<path>", crate::word_regex!(), "):");
+const PATH_ROW_COLUMN_DESC_REGEX: &str = concat!(
+    r#"(?x)
+    (?<path>
+    (?:"#,
+    path_chars_msvc!(),
+    r#")(?:
+        \((?:\d+)[,:](?:\d+)\) # path(row,column), path(row:column)
+        |
+        \((?:\d+)\)            # path(row)
+    )
+    |
+    (?:"#,
+    path_chars!(),
+    r#")(?:
+        \:+(?:\d+)\:(?:\d+)    # path:row:column
+        |
+        \:+(?:\d+)             # path:row
+    ))
+    :(?<desc>[^\d].+)$         # desc
+    "#
+);
 
-const PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 1] = [ROW_COLUMN_DESCRIPTION_REGEX];
+const PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 1] = [PATH_ROW_COLUMN_DESC_REGEX];
 
 /// Returns a list of the preapproved path hyperlink regexes
 pub fn preapproved_path_hyperlink_regexes() -> &'static Vec<Regex> {
@@ -244,7 +290,7 @@ impl MaybePathLike {
                 word: self.text_at(&stripped_range).to_string(),
                 word_match: self.match_from_text_range(term, &stripped_range),
             })
-        } else if self.looks_like_a_path_match(&self.word_range) {
+        } else if self.looks_like_a_path_match() {
             debug!(
                 "Terminal: path heuristic 'looks like a path' match: {:?}",
                 &self.line[self.word_range.clone()]
@@ -253,8 +299,11 @@ impl MaybePathLike {
                 word: self.line[self.word_range.clone()].to_string(),
                 word_match: self.word_match.clone(),
             })
-        } else if let Some(path_range) = path_regex_match(&self.line, &self.word_range, &Vec::new())
-        {
+        } else if let Some(path_range) = path_regex_match(
+            &self.line[self.word_range.clone()],
+            &(0..self.word_range.len()),
+            &preapproved_path_hyperlink_regexes(),
+        ) {
             debug!(
                 "Terminal: path heuristic 'path regex' match: {:?}",
                 self.text_at(&path_range)
@@ -268,11 +317,23 @@ impl MaybePathLike {
         }
     }
 
-    fn looks_like_a_path_match(&self, word_range: &Range<usize>) -> bool {
-        let word = self.text_at(word_range);
-        Path::new(word).extension().is_some()
-            || word.starts_with('.')
-            || word.contains(MAIN_SEPARATORS)
+    fn looks_like_a_path_match(&self) -> bool {
+        static LOOKS_LIKE_A_PATH_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r#"(?x)
+                    ^\.            # does not start with a period
+                    |
+                    ^[a-zA-Z]:     # starts with a window drive
+                    |
+                    [/\\]          # contains a path separator
+                    |
+                    \.[^\s]{1,5}$  # ends in an extension
+                    "#,
+            )
+            .unwrap()
+        });
+
+        LOOKS_LIKE_A_PATH_REGEX.is_match(&self.line[self.word_range.clone()])
     }
 
     pub(super) fn match_from_text_range(
@@ -318,23 +379,94 @@ impl MaybePathLike {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tests::re_test;
+    use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 
+    use super::*;
+
+    fn re_test_row_col_desc(hay: &str, expected: Option<(&str, &str)>) {
+        let regex = regex::Regex::new(PATH_ROW_COLUMN_DESC_REGEX).unwrap();
+        if let Some((_, [path, desc])) = regex.captures_iter(hay).map(|c| c.extract()).next() {
+            let Some((expected_path, expected_desc)) = expected else {
+                assert!(
+                    false,
+                    "Expected no path = \"{}\" and desc = \"{}\" for: \"{}\"",
+                    path, desc, hay
+                );
+                return;
+            };
+            assert_eq!(path, expected_path);
+            assert_eq!(desc, expected_desc);
+        } else if let Some((expected_path, expected_desc)) = expected {
+            assert!(
+                false,
+                "Expected path = \"{}\" and desc = \"{}\" for: \"{}\"",
+                hay, expected_path, expected_desc
+            );
+        };
+    }
+
+    // Ruby (see https://github.com/zed-industries/zed/issues/25086)
     #[test]
     fn test_row_column_description_regex_25086() {
-        // Some tools output "filename:line:col:message"
-        // - Ruby (https://github.com/zed-industries/zed/issues/25086)
-        re_test(
-            ROW_COLUMN_DESCRIPTION_REGEX,
+        re_test_row_col_desc(
             "Main.cs:20:5:Error desc",
-            vec!["Main.cs:20:5:"],
+            Some(("Main.cs:20:5", "Error desc")),
         );
-        // Some tools output "filename(line,col):message"
-        re_test(
-            ROW_COLUMN_DESCRIPTION_REGEX,
+        re_test_row_col_desc(
             "Main.cs(20,5):Error desc",
-            vec!["Main.cs(20,5):"],
+            Some(("Main.cs(20,5)", "Error desc")),
+        );
+        re_test_row_col_desc(
+            "Ma:n.cs:20:5:Error desc",
+            Some(("Ma:n.cs:20:5", "Error desc")),
+        );
+        re_test_row_col_desc(
+            "Ma(n.cs(20,5):Error desc",
+            Some(("n.cs(20,5)", "Error desc")),
+        );
+        re_test_row_col_desc("Main.cs:20:5 Error desc", None);
+        re_test_row_col_desc("Main.cs(20,5) Error desc", None);
+    }
+
+    #[test]
+    fn test_looks_like_a_path() {
+        let match_range: Match = Match::new(
+            AlacPoint::new(Line(0), Column(0)),
+            AlacPoint::new(Line(0), Column(0)),
+        );
+
+        macro_rules! test_looks_like_a_path {
+            ($prefix:literal, $word:literal, $suffix:literal, $looks_like:ident) => { {
+                let maybe_path_like = MaybePathLike::from_line_and_word_range(
+                    concat!($prefix, $word, $suffix).to_string(),
+                    $prefix.len()..$prefix.len() + $word.len(),
+                    &match_range,
+                );
+
+                assert_eq!($looks_like, maybe_path_like.looks_like_a_path_match(),
+                    "Expected '{}' for \"{}\"", $looks_like, concat!($prefix, $word, $suffix));
+            } };
+
+            () => {};
+
+            ($looks_like:ident @ $([ $prefix:literal, $word:literal, $suffix:literal ] $(,)?)+) => {
+                $(test_looks_like_a_path!($prefix, $word, $suffix, $looks_like);)+
+            };
+        }
+
+        test_looks_like_a_path!(true @
+            ["Wow, so ", "C:ool!", ", dude."],
+            ["Wow, so ", "C.ool!", ", dude."],
+            ["Wow, so ", ".zprofyle", ", dude."],
+            ["Wow, so ", "o\\ol!", ", dude."],
+            ["Wow, so ", "o/ol!", ", dude."],
+        );
+
+        test_looks_like_a_path!(false @
+            ["Wow, so not ", "Cool!", " Oh, well"],
+            ["Wow, so not ", "Cool.", " Oh, well"],
+            ["Wow, so not ", "Cool!(3,4)", " Oh, well"],
+            ["Wow, so not ", "Co.ooooooool!", " Oh, well"],
         );
     }
 }
