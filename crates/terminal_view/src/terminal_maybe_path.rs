@@ -19,6 +19,7 @@
 //! whatever random text is there.
 //! - [ ] Zed's tooltips don't render markdown tables correctly
 //! - [ ] On Windows, PS terminal doesn't hyperlink any paths
+//! - [ ] Wiggling the mouse over the terminal window (with no keys pressed) consumues 1 full cpu core. Seems sub-optimal.
 
 use regex::Regex;
 use std::{
