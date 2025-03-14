@@ -20,6 +20,8 @@
 //! - [ ] Zed's tooltips don't render markdown tables correctly
 //! - [ ] On Windows, PS terminal doesn't hyperlink any paths
 //! - [ ] Wiggling the mouse over the terminal window (with no keys pressed) consumues 1 full cpu core. Seems sub-optimal.
+//! - [ ] After Cmd-click navigating, when the mouse in the terminal, but not over any word (over empty space), pressing
+//! Cmd causes the previously linkified path to linkify again.
 
 use regex::Regex;
 use std::{
