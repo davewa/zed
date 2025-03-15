@@ -96,28 +96,56 @@ pub fn longest_surrounding_symbols_match(
 }
 
 #[cfg(target_os = "windows")]
-macro_rules! path_chars {
+macro_rules! default_path_chars {
+    () => {
+        r#"[^\s<>"|?*]+?"#
+    };
+}
+
+#[cfg(target_os = "windows")]
+macro_rules! default_path_chars_msvc {
+    () => {
+        r#"[^\s<>"|?*\(]+"#
+    };
+}
+
+#[cfg(not(target_os = "windows"))]
+macro_rules! default_path_chars {
+    () => {
+        r#"[^\s]+?"#
+    };
+}
+
+#[cfg(not(target_os = "windows"))]
+macro_rules! default_path_chars_msvc {
+    () => {
+        r#"[^\s\(]+"#
+    };
+}
+
+#[cfg(target_os = "windows")]
+macro_rules! advanced_path_chars {
     () => {
         r#"[^<>"|?*]+?"#
     };
 }
 
 #[cfg(target_os = "windows")]
-macro_rules! path_chars_msvc {
+macro_rules! advanced_path_chars_msvc {
     () => {
         r#"[^<>"|?*\(]+"#
     };
 }
 
 #[cfg(not(target_os = "windows"))]
-macro_rules! path_chars {
+macro_rules! advanced_path_chars {
     () => {
         r#".+?"#
     };
 }
 
 #[cfg(not(target_os = "windows"))]
-macro_rules! path_chars_msvc {
+macro_rules! advanced_path_chars_msvc {
     () => {
         r#"[^\(]+"#
     };
@@ -131,11 +159,11 @@ macro_rules! path_chars_msvc {
 // and after the colon for digit-ness so that in case the line and column suffix is in
 // MSVC-style (<line>,<column>):message or some other style. Line and column suffixes are
 // processed later in termainl_view.
-const PATH_ROW_COLUMN_DESC_REGEX: &str = concat!(
+const DEFAULT_PATH_ROW_COLUMN_DESC_REGEX: &str = concat!(
     r#"(?x)
     (?<path>
     (?:"#,
-    path_chars_msvc!(),
+    default_path_chars_msvc!(),
     r#")(?:
         \((?:\d+)[,:](?:\d+)\) # path(row,column), path(row:column)
         |
@@ -143,7 +171,7 @@ const PATH_ROW_COLUMN_DESC_REGEX: &str = concat!(
     )
     |
     (?:"#,
-    path_chars!(),
+    default_path_chars!(),
     r#")(?:
         \:+(?:\d+)\:(?:\d+)    # path:row:column
         |
@@ -153,7 +181,33 @@ const PATH_ROW_COLUMN_DESC_REGEX: &str = concat!(
     "#
 );
 
-const PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 1] = [PATH_ROW_COLUMN_DESC_REGEX];
+/// Like, DEFAULT_PATH_ROW_COLUMN_DESC_REGEX, but allows spaces in the path
+const ADVANCED_PATH_ROW_COLUMN_DESC_REGEX: &str = concat!(
+    r#"(?x)
+    (?<path>
+    (?:"#,
+    advanced_path_chars_msvc!(),
+    r#")(?:
+        \((?:\d+)[,:](?:\d+)\) # path(row,column), path(row:column)
+        |
+        \((?:\d+)\)            # path(row)
+    )
+    |
+    (?:"#,
+    advanced_path_chars!(),
+    r#")(?:
+        \:+(?:\d+)\:(?:\d+)    # path:row:column
+        |
+        \:+(?:\d+)             # path:row
+    ))
+    :(?<desc>[^\d].+)$         # desc
+    "#
+);
+
+const PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 2] = [
+    DEFAULT_PATH_ROW_COLUMN_DESC_REGEX,
+    ADVANCED_PATH_ROW_COLUMN_DESC_REGEX,
+];
 
 /// Returns a list of the preapproved path hyperlink regexes
 pub fn preapproved_path_hyperlink_regexes() -> &'static Vec<Regex> {
@@ -167,33 +221,49 @@ pub fn preapproved_path_hyperlink_regexes() -> &'static Vec<Regex> {
     &PREAPPROVED_MAYBE_PATH_REGEXES
 }
 
+#[derive(Eq, PartialEq)]
+pub enum PathRegexSearchMode {
+    StopOnFirstMatch,
+    ReturnAllMatches,
+}
+
 /// If `hovered_word_range` overlaps the regex match, returns the matched range
-pub fn path_regex_match(
-    line: &str,
-    hovered_word_range: &Range<usize>,
-    path_regexes: &Vec<Regex>,
-) -> Option<Range<usize>> {
-    for regex in path_regexes.iter().chain(path_regexes.iter()) {
-        let Some(captures) = regex.captures(&line) else {
-            debug!("Regex should succeed if RegexSearch succeeded already");
-            continue;
-        };
-        // Note: Do NOT use captures[CUSTOM_PATH_HYPERLINK_REGEX_CAPTURE_NAME] here because
-        // it can panic. This is extra paranoid because we don't load path regexes that do not
-        // contain a path named capture group in the first place (see [init_path_regexes]).
-        let Some(path_capture) = captures.name("path") else {
-            debug!("'path' capture not matched in regex");
-            continue;
-        };
+pub fn path_regex_match<'a>(
+    line: &'a str,
+    hovered_word_range: Range<usize>,
+    path_regex_search_mode: PathRegexSearchMode,
+    path_regexes: &'a Vec<Regex>,
+) -> impl Iterator<Item = Range<usize>> + 'a {
+    path_regexes
+        .iter()
+        .filter_map(move |regex| {
+            let Some(captures) = regex.captures(&line) else {
+                debug!("Regex should succeed if RegexSearch succeeded already");
+                return None;
+            };
+            // Note: Do NOT use captures[CUSTOM_PATH_HYPERLINK_REGEX_CAPTURE_NAME] here because
+            // it can panic. This is extra paranoid because we don't load path regexes that do not
+            // contain a path named capture group in the first place (see [init_path_regexes]).
+            let Some(path_capture) = captures.name("path") else {
+                debug!("'path' capture not matched in regex");
+                return None;
+            };
 
-        if hovered_word_range.contains(&path_capture.start())
-            || hovered_word_range.contains(&path_capture.end())
-        {
-            return Some(path_capture.range());
-        }
-    }
+            if hovered_word_range.contains(&path_capture.start())
+                || hovered_word_range.contains(&path_capture.end())
+            {
+                return Some(path_capture.range());
+            }
 
-    None
+            None
+        })
+        .take(
+            if path_regex_search_mode == PathRegexSearchMode::StopOnFirstMatch {
+                1
+            } else {
+                usize::MAX
+            },
+        )
 }
 
 /// The hovered or Cmd-clicked word in the terminal
@@ -301,9 +371,12 @@ impl MaybePathLike {
             })
         } else if let Some(path_range) = path_regex_match(
             &self.line[self.word_range.clone()],
-            &(0..self.word_range.len()),
+            0..self.word_range.len(),
+            PathRegexSearchMode::StopOnFirstMatch,
             &preapproved_path_hyperlink_regexes(),
-        ) {
+        )
+        .nth(0)
+        {
             debug!(
                 "Terminal: path heuristic 'path regex' match: {:?}",
                 self.text_at(&path_range)
@@ -384,7 +457,7 @@ mod tests {
     use super::*;
 
     fn re_test_row_col_desc(hay: &str, expected: Option<(&str, &str)>) {
-        let regex = regex::Regex::new(PATH_ROW_COLUMN_DESC_REGEX).unwrap();
+        let regex = regex::Regex::new(DEFAULT_PATH_ROW_COLUMN_DESC_REGEX).unwrap();
         if let Some((_, [path, desc])) = regex.captures_iter(hay).map(|c| c.extract()).next() {
             let Some((expected_path, expected_desc)) = expected else {
                 assert!(

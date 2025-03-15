@@ -35,7 +35,7 @@ use std::{
 };
 use terminal::terminal_maybe_path_like::{
     longest_surrounding_symbols_match, path_regex_match, preapproved_path_hyperlink_regexes,
-    MaybePathLike, COMMON_PATH_SURROUNDING_SYMBOLS, MAIN_SEPARATORS,
+    MaybePathLike, PathRegexSearchMode, COMMON_PATH_SURROUNDING_SYMBOLS, MAIN_SEPARATORS,
 };
 #[cfg(doc)]
 use terminal::terminal_settings::PathHyperlinkNavigation;
@@ -109,11 +109,8 @@ impl MaybePath {
             .into_iter()
             .chain(iter::once_with(|| self.longest_surrounding_symbols_variants()).flatten())
             .chain(
-                iter::once_with(|| {
-                    self.path_regex_variants(preapproved_path_hyperlink_regexes())
-                        .into_iter()
-                })
-                .flatten(),
+                iter::once_with(|| self.path_regex_variants(preapproved_path_hyperlink_regexes()))
+                    .flatten(),
             )
             .chain(
                 iter::once_with(|| {
@@ -134,7 +131,6 @@ impl MaybePath {
     pub fn advanced_variants(&self) -> impl VariantIterator<'_> {
         // TODO(davewa): Some way to assert we are not called on the main thread...
         self.path_regex_variants(&self.path_hyperlink_regexes)
-            .into_iter()
             .chain(self.line_ends_in_a_path_maybe_path_variants(
                 Self::MAX_MAIN_THREAD_PREFIX_WORDS,
                 Self::MAX_BACKGROUND_THREAD_PREFIX_WORDS,
@@ -178,12 +174,14 @@ impl MaybePath {
         vec![].into_iter()
     }
 
-    fn path_regex_variants(&self, path_regexes: &Vec<Regex>) -> Option<MaybePathVariant<'_>> {
-        if let Some(path) = path_regex_match(&self.line, &self.word_range, path_regexes) {
-            Some(MaybePathVariant::new(&self.line, path.clone()))
-        } else {
-            None
-        }
+    fn path_regex_variants<'a>(&'a self, path_regexes: &'a Vec<Regex>) -> impl VariantIterator<'a> {
+        path_regex_match(
+            &self.line,
+            self.word_range.clone(),
+            PathRegexSearchMode::ReturnAllMatches,
+            path_regexes,
+        )
+        .map(|range| MaybePathVariant::new(&self.line, range.clone()))
     }
 
     /// [PathHyperlinkNavigation::Advanced] maybe path variants that start on the hovered word or a
@@ -644,9 +642,7 @@ mod tests {
                     maybe_path_with_position.path, normalized_path,
                     "Normalized was not a noop"
                 );
-                if let Ok(Some(_metadata)) =
-                    fs.metadata(&fs::normalize_path(&normalized_path)).await
-                {
+                if let Ok(Some(_metadata)) = fs.metadata(&normalized_path).await {
                     // TODO(davewa): assert_eq!(metadata.is_dir, expected_open_target.is_dir)
                     return Some(MaybePathWithPosition {
                         path: Cow::Owned(maybe_path_with_position.path.to_path_buf()),
@@ -818,6 +814,110 @@ mod tests {
         ($path:literal) => {
             separator!($path)
         };
+    }
+
+    // <https://github.com/zed-industries/zed/issues/25086>
+    #[gpui::test]
+    async fn issue_25086(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "app": {
+                    "services": {
+                        "opensearch": {
+                            "contacts" :{
+                                "create_service.rb": ""
+                            }
+                        }
+                    },
+                }
+            }),
+        )
+        .await;
+
+        let mut expected = ExpectedMap::from_iter([]);
+
+        expected.insert(
+            PathHyperlinkNavigation::Default,
+            Vec::from_iter([
+                expected!{
+                    relative![
+                        [ rel!("./app/services/opensearch/contacts/create_service.rb:9:in") ];
+                        [ rel!("./app/services/opensearch/contacts/create_service.rb") ], 9;
+                        [ rel!("./app/services/opensearch/contacts/create_service.rb:9") ];
+                        [ rel!("# ./app/services/opensearch/contacts/create_service.rb") ], 9;
+                        [ rel!("# ./app/services/opensearch/contacts/create_service.rb:9") ];
+                        [ rel!("./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                        [ rel!("# ./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                    ],
+                    absolutized![
+                        [ abs!("/root/./app/services/opensearch/contacts/create_service.rb:9:in") ];
+                        [ abs!("/Some/cool/place/./app/services/opensearch/contacts/create_service.rb:9:in") ];
+                        [ abs!("/root/./app/services/opensearch/contacts/create_service.rb") ], 9;
+                        [ abs!("/Some/cool/place/./app/services/opensearch/contacts/create_service.rb") ], 9;
+                        [ abs!("/root/./app/services/opensearch/contacts/create_service.rb:9") ];
+                        [ abs!("/Some/cool/place/./app/services/opensearch/contacts/create_service.rb:9") ];
+                        [ abs!("/root/# ./app/services/opensearch/contacts/create_service.rb") ], 9;
+                        [ abs!("/Some/cool/place/# ./app/services/opensearch/contacts/create_service.rb") ], 9;
+                        [ abs!("/root/# ./app/services/opensearch/contacts/create_service.rb:9") ];
+                        [ abs!("/Some/cool/place/# ./app/services/opensearch/contacts/create_service.rb:9") ];
+                        [ abs!("/root/./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                        [ abs!("/Some/cool/place/./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                        [ abs!("/root/# ./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                        [ abs!("/Some/cool/place/# ./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                    ],
+                    open_target!("/root/./app/services/opensearch/contacts/create_service.rb", 9)
+                }
+            ].into_iter()),
+        );
+
+        expected.insert(
+            PathHyperlinkNavigation::Advanced,
+            Vec::from_iter(
+                [expected! {
+                    relative![
+                    ],
+                    absolutized![
+                    ]
+                }]
+                .into_iter(),
+            ),
+        );
+
+        expected.insert(
+            PathHyperlinkNavigation::Exhaustive,
+            Vec::from_iter(
+                [expected! {
+                    relative![
+                        [ rel!("# ./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                        [ rel!("# ./app/services/opensearch/contacts/create_service.rb:9:in") ];
+                        [ rel!("./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                        [ rel!("./app/services/opensearch/contacts/create_service.rb:9:in") ];
+                    ],
+                    absolutized![
+                        [ abs!("/root/# ./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                        [ abs!("/Some/cool/place/# ./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                        [ abs!("/root/# ./app/services/opensearch/contacts/create_service.rb:9:in") ];
+                        [ abs!("/Some/cool/place/# ./app/services/opensearch/contacts/create_service.rb:9:in") ];
+                        [ abs!("/root/./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                        [ abs!("/Some/cool/place/./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'") ];
+                        [ abs!("/root/./app/services/opensearch/contacts/create_service.rb:9:in") ];
+                        [ abs!("/Some/cool/place/./app/services/opensearch/contacts/create_service.rb:9:in") ];
+                    ]
+                }]
+                .into_iter(),
+            ),
+        );
+
+        test_maybe_paths(
+            Arc::clone(&fs),
+            &Path::new(abs!("/root")),
+            "# ./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'",
+            Some(1),
+            &expected,
+        )
+        .await;
     }
 
     // <https://github.com/zed-industries/zed/issues/12338>
