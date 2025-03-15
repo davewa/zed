@@ -221,7 +221,7 @@ impl TerminalView {
                     .path_hyperlink_regexes
                     .iter()
                     .map(|regex| Regex::new(regex).unwrap())
-                    .collect::<Vec<_>>(),
+                    .collect_vec(),
             ),
             path_hyperlink_timeout: Duration::from_millis(
                 TerminalSettings::get_global(cx).path_hyperlink_timeout,
@@ -1110,7 +1110,7 @@ fn possible_open_target(
                 None => usize::MAX,
             }
         })
-        .collect::<Vec<_>>();
+        .collect_vec();
 
     // Outer loops should be maybe path variants and variations so that we stop as soon as
     // a match is found. Variants and variations are ordered by most common to least common.

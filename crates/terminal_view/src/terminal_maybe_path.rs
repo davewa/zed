@@ -23,6 +23,7 @@
 //! - [ ] After Cmd-click navigating, when the mouse in the terminal, but not over any word (over empty space), pressing
 //! Cmd causes the previously linkified path to linkify again.
 
+use itertools::Itertools;
 use regex::Regex;
 use std::{
     borrow::Cow,
@@ -117,7 +118,7 @@ impl MaybePath {
                         0,
                         Self::MAX_MAIN_THREAD_PREFIX_WORDS,
                     )
-                    .collect::<Vec<_>>()
+                    .collect_vec()
                     .into_iter()
                     // One prefix stripped is the most likely path, start there
                     .rev()
@@ -150,7 +151,7 @@ impl MaybePath {
             .map(move |start| {
                 word_regex()
                     .find_iter(&self.line[self.word_range.start..])
-                    .collect::<Vec<_>>()
+                    .collect_vec()
                     .into_iter()
                     .rev()
                     .map(|match_| match_.end())
@@ -490,6 +491,7 @@ mod tests {
     use collections::HashMap;
     use fs::{FakeFs, Fs};
     use gpui::TestAppContext;
+    use itertools::Itertools;
     use serde_json::json;
     use std::{path::Path, sync::Arc};
     use terminal::terminal_settings::PathHyperlinkNavigation;
@@ -502,6 +504,188 @@ mod tests {
     }
 
     type ExpectedMap<'a> = HashMap<PathHyperlinkNavigation, Vec<ExpectedMaybePathVariations<'a>>>;
+
+    async fn test_maybe_paths<'a>(
+        fs: Arc<FakeFs>,
+        worktree_root: &Path,
+        line: &str,
+        word_index: Option<usize>,
+        expected: &ExpectedMap<'a>,
+    ) {
+        let custom_path_regexes = Arc::new(Vec::new());
+        let maybe_paths = if let Some(word_index) = word_index {
+            vec![word_regex().find_iter(&line).nth(word_index).unwrap()]
+        } else {
+            word_regex().find_iter(&line).collect_vec()
+        };
+
+        let test_maybe_path = async |path_hyperlink_navigation| {
+            let word_expected = expected.get(&path_hyperlink_navigation).unwrap();
+            for (matched, expected) in maybe_paths.iter().zip(word_expected) {
+                let maybe_path =
+                    MaybePath::new(line, matched.range(), Arc::clone(&custom_path_regexes));
+                println!("\n\nTesting {path_hyperlink_navigation:?}: {maybe_path}");
+
+                let variants = match path_hyperlink_navigation {
+                    PathHyperlinkNavigation::Default => maybe_path.default_variants().collect_vec(),
+                    PathHyperlinkNavigation::Advanced => {
+                        maybe_path.advanced_variants().collect_vec()
+                    }
+                    PathHyperlinkNavigation::Exhaustive => {
+                        maybe_path.exhaustive_variants().collect_vec()
+                    }
+                    _ => {
+                        assert!(false, "Unexpected {path_hyperlink_navigation:?}");
+                        return;
+                    }
+                };
+
+                test_variants(Arc::clone(&fs), worktree_root, variants, &expected).await
+            }
+        };
+
+        test_maybe_path(PathHyperlinkNavigation::Default).await;
+        test_maybe_path(PathHyperlinkNavigation::Advanced).await;
+        if expected.contains_key(&PathHyperlinkNavigation::Exhaustive) {
+            test_maybe_path(PathHyperlinkNavigation::Exhaustive).await;
+        }
+    }
+
+    fn check_variations<'a>(
+        actual: &Vec<MaybePathWithPosition<'a>>,
+        expected: &Vec<MaybePathWithPosition<'a>>,
+        rel_or_abs: &str,
+    ) {
+        let errors: Vec<_> = actual
+            .iter()
+            .zip(expected.iter())
+            .filter(|(actual, expected)| {
+                actual.path != expected.path || actual.position != expected.position
+            })
+            .inspect(|(actual, expected)| {
+                println!(
+                    "  left: \"{}\", position = {:?}",
+                    actual.path.to_string_lossy(),
+                    actual.position
+                );
+                println!(
+                    " right: \"{}\", position = {:?}",
+                    expected.path.to_string_lossy(),
+                    expected.position
+                );
+            })
+            .collect();
+
+        if actual.len() != expected.len() || !errors.is_empty() {
+            println!("\nActual:");
+            actual
+                .iter()
+                .for_each(|MaybePathWithPosition { path, .. }| {
+                    println!("    [ {rel_or_abs}!(\"{}\") ];", path.to_string_lossy())
+                });
+            println!("\nExpected:");
+            expected
+                .iter()
+                .for_each(|MaybePathWithPosition { path, .. }| {
+                    println!("    [ {rel_or_abs}!(\"{}\") ];", path.to_string_lossy())
+                });
+            assert!(false);
+        }
+    }
+
+    async fn test_variants<'a>(
+        fs: Arc<FakeFs>,
+        worktree_root: &Path,
+        variants: Vec<MaybePathVariant<'_>>,
+        expected: &ExpectedMaybePathVariations<'a>,
+    ) {
+        //assert_eq!(variants().len(), 3);
+
+        println!(
+            "\nVariants: {:#?}",
+            variants
+                .iter()
+                .map(|maybe_path_variant| maybe_path_variant
+                    .relative_variations(None)
+                    .into_iter()
+                    .collect_vec())
+                .collect_vec()
+        );
+
+        println!("\nTesting Relative: strip_prefix = {worktree_root:?}");
+
+        let actual_relative: Vec<_> = variants
+            .iter()
+            .map(|maybe_path_variant| maybe_path_variant.relative_variations(Some(worktree_root)))
+            .flatten()
+            .collect();
+
+        check_variations(&actual_relative, &expected.relative, "rel");
+
+        const HOME_DIR: &str = path!("/Usors/uzer");
+        const CWD: &str = path!("/Some/cool/place");
+
+        let home_dir = Path::new(HOME_DIR).to_path_buf();
+        let roots = [worktree_root, Path::new(CWD)];
+
+        println!("\nTesting Absolutized: home_dir: {home_dir:?}, roots: {roots:?}",);
+
+        let actual_absolutized: Vec<_> = variants
+            .iter()
+            .map(|maybe_path_variant| {
+                maybe_path_variant.absolutized_variations(roots.into_iter(), &home_dir)
+            })
+            .flatten()
+            .collect();
+
+        check_variations(&actual_absolutized, &expected.absolutized, "abs");
+
+        let actual_open_target = async || {
+            for maybe_path_with_position in &actual_absolutized {
+                let normalized_path = fs::normalize_path(&maybe_path_with_position.path);
+                assert_eq!(
+                    maybe_path_with_position.path, normalized_path,
+                    "Normalized was not a noop"
+                );
+                if let Ok(Some(_metadata)) =
+                    fs.metadata(&fs::normalize_path(&normalized_path)).await
+                {
+                    // TODO(davewa): assert_eq!(metadata.is_dir, expected_open_target.is_dir)
+                    return Some(MaybePathWithPosition {
+                        path: Cow::Owned(maybe_path_with_position.path.to_path_buf()),
+                        ..maybe_path_with_position.clone()
+                    });
+                }
+            }
+
+            None
+        };
+
+        if let Some(actual_open_target) = actual_open_target().await {
+            if let Some(expected_open_target) = expected.open_target.as_ref() {
+                assert_eq!(
+                    *expected_open_target.path, actual_open_target.path,
+                    "Mismatched open target paths"
+                );
+                assert_eq!(
+                    expected_open_target.position, actual_open_target.position,
+                    "Mismatched open target positions"
+                );
+            } else {
+                assert!(
+                    false,
+                    "Expected no open target, but found: {:?}",
+                    actual_open_target
+                );
+            }
+        } else if let Some(expected_open_target) = expected.open_target.as_ref() {
+            assert!(
+                false,
+                "No open target found, expected: {:?}",
+                expected_open_target
+            );
+        }
+    }
 
     #[cfg(target_os = "windows")]
     macro_rules! maybe_home_path_with_positions {
@@ -779,7 +963,7 @@ mod tests {
             ),
         );
 
-        test_line_maybe_path_variants(
+        test_maybe_paths(
             Arc::clone(&fs),
             &Path::new(abs!("/root")),
             ".rw-r--r--     0     staff 05-27 13:56 'test file 1.txt'",
@@ -870,7 +1054,7 @@ mod tests {
             ),
         );
 
-        test_line_maybe_path_variants(
+        test_maybe_paths(
             Arc::clone(&fs),
             &Path::new(abs!("/root")),
             ".rw-r--r--     0     staff 05-27 14:03 test、2.txt",
@@ -962,7 +1146,7 @@ mod tests {
             ),
         );
 
-        test_line_maybe_path_variants(
+        test_maybe_paths(
             Arc::clone(&fs),
             &Path::new(abs!("/root")),
             ".rw-r--r--     0     staff 05-27 14:03 test。3.txt",
@@ -1207,7 +1391,7 @@ mod tests {
             ),
         );
 
-        test_line_maybe_path_variants(
+        test_maybe_paths(
             fs,
             &Path::new(abs!("/root 2")),
             concat!(
@@ -1219,198 +1403,5 @@ mod tests {
             &expected,
         )
         .await
-    }
-
-    async fn test_line_maybe_path_variants<'a>(
-        fs: Arc<FakeFs>,
-        worktree_root: &Path,
-        line: &str,
-        word_index: Option<usize>,
-        expected: &ExpectedMap<'a>,
-    ) {
-        let custom_path_regexes = Arc::new(Vec::new());
-
-        let test_maybe_path = async |path_hyperlink_navigation, variants| {
-            let maybe_paths = |expected| {
-                if let Some(word_index) = word_index {
-                    word_regex()
-                        .find_iter(&line)
-                        .skip(word_index)
-                        .take(1)
-                        .zip(expected)
-                        .collect::<Vec<_>>()
-                } else {
-                    word_regex()
-                        .find_iter(&line)
-                        .zip(expected)
-                        .collect::<Vec<_>>()
-                }
-            };
-
-            let word_expected = expected.get(&path_hyperlink_navigation).unwrap();
-            for (matched, expected) in maybe_paths(word_expected) {
-                let maybe_path =
-                    MaybePath::new(line, matched.range(), Arc::clone(&custom_path_regexes));
-                println!("\n\nTesting {path_hyperlink_navigation:?}: {maybe_path}");
-
-                test_maybe_path(
-                    Arc::clone(&fs),
-                    worktree_root,
-                    maybe_path,
-                    &variants,
-                    &expected,
-                )
-                .await
-            }
-        };
-
-        test_maybe_path(
-            PathHyperlinkNavigation::Default,
-            Box::new(|maybe_path| Box::new(maybe_path.default_variants())),
-        )
-        .await;
-
-        test_maybe_path(
-            PathHyperlinkNavigation::Advanced,
-            Box::new(|maybe_path| Box::new(maybe_path.advanced_variants())),
-        )
-        .await;
-
-        if expected.contains_key(&PathHyperlinkNavigation::Exhaustive) {
-            test_maybe_path(
-                PathHyperlinkNavigation::Exhaustive,
-                Box::new(|maybe_path| Box::new(maybe_path.exhaustive_variants())),
-            )
-            .await;
-        }
-    }
-
-    fn check_variations<'a>(
-        actual: &Vec<MaybePathWithPosition<'a>>,
-        expected: &Vec<MaybePathWithPosition<'a>>,
-        macro_name: &str,
-    ) {
-        let errors: Vec<_> = actual
-            .iter()
-            .zip(expected.iter())
-            .filter(|(actual, expected)| {
-                actual.path != expected.path || actual.position != expected.position
-            })
-            .inspect(|(actual, expected)| {
-                println!("  left: {:?}", actual);
-                println!(" right: {:?}", expected);
-            })
-            .collect();
-
-        if actual.len() != expected.len() || !errors.is_empty() {
-            println!("\nActual:");
-            actual
-                .iter()
-                .for_each(|MaybePathWithPosition { path, .. }| {
-                    println!("    [ {macro_name}!(\"{}\") ];", path.to_string_lossy())
-                });
-            println!("\nExpected:");
-            expected
-                .iter()
-                .for_each(|MaybePathWithPosition { path, .. }| {
-                    println!("    [ {macro_name}!(\"{}\") ];", path.to_string_lossy())
-                });
-            assert!(false);
-        }
-    }
-
-    async fn test_maybe_path<'a>(
-        fs: Arc<FakeFs>,
-        worktree_root: &Path,
-        maybe_path: MaybePath,
-        variants: &Box<
-            dyn Fn(&MaybePath) -> Box<dyn Iterator<Item = MaybePathVariant<'_>> + Send + '_>,
-        >,
-        expected: &ExpectedMaybePathVariations<'a>,
-    ) {
-        //assert_eq!(variants().len(), 3);
-
-        println!(
-            "\nVariants: {:#?}",
-            variants(&maybe_path)
-                .map(|maybe_path_variant| maybe_path_variant
-                    .relative_variations(None)
-                    .into_iter()
-                    .map(|variation| &maybe_path.line[variation.range.clone()])
-                    .collect::<Vec<_>>())
-                .collect::<Vec<_>>()
-        );
-
-        println!("\nTesting Relative: strip_prefix = {worktree_root:?}");
-
-        let actual_relative: Vec<_> = variants(&maybe_path)
-            .map(|maybe_path_variant| maybe_path_variant.relative_variations(Some(worktree_root)))
-            .flatten()
-            .collect();
-
-        check_variations(&actual_relative, &expected.relative, "rel");
-
-        const HOME_DIR: &str = path!("/Usors/uzer");
-        const CWD: &str = path!("/Some/cool/place");
-
-        let home_dir = Path::new(HOME_DIR).to_path_buf();
-        let roots = [worktree_root, Path::new(CWD)];
-
-        println!("\nTesting Absolutized: home_dir: {home_dir:?}, roots: {roots:?}",);
-
-        let actual_absolutized: Vec<_> = variants(&maybe_path)
-            .map(|maybe_path_variant| {
-                maybe_path_variant.absolutized_variations(roots.into_iter(), &home_dir)
-            })
-            .flatten()
-            .collect();
-
-        check_variations(&actual_absolutized, &expected.absolutized, "abs");
-
-        let actual_open_target = async || {
-            for maybe_path_with_position in &actual_absolutized {
-                let normalized_path = fs::normalize_path(&maybe_path_with_position.path);
-                assert_eq!(
-                    maybe_path_with_position.path, normalized_path,
-                    "Normalized was not a noop"
-                );
-                if let Ok(Some(_metadata)) =
-                    fs.metadata(&fs::normalize_path(&normalized_path)).await
-                {
-                    // TODO(davewa): assert_eq!(metadata.is_dir, expected_open_target.is_dir)
-                    return Some(MaybePathWithPosition {
-                        path: Cow::Owned(maybe_path_with_position.path.to_path_buf()),
-                        ..maybe_path_with_position.clone()
-                    });
-                }
-            }
-
-            None
-        };
-
-        if let Some(actual_open_target) = actual_open_target().await {
-            if let Some(expected_open_target) = expected.open_target.as_ref() {
-                assert_eq!(
-                    *expected_open_target.path, actual_open_target.path,
-                    "Mismatched open target paths"
-                );
-                assert_eq!(
-                    expected_open_target.position, actual_open_target.position,
-                    "Mismatched open target positions"
-                );
-            } else {
-                assert!(
-                    false,
-                    "Expected no open target, but found: {:?}",
-                    actual_open_target
-                );
-            }
-        } else if let Some(expected_open_target) = expected.open_target.as_ref() {
-            assert!(
-                false,
-                "No open target found, expected: {:?}",
-                expected_open_target
-            );
-        }
     }
 }
