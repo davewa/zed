@@ -69,6 +69,9 @@ impl Display for MaybePath {
     }
 }
 
+pub trait VariantIterator<'a>: Iterator<Item = MaybePathVariant<'a>> + 'a {}
+impl<'a, I: Iterator<Item = MaybePathVariant<'a>> + 'a> VariantIterator<'a> for I {}
+
 impl MaybePath {
     pub(super) fn from_maybe_path_like(
         maybe_path_like: &MaybePathLike,
@@ -101,7 +104,7 @@ impl MaybePath {
     ///
     /// *Local Only*--If no worktree match is found they will also be checked
     /// for existence in the workspace's real file system on the background thread.
-    pub fn default_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
+    pub fn default_variants(&self) -> impl VariantIterator<'_> {
         [MaybePathVariant::new(&self.line, self.word_range.clone())]
             .into_iter()
             .chain(iter::once_with(|| self.longest_surrounding_symbols_variants()).flatten())
@@ -114,21 +117,21 @@ impl MaybePath {
             )
             .chain(
                 iter::once_with(|| {
-                    self.line_ends_in_a_path_maybe_path_variants(
-                        0,
-                        Self::MAX_MAIN_THREAD_PREFIX_WORDS,
-                    )
-                    .collect_vec()
-                    .into_iter()
                     // One prefix stripped is the most likely path, start there
-                    .rev()
+                    itertools::rev(
+                        self.line_ends_in_a_path_maybe_path_variants(
+                            0,
+                            Self::MAX_MAIN_THREAD_PREFIX_WORDS,
+                        )
+                        .collect_vec(),
+                    )
                 })
                 .flatten(),
             )
     }
 
     /// All [PathHyperlinkNavigation::Advanced] maybe path variants.
-    pub fn advanced_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
+    pub fn advanced_variants(&self) -> impl VariantIterator<'_> {
         // TODO(davewa): Some way to assert we are not called on the main thread...
         self.path_regex_variants(&self.path_hyperlink_regexes)
             .into_iter()
@@ -140,32 +143,26 @@ impl MaybePath {
 
     /// All [PathHyperlinkNavigation::Exhaustive] maybe path variants that start on the hovered word or a
     /// word before it and end the hovered word or a word after it.
-    pub fn exhaustive_variants(&self) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
+    pub fn exhaustive_variants(&self) -> impl VariantIterator<'_> {
         // TODO(davewa): Some way to assert we are not called on the main thread...
         let starts = word_regex()
             .find_iter(&self.line[..self.word_range.end])
             .map(|match_| match_.start());
 
-        starts
-            .into_iter()
-            .map(move |start| {
+        starts.flat_map(move |start| {
+            itertools::rev(
                 word_regex()
                     .find_iter(&self.line[self.word_range.start..])
-                    .collect_vec()
-                    .into_iter()
-                    .rev()
-                    .map(|match_| match_.end())
-                    .map(move |end| {
-                        MaybePathVariant::new(&self.line, start..self.word_range.start + end)
-                    })
+                    .collect_vec(),
+            )
+            .map(move |match_| {
+                MaybePathVariant::new(&self.line, start..self.word_range.start + match_.end())
             })
-            .flatten()
+        })
     }
 
     /// [PathHyperlinkNavigation::Default] variant for the longest surrounding symbols match, if any
-    fn longest_surrounding_symbols_variants(
-        &self,
-    ) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
+    fn longest_surrounding_symbols_variants(&self) -> impl VariantIterator<'_> {
         if let Some(surrounding_range) =
             longest_surrounding_symbols_match(&self.line, &self.word_range)
         {
@@ -195,7 +192,7 @@ impl MaybePath {
         &self,
         start_prefix_words: usize,
         max_prefix_words: usize,
-    ) -> impl Iterator<Item = MaybePathVariant<'_>> + '_ {
+    ) -> impl VariantIterator<'_> {
         word_regex()
             .find_iter(&self.line[..self.word_range.end])
             .skip(start_prefix_words)
@@ -556,7 +553,7 @@ mod tests {
         expected: &Vec<MaybePathWithPosition<'a>>,
         rel_or_abs: &str,
     ) {
-        let errors: Vec<_> = actual
+        let errors = actual
             .iter()
             .zip(expected.iter())
             .filter(|(actual, expected)| {
@@ -574,7 +571,7 @@ mod tests {
                     expected.position
                 );
             })
-            .collect();
+            .collect_vec();
 
         if actual.len() != expected.len() || !errors.is_empty() {
             println!("\nActual:");
@@ -614,11 +611,12 @@ mod tests {
 
         println!("\nTesting Relative: strip_prefix = {worktree_root:?}");
 
-        let actual_relative: Vec<_> = variants
+        let actual_relative = variants
             .iter()
-            .map(|maybe_path_variant| maybe_path_variant.relative_variations(Some(worktree_root)))
-            .flatten()
-            .collect();
+            .flat_map(|maybe_path_variant| {
+                maybe_path_variant.relative_variations(Some(worktree_root))
+            })
+            .collect_vec();
 
         check_variations(&actual_relative, &expected.relative, "rel");
 
@@ -630,13 +628,12 @@ mod tests {
 
         println!("\nTesting Absolutized: home_dir: {home_dir:?}, roots: {roots:?}",);
 
-        let actual_absolutized: Vec<_> = variants
+        let actual_absolutized = variants
             .iter()
-            .map(|maybe_path_variant| {
+            .flat_map(|maybe_path_variant| {
                 maybe_path_variant.absolutized_variations(roots.into_iter(), &home_dir)
             })
-            .flatten()
-            .collect();
+            .collect_vec();
 
         check_variations(&actual_absolutized, &expected.absolutized, "abs");
 
