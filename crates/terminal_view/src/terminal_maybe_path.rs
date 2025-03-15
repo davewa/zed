@@ -639,6 +639,204 @@ mod tests {
         };
     }
 
+    // <https://github.com/zed-industries/zed/issues/12338>
+    #[gpui::test]
+    async fn issue_12338(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "'test file 1.txt'": "",
+                "test、2.txt": "",
+                "test。3.txt": "",
+            }),
+        )
+        .await;
+
+        let mut expected = ExpectedMap::from_iter([]);
+
+        expected.insert(
+            PathHyperlinkNavigation::Default,
+            Vec::from_iter([
+                expected!{
+                    relative![
+                        [ rel!("'test") ];
+                        [ rel!("test file 1.txt") ];
+                        [ rel!("0     staff 05-27 13:56 'test file 1.txt'") ];
+                        [ rel!(".rw-r--r--     0     staff 05-27 13:56 'test file 1.txt'") ];
+                    ],
+                    absolutized![
+                        [ abs!("/root/'test") ];
+                        [ abs!("/Some/cool/place/'test") ];
+                        [ abs!("/root/test file 1.txt") ];
+                        [ abs!("/Some/cool/place/test file 1.txt") ];
+                        [ abs!("/root/0     staff 05-27 13:56 'test file 1.txt'") ];
+                        [ abs!("/Some/cool/place/0     staff 05-27 13:56 'test file 1.txt'") ];
+                        [ abs!("/root/.rw-r--r--     0     staff 05-27 13:56 'test file 1.txt'") ];
+                        [ abs!("/Some/cool/place/.rw-r--r--     0     staff 05-27 13:56 'test file 1.txt'") ];
+                    ]
+                }
+            ].into_iter()),
+        );
+
+        expected.insert(
+            PathHyperlinkNavigation::Advanced,
+            Vec::from_iter(
+                [expected! {
+                    relative![
+                        [ rel!("staff 05-27 13:56 'test file 1.txt'") ];
+                        [ rel!("05-27 13:56 'test file 1.txt'") ];
+                        [ rel!("13:56 'test file 1.txt'") ];
+                        [ rel!("test file 1.txt") ];
+                        [ rel!("'test file 1.txt'") ];
+                    ],
+                    absolutized![
+                        [ abs!("/root/staff 05-27 13:56 'test file 1.txt'") ];
+                        [ abs!("/Some/cool/place/staff 05-27 13:56 'test file 1.txt'") ];
+                        [ abs!("/root/05-27 13:56 'test file 1.txt'") ];
+                        [ abs!("/Some/cool/place/05-27 13:56 'test file 1.txt'") ];
+                        [ abs!("/root/13:56 'test file 1.txt'") ];
+                        [ abs!("/Some/cool/place/13:56 'test file 1.txt'") ];
+                        [ abs!("/root/test file 1.txt") ];
+                        [ abs!("/Some/cool/place/test file 1.txt") ];
+                        [ abs!("/root/'test file 1.txt'") ];
+                        [ abs!("/Some/cool/place/'test file 1.txt'") ];
+                    ],
+                    open_target!("/root/'test file 1.txt'")
+                }]
+                .into_iter(),
+            ),
+        );
+
+        test_line_maybe_path_variants(
+            Arc::clone(&fs),
+            &Path::new(abs!("/root")),
+            ".rw-r--r--     0     staff 05-27 13:56 'test file 1.txt'",
+            Some(5),
+            &expected,
+        )
+        .await;
+
+        let mut expected = ExpectedMap::from_iter([]);
+
+        expected.insert(
+                    PathHyperlinkNavigation::Default,
+                    Vec::from_iter([
+                        expected!{
+                            relative![
+                                [ rel!("test、2.txt") ];
+                                [ rel!("0     staff 05-27 14:03 test、2.txt") ];
+                                [ rel!(".rw-r--r--     0     staff 05-27 14:03 test、2.txt") ];
+                            ],
+                            absolutized![
+                                [ abs!("/root/test、2.txt") ];
+                                [ abs!("/Some/cool/place/test、2.txt") ];
+                                [ abs!("/root/0     staff 05-27 14:03 test、2.txt") ];
+                                [ abs!("/Some/cool/place/0     staff 05-27 14:03 test、2.txt") ];
+                                [ abs!("/root/.rw-r--r--     0     staff 05-27 14:03 test、2.txt") ];
+                                [ abs!("/Some/cool/place/.rw-r--r--     0     staff 05-27 14:03 test、2.txt") ];
+                            ],
+                            open_target!("/root/test、2.txt")
+                        }
+                    ].into_iter()),
+                );
+
+        expected.insert(
+            PathHyperlinkNavigation::Advanced,
+            Vec::from_iter(
+                [expected! {
+                    relative![
+                        [ rel!("staff 05-27 14:03 test、2.txt") ];
+                        [ rel!("05-27 14:03 test、2.txt") ];
+                        [ rel!("14:03 test、2.txt") ];
+                        [ rel!("test、2.txt") ];
+                    ],
+                    absolutized![
+                        [ abs!("/root/staff 05-27 14:03 test、2.txt") ];
+                        [ abs!("/Some/cool/place/staff 05-27 14:03 test、2.txt") ];
+                        [ abs!("/root/05-27 14:03 test、2.txt") ];
+                        [ abs!("/Some/cool/place/05-27 14:03 test、2.txt") ];
+                        [ abs!("/root/14:03 test、2.txt") ];
+                        [ abs!("/Some/cool/place/14:03 test、2.txt") ];
+                        [ abs!("/root/test、2.txt") ];
+                        [ abs!("/Some/cool/place/test、2.txt") ];
+                    ],
+                    open_target!("/root/test、2.txt")
+                }]
+                .into_iter(),
+            ),
+        );
+
+        test_line_maybe_path_variants(
+            Arc::clone(&fs),
+            &Path::new(abs!("/root")),
+            ".rw-r--r--     0     staff 05-27 14:03 test、2.txt",
+            // ".rw-r--r--     0     staff 05-27 14:03 test。3.txt"
+            Some(5),
+            &expected,
+        )
+        .await;
+
+        let mut expected = ExpectedMap::from_iter([]);
+
+        expected.insert(
+                    PathHyperlinkNavigation::Default,
+                    Vec::from_iter([
+                        expected!{
+                            relative![
+                                [ rel!("test。3.txt") ];
+                                [ rel!("0     staff 05-27 14:03 test。3.txt") ];
+                                [ rel!(".rw-r--r--     0     staff 05-27 14:03 test。3.txt") ];
+                            ],
+                            absolutized![
+                                [ abs!("/root/test。3.txt") ];
+                                [ abs!("/Some/cool/place/test。3.txt") ];
+                                [ abs!("/root/0     staff 05-27 14:03 test。3.txt") ];
+                                [ abs!("/Some/cool/place/0     staff 05-27 14:03 test。3.txt") ];
+                                [ abs!("/root/.rw-r--r--     0     staff 05-27 14:03 test。3.txt") ];
+                                [ abs!("/Some/cool/place/.rw-r--r--     0     staff 05-27 14:03 test。3.txt") ];
+                            ],
+                            open_target!("/root/test。3.txt")
+                        }
+                    ].into_iter()),
+                );
+
+        expected.insert(
+            PathHyperlinkNavigation::Advanced,
+            Vec::from_iter(
+                [expected! {
+                    relative![
+                        [ rel!("staff 05-27 14:03 test。3.txt") ];
+                        [ rel!("05-27 14:03 test。3.txt") ];
+                        [ rel!("14:03 test。3.txt") ];
+                        [ rel!("test。3.txt") ];
+                    ],
+                    absolutized![
+                        [ abs!("/root/staff 05-27 14:03 test。3.txt") ];
+                        [ abs!("/Some/cool/place/staff 05-27 14:03 test。3.txt") ];
+                        [ abs!("/root/05-27 14:03 test。3.txt") ];
+                        [ abs!("/Some/cool/place/05-27 14:03 test。3.txt") ];
+                        [ abs!("/root/14:03 test。3.txt") ];
+                        [ abs!("/Some/cool/place/14:03 test。3.txt") ];
+                        [ abs!("/root/test。3.txt") ];
+                        [ abs!("/Some/cool/place/test。3.txt") ];
+                    ],
+                    open_target!("/root/test。3.txt")
+                }]
+                .into_iter(),
+            ),
+        );
+
+        test_line_maybe_path_variants(
+            Arc::clone(&fs),
+            &Path::new(abs!("/root")),
+            ".rw-r--r--     0     staff 05-27 14:03 test。3.txt",
+            Some(5),
+            &expected,
+        )
+        .await;
+    }
+
     #[gpui::test]
     async fn simple_maybe_paths(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
@@ -657,6 +855,7 @@ mod tests {
             }),
         )
         .await;
+
         let mut expected = ExpectedMap::from_iter([]);
 
         expected.insert(
@@ -881,6 +1080,7 @@ mod tests {
                 abs!("/root 2/שיתופית.rs"),
                 rel!(")")
             ),
+            None,
             &expected,
         )
         .await
@@ -890,11 +1090,29 @@ mod tests {
         fs: Arc<FakeFs>,
         worktree_root: &Path,
         line: &str,
+        word_index: Option<usize>,
         expected: &ExpectedMap<'a>,
     ) {
         let custom_path_regexes = Arc::new(Vec::new());
+
+        let maybe_paths = |expected| {
+            if let Some(word_index) = word_index {
+                word_regex()
+                    .find_iter(&line)
+                    .skip(word_index)
+                    .take(1)
+                    .zip(expected)
+                    .collect::<Vec<_>>()
+            } else {
+                word_regex()
+                    .find_iter(&line)
+                    .zip(expected)
+                    .collect::<Vec<_>>()
+            }
+        };
+
         let word_expected = expected.get(&PathHyperlinkNavigation::Default).unwrap();
-        for (matched, expected) in word_regex().find_iter(&line).zip(word_expected) {
+        for (matched, expected) in maybe_paths(word_expected) {
             let maybe_path =
                 MaybePath::new(line, matched.range(), Arc::clone(&custom_path_regexes));
             println!("\n\nTesting Default: {}", maybe_path);
@@ -903,14 +1121,14 @@ mod tests {
                 Arc::clone(&fs),
                 worktree_root,
                 &maybe_path,
-                || maybe_path.default_variants(),
+                Box::new(|maybe_path| maybe_path.default_variants()),
                 &expected,
             )
             .await
         }
 
         let advanced_expected = expected.get(&PathHyperlinkNavigation::Advanced).unwrap();
-        for (matched, expected) in word_regex().find_iter(&line).zip(advanced_expected) {
+        for (matched, expected) in maybe_paths(advanced_expected) {
             let maybe_path =
                 MaybePath::new(line, matched.range(), Arc::clone(&custom_path_regexes));
             println!("\n\nTesting Advanced: {}", maybe_path);
@@ -919,7 +1137,7 @@ mod tests {
                 Arc::clone(&fs),
                 worktree_root,
                 &maybe_path,
-                || maybe_path.advanced_variants(),
+                Box::new(|maybe_path| maybe_path.advanced_variants()),
                 &expected,
             )
             .await
@@ -929,6 +1147,7 @@ mod tests {
     fn check_variations<'a>(
         actual: &Vec<MaybePathWithPosition<'a>>,
         expected: &Vec<MaybePathWithPosition<'a>>,
+        macro_name: &str,
     ) {
         let errors: Vec<_> = actual
             .iter()
@@ -947,13 +1166,13 @@ mod tests {
             actual
                 .iter()
                 .for_each(|MaybePathWithPosition { path, .. }| {
-                    println!("    {};", path.to_string_lossy())
+                    println!("    [ {macro_name}!(\"{}\") ];", path.to_string_lossy())
                 });
             println!("\nExpected:");
             expected
                 .iter()
                 .for_each(|MaybePathWithPosition { path, .. }| {
-                    println!("    {};", path.to_string_lossy())
+                    println!("    [ {macro_name}!(\"{}\") ];", path.to_string_lossy())
                 });
             assert!(false);
         }
@@ -963,16 +1182,16 @@ mod tests {
         fs: Arc<FakeFs>,
         worktree_root: &Path,
         maybe_path: &'a MaybePath,
-        variants: impl Fn() -> VariantIterator,
+        variants: Box<dyn Fn(&'a MaybePath) -> VariantIterator>,
         expected: &ExpectedMaybePathVariations<'a>,
     ) where
-        VariantIterator: Iterator<Item = MaybePathVariant<'a>> + 'a,
+        VariantIterator: Iterator<Item = MaybePathVariant<'a>> + Send + 'a,
     {
         //assert_eq!(variants().len(), 3);
 
         println!(
             "\nVariants: {:#?}",
-            variants()
+            variants(maybe_path)
                 .map(|maybe_path_variant| maybe_path_variant
                     .relative_variations(None)
                     .into_iter()
@@ -983,12 +1202,12 @@ mod tests {
 
         println!("\nTesting Relative: strip_prefix = {worktree_root:?}");
 
-        let actual_relative: Vec<_> = variants()
+        let actual_relative: Vec<_> = variants(maybe_path)
             .map(|maybe_path_variant| maybe_path_variant.relative_variations(Some(worktree_root)))
             .flatten()
             .collect();
 
-        check_variations(&actual_relative, &expected.relative);
+        check_variations(&actual_relative, &expected.relative, "rel");
 
         const HOME_DIR: &str = path!("/Usors/uzer");
         const CWD: &str = path!("/Some/cool/place");
@@ -998,14 +1217,14 @@ mod tests {
 
         println!("\nTesting Absolutized: home_dir: {home_dir:?}, roots: {roots:?}",);
 
-        let actual_absolutized: Vec<_> = variants()
+        let actual_absolutized: Vec<_> = variants(maybe_path)
             .map(|maybe_path_variant| {
                 maybe_path_variant.absolutized_variations(roots.into_iter(), &home_dir)
             })
             .flatten()
             .collect();
 
-        check_variations(&actual_absolutized, &expected.absolutized);
+        check_variations(&actual_absolutized, &expected.absolutized, "abs");
 
         let actual_open_target = async || {
             for maybe_path_with_position in &actual_absolutized {
