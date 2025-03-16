@@ -44,7 +44,7 @@
 
 #[cfg(doc)]
 use super::WORD_REGEX;
-use crate::{HoveredWord, ZedListener};
+use crate::{terminal_settings::PathHyperlinkNavigation, HoveredWord, ZedListener};
 use alacritty_terminal::{index::Boundary, term::search::Match, Term};
 use log::debug;
 use regex::Regex;
@@ -204,21 +204,35 @@ const ADVANCED_PATH_ROW_COLUMN_DESC_REGEX: &str = concat!(
     "#
 );
 
-const PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 2] = [
-    DEFAULT_PATH_ROW_COLUMN_DESC_REGEX,
-    ADVANCED_PATH_ROW_COLUMN_DESC_REGEX,
-];
+const DEFAULT_PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 1] = [DEFAULT_PATH_ROW_COLUMN_DESC_REGEX];
+
+const ADVANCED_PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 1] =
+    [ADVANCED_PATH_ROW_COLUMN_DESC_REGEX];
 
 /// Returns a list of the preapproved path hyperlink regexes
-pub fn preapproved_path_hyperlink_regexes() -> &'static Vec<Regex> {
-    static PREAPPROVED_MAYBE_PATH_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+pub fn preapproved_path_hyperlink_regexes(
+    path_hyperlink_navigation: PathHyperlinkNavigation,
+) -> &'static Vec<Regex> {
+    static DEFAULT_PREAPPROVED_MAYBE_PATH_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         let mut regexes = Vec::new();
-        for regex in PREAPPROVED_PATH_HYPERLINK_REGEXES {
+        for regex in DEFAULT_PREAPPROVED_PATH_HYPERLINK_REGEXES {
             regexes.push(Regex::new(regex).unwrap());
         }
         regexes
     });
-    &PREAPPROVED_MAYBE_PATH_REGEXES
+    static ADVANCED_PREAPPROVED_MAYBE_PATH_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+        let mut regexes = Vec::new();
+        for regex in ADVANCED_PREAPPROVED_PATH_HYPERLINK_REGEXES {
+            regexes.push(Regex::new(regex).unwrap());
+        }
+        regexes
+    });
+
+    if path_hyperlink_navigation == PathHyperlinkNavigation::Default {
+        &DEFAULT_PREAPPROVED_MAYBE_PATH_REGEXES
+    } else {
+        &ADVANCED_PREAPPROVED_MAYBE_PATH_REGEXES
+    }
 }
 
 #[derive(Eq, PartialEq)]
@@ -229,15 +243,14 @@ pub enum PathRegexSearchMode {
 
 /// If `hovered_word_range` overlaps the regex match, returns the matched range
 pub fn path_regex_match<'a>(
-    line: &'a str,
-    hovered_word_range: Range<usize>,
+    maybe_path: &'a str,
     path_regex_search_mode: PathRegexSearchMode,
     path_regexes: &'a Vec<Regex>,
 ) -> impl Iterator<Item = Range<usize>> + 'a {
     path_regexes
         .iter()
         .filter_map(move |regex| {
-            let Some(captures) = regex.captures(&line) else {
+            let Some(captures) = regex.captures(&maybe_path) else {
                 debug!("Regex should succeed if RegexSearch succeeded already");
                 return None;
             };
@@ -249,13 +262,7 @@ pub fn path_regex_match<'a>(
                 return None;
             };
 
-            if hovered_word_range.contains(&path_capture.start())
-                || hovered_word_range.contains(&path_capture.end())
-            {
-                return Some(path_capture.range());
-            }
-
-            None
+            return Some(path_capture.range());
         })
         .take(
             if path_regex_search_mode == PathRegexSearchMode::StopOnFirstMatch {
@@ -371,9 +378,8 @@ impl MaybePathLike {
             })
         } else if let Some(path_range) = path_regex_match(
             &self.line[self.word_range.clone()],
-            0..self.word_range.len(),
             PathRegexSearchMode::StopOnFirstMatch,
-            &preapproved_path_hyperlink_regexes(),
+            &preapproved_path_hyperlink_regexes(PathHyperlinkNavigation::Default),
         )
         .nth(0)
         {
@@ -482,23 +488,23 @@ mod tests {
     #[test]
     fn test_row_column_description_regex_25086() {
         re_test_row_col_desc(
-            "Main.cs:20:5:Error desc",
+            "# Main.cs:20:5:Error desc",
             Some(("Main.cs:20:5", "Error desc")),
         );
         re_test_row_col_desc(
-            "Main.cs(20,5):Error desc",
+            "# Main.cs(20,5):Error desc",
             Some(("Main.cs(20,5)", "Error desc")),
         );
         re_test_row_col_desc(
-            "Ma:n.cs:20:5:Error desc",
+            "# Ma:n.cs:20:5:Error desc",
             Some(("Ma:n.cs:20:5", "Error desc")),
         );
         re_test_row_col_desc(
-            "Ma(n.cs(20,5):Error desc",
+            "# Ma(n.cs(20,5):Error desc",
             Some(("n.cs(20,5)", "Error desc")),
         );
-        re_test_row_col_desc("Main.cs:20:5 Error desc", None);
-        re_test_row_col_desc("Main.cs(20,5) Error desc", None);
+        re_test_row_col_desc("# Main.cs:20:5 Error desc", None);
+        re_test_row_col_desc("# Main.cs(20,5) Error desc", None);
     }
 
     #[test]
