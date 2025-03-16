@@ -1183,14 +1183,17 @@ fn possible_open_target_from_fs(
         roots: &Vec<Arc<Path>>,
         maybe_path_variants: Box<dyn Iterator<Item = MaybePathVariant<'a>> + Send + 'a>,
         timed_out: impl Fn() -> bool,
-    ) -> Option<OpenTarget> {
+    ) -> (Option<OpenTarget>, usize) {
+        let mut checked_variations = 0;
         for maybe_path_variant in maybe_path_variants {
             for maybe_path_with_position in
                 maybe_path_variant.absolutized_variations(roots.iter().map(Deref::deref), home_dir)
             {
                 if timed_out() {
-                    return None;
+                    return (None, checked_variations);
                 }
+
+                checked_variations += 1;
 
                 if let Some(metadata) = fs
                     .metadata(&maybe_path_with_position.path)
@@ -1202,10 +1205,13 @@ fn possible_open_target_from_fs(
                         "Terminal: MaybePath found absolutized variation: {:?}",
                         maybe_path_with_position.path
                     );
-                    return Some(OpenTarget::File(
-                        maybe_path_with_position.into_owned(),
-                        metadata,
-                    ));
+                    return (
+                        Some(OpenTarget::File(
+                            maybe_path_with_position.into_owned(),
+                            metadata,
+                        )),
+                        checked_variations,
+                    );
                 } else {
                     trace!(
                         "Terminal: MaybePath skipping absolutized variation: {:?}",
@@ -1215,31 +1221,45 @@ fn possible_open_target_from_fs(
             }
         }
 
-        None
+        (None, checked_variations)
     }
 
     cx.background_spawn(async move {
         let search_start_time = Instant::now();
-        let timed_out = || {
-            Instant::now().saturating_duration_since(search_start_time) > path_hyperlink_timeout
-        };
+        let timed_out =
+            || Instant::now().saturating_duration_since(search_start_time) > path_hyperlink_timeout;
         let home_dir = paths::home_dir();
+
+        let mut total_checked_variations = 0;
+        let mut count = |(open_target, checked_variations)| {
+            total_checked_variations += checked_variations;
+            open_target
+        };
+
         let search_absolutized = |variants| {
-            search_absolutized_maybe_path_variants(Arc::clone(&fs), home_dir, &roots, variants, timed_out)
+            search_absolutized_maybe_path_variants(
+                Arc::clone(&fs),
+                home_dir,
+                &roots,
+                variants,
+                timed_out,
+            )
         };
 
         // TODO(davewa): Maybe keep a HashSet of variations checked so far to avoid repeating?
         // But, it might acutally be slower than checking a few repeats.
-        let open_target = if let Some(default) = search_absolutized(Box::new(maybe_path.default_variants())).await {
+        let open_target = if let Some(default) =
+            count(search_absolutized(Box::new(maybe_path.default_variants())).await)
+        {
             Some(default)
         } else if !timed_out() && path_hyperlink_navigation > PathHyperlinkNavigation::Default {
-            if let Some(advanced) = search_absolutized(Box::new(maybe_path.advanced_variants()))
-            .await
+            if let Some(advanced) =
+                count(search_absolutized(Box::new(maybe_path.advanced_variants())).await)
             {
                 Some(advanced)
-            } else if !timed_out() && path_hyperlink_navigation > PathHyperlinkNavigation::Advanced {
-                search_absolutized(Box::new(maybe_path.exhaustive_variants()))
-                .await
+            } else if !timed_out() && path_hyperlink_navigation > PathHyperlinkNavigation::Advanced
+            {
+                count(search_absolutized(Box::new(maybe_path.exhaustive_variants())).await)
             } else {
                 None
             }
@@ -1247,14 +1267,30 @@ fn possible_open_target_from_fs(
             None
         };
 
-        let duration = Instant::now().saturating_duration_since(search_start_time);
+        macro_rules! search_log_message {
+            ($log_level:ident, $message:literal) => {{
+                let duration = Instant::now()
+                    .saturating_duration_since(search_start_time)
+                    .as_millis();
+                $log_level!(
+                    concat!(
+                        "TerminalView: {:?} maybe path search for real file ",
+                        $message,
+                        " after {}ms ({} variations checked)"
+                    ),
+                    path_hyperlink_navigation,
+                    duration,
+                    total_checked_variations
+                )
+            }};
+        }
 
         if timed_out() {
-            info!("TerminalView: {path_hyperlink_navigation:?} search timed out searching for real file for maybe path variations after {}ms", duration.as_millis());
+            search_log_message!(info, "timed out");
         } else if open_target.is_some() {
-            debug!("TerminalView: {path_hyperlink_navigation:?} search found real file for maybe path in {}ms", duration.as_millis());
+            search_log_message!(debug, "succeeded");
         } else {
-            trace!("TerminalView: {path_hyperlink_navigation:?} search did not find a real file for maybe_path in {}ms", duration.as_millis());
+            search_log_message!(trace, "did not find a real file");
         }
 
         open_target
