@@ -603,7 +603,7 @@ pub struct TerminalContent {
     last_hovered_path_like_target: Option<PathLikeTarget>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct HoveredWord {
     pub word: String,
     pub word_match: RangeInclusive<AlacPoint>,
@@ -611,7 +611,13 @@ pub struct HoveredWord {
 
 enum MaybeHyperlink {
     Url(HoveredWord),
-    PathLike(Option<HoveredWord>, MaybePathLike),
+    PathLike(MaybePathLike, Option<HoveredWord>),
+}
+
+#[derive(Eq, PartialEq)]
+enum MaybeNavigationTargetKind {
+    PreExisting,
+    New,
 }
 
 impl Default for TerminalContent {
@@ -993,7 +999,7 @@ impl Terminal {
                                 file_url_as_path,
                                 &hovered_url.word_match,
                             );
-                            Some(MaybeHyperlink::PathLike(Some(hovered_url), maybe_path_like))
+                            Some(MaybeHyperlink::PathLike(maybe_path_like, Some(hovered_url)))
                         } else {
                             Some(MaybeHyperlink::Url(hovered_url))
                         }
@@ -1001,17 +1007,15 @@ impl Terminal {
                         regex_match_at(term, point, &mut self.word_regex).map(|word_match| {
                             let maybe_path_like =
                                 MaybePathLike::from_hovered_word_match(term, &word_match);
-                            MaybeHyperlink::PathLike(
-                                maybe_path_like.best_heuristic_hovered_word(term),
-                                maybe_path_like,
-                            )
+                            let hovered_word = maybe_path_like.best_heuristic_hovered_word(term);
+                            MaybeHyperlink::PathLike(maybe_path_like, hovered_word)
                         })
                     }
                 } else {
                     None
                 };
 
-                if let Some((target, is_new_target)) = self.update_last_hovered(
+                if let Some((target, target_kind)) = self.update_last_hovered(
                     maybe_hyperlink,
                     point_within_last_hovered,
                     self.working_directory(),
@@ -1020,7 +1024,7 @@ impl Terminal {
                     if *open {
                         debug!("Opening {target:?}");
                         cx.emit(Event::Open(target));
-                    } else if is_new_target {
+                    } else if target_kind == MaybeNavigationTargetKind::New {
                         cx.emit(Event::NewNavigationTarget(Some(target)));
                     }
                 }
@@ -1034,7 +1038,7 @@ impl Terminal {
         point_within_last_hovered: bool,
         terminal_dir: Option<PathBuf>,
         cx: &mut Context<Self>,
-    ) -> Option<(MaybeNavigationTarget, bool)> {
+    ) -> Option<(MaybeNavigationTarget, MaybeNavigationTargetKind)> {
         let Some(maybe_hyperlink) = maybe_hyperlink else {
             // No MaybeHyperlink was found
             if !point_within_last_hovered {
@@ -1052,16 +1056,22 @@ impl Terminal {
                 self.last_content.last_hovered_path_like_target = None;
                 if let Some(last_hovered_word) = self.last_content.last_hovered_word.as_ref() {
                     if last_hovered_word == &hovered_word {
-                        return Some((MaybeNavigationTarget::Url(hovered_word.word), false));
+                        return Some((
+                            MaybeNavigationTarget::Url(hovered_word.word),
+                            MaybeNavigationTargetKind::PreExisting,
+                        ));
                     }
                 }
 
                 self.last_content.last_hovered_word = Some(hovered_word.clone());
                 cx.notify();
 
-                Some((MaybeNavigationTarget::Url(hovered_word.word), true))
+                Some((
+                    MaybeNavigationTarget::Url(hovered_word.word),
+                    MaybeNavigationTargetKind::New,
+                ))
             }
-            MaybeHyperlink::PathLike(hovered_word, maybe_path_like) => {
+            MaybeHyperlink::PathLike(maybe_path_like, hovered_word) => {
                 if let Some(last_hovered_path_like_target) =
                     self.last_content.last_hovered_path_like_target.as_ref()
                 {
@@ -1070,7 +1080,7 @@ impl Terminal {
                     {
                         return Some((
                             MaybeNavigationTarget::PathLike(last_hovered_path_like_target.clone()),
-                            false,
+                            MaybeNavigationTargetKind::PreExisting,
                         ));
                     }
                 }
@@ -1092,7 +1102,10 @@ impl Terminal {
 
                 self.last_content.last_hovered_path_like_target = Some(path_like_target.clone());
 
-                Some((MaybeNavigationTarget::PathLike(path_like_target), true))
+                Some((
+                    MaybeNavigationTarget::PathLike(path_like_target),
+                    MaybeNavigationTargetKind::New,
+                ))
             }
         }
     }
@@ -2145,7 +2158,7 @@ pub fn get_color_at_index(index: usize, theme: &Theme) -> Hsla {
 ///
 /// Wikipedia gives a formula for calculating the index for a given color:
 ///
-/// ```zsh
+/// ```none
 /// index = 16 + 36 × r + 6 × g + b (0 ≤ r, g, b ≤ 5)
 /// ```
 ///

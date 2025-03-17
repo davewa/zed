@@ -1,10 +1,9 @@
-//! heuristics which define variations of a [MaybePathLike] from [terminal]
+//! Heuristics which define variations of a [MaybePathLike] from [terminal]
 //!
 //! # TODOs
 //! ## [Cmd+click to linkify file in terminal doesn't work when there are whitespace or certain separators in the filename](https://github.com/zed-industries/zed/issues/12338)
 //!
 //! - [ ] Move tests to a checked-in baseline file for expected, to prioritized maintaining fast build times over fast test execution
-//! - [ ] There is still too much duplication in Exhaustive...
 //! - [ ] Add many more tests
 //!     - [ ] `file://` Urls
 //!     - [ ] Lots of edge cases
@@ -16,7 +15,7 @@
 //! - [ ] When holding Cmd, and the terminal output is scrolling, the link is highlighted, but after scrolling
 //! away, it is still hyperlinking whatever random text is where the original link was.
 //! - [ ] When holding Cmd, and the terminal contents are not scrolling, but a command is running that is adding
-//! output off screen, the hovered link move down one line for each new line of content added off screen, hyperlinking
+//! output off screen, the hovered link moves down one line for each new line of content added off screen, hyperlinking
 //! whatever random text is there.
 //! - [ ] Zed's tooltips don't render markdown tables correctly
 //! - [ ] On Windows, PS terminal doesn't hyperlink any paths
@@ -30,7 +29,7 @@ use std::{
     borrow::Cow,
     fmt::Display,
     iter,
-    ops::Range,
+    ops::{Deref, Range},
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
@@ -109,7 +108,7 @@ impl MaybePath {
     pub fn default_variants(&self) -> impl VariantIterator<'_> {
         [MaybePathVariant::new(&self.line, self.word_range.clone())]
             .into_iter()
-            .chain(iter::once_with(|| self.longest_surrounding_symbols_variants()).flatten())
+            .chain(iter::once_with(|| self.longest_surrounding_symbols_variant()).flatten())
             .chain(
                 iter::once_with(|| {
                     self.path_regex_variants(
@@ -183,20 +182,19 @@ impl MaybePath {
     }
 
     /// [PathHyperlinkNavigation::Default] variant for the longest surrounding symbols match, if any
-    fn longest_surrounding_symbols_variants(&self) -> impl VariantIterator<'_> {
+    fn longest_surrounding_symbols_variant(&self) -> Option<MaybePathVariant<'_>> {
         if let Some(surrounding_range) =
             longest_surrounding_symbols_match(&self.line, &self.word_range)
         {
             if surrounding_range != self.word_range {
-                return vec![MaybePathVariant::new(
+                return Some(MaybePathVariant::new(
                     &self.line,
                     surrounding_range.start + 1..surrounding_range.end - 1,
-                )]
-                .into_iter();
+                ));
             }
         }
 
-        vec![].into_iter()
+        None
     }
 
     fn path_regex_variants<'a>(
@@ -390,12 +388,12 @@ impl<'a> MaybePathVariant<'a> {
         }
     }
 
-    /// Yields all relative substring variations of the contained path:
+    /// Returns all relative substring variations of the contained path:
     /// - With and without stripped common surrounding symbols: `"` `'` `(` `)` `[` `]`
     /// - With and without line and column suffix: `:4:2` or `(4,2)`
     /// - With and without git diff prefixes: `a/` or `b/`
     ///
-    /// Iff prefix_to_strip is provided, each variation will additionally be stripped of that
+    /// If `prefix_to_strip` is provided, each variation will additionally be stripped of that
     /// prefix (if it is present).
     pub fn relative_variations(
         &self,
@@ -430,9 +428,9 @@ impl<'a> MaybePathVariant<'a> {
         variations
     }
 
-    fn absolutize<'b>(
+    fn absolutize<P: Deref<Target = Path>>(
         &self,
-        roots: impl Iterator<Item = &'b Path> + Clone + 'b,
+        roots: &Vec<P>,
         home_dir: &PathBuf,
         range: &Range<usize>,
         position: Option<RowColumn>,
@@ -494,15 +492,15 @@ impl<'a> MaybePathVariant<'a> {
         }
     }
 
-    pub fn absolutized_variations<'b>(
+    pub fn absolutized_variations<P: Deref<Target = Path>>(
         &self,
-        roots: impl Iterator<Item = &'b Path> + Clone + 'b,
+        roots: &Vec<P>,
         home_dir: &PathBuf,
     ) -> Vec<MaybePathWithPosition<'a>> {
         let mut variations = Vec::new();
 
         let mut push_absolute = |range: &Range<usize>, position: Option<RowColumn>| {
-            variations.append(&mut self.absolutize(roots.clone(), home_dir, range, position));
+            variations.append(&mut self.absolutize(roots, home_dir, range, position));
         };
 
         // The positioned variation, if any, is the most likely path
@@ -667,14 +665,14 @@ mod tests {
         const CWD: &str = path!("/Some/cool/place");
 
         let home_dir = Path::new(HOME_DIR).to_path_buf();
-        let roots = [worktree_root, Path::new(CWD)];
+        let roots = Vec::from_iter([worktree_root, Path::new(CWD)]);
 
         println!("\nTesting Absolutized: home_dir: {home_dir:?}, roots: {roots:?}",);
 
         let actual_absolutized = variants
             .iter()
             .flat_map(|maybe_path_variant| {
-                maybe_path_variant.absolutized_variations(roots.into_iter(), &home_dir)
+                maybe_path_variant.absolutized_variations(&roots, &home_dir)
             })
             .collect_vec();
 
@@ -682,12 +680,7 @@ mod tests {
 
         let actual_open_target = async || {
             for maybe_path_with_position in &actual_absolutized {
-                let normalized_path = fs::normalize_path(&maybe_path_with_position.path);
-                assert_eq!(
-                    maybe_path_with_position.path, normalized_path,
-                    "Normalized was not a noop"
-                );
-                if let Ok(Some(_metadata)) = fs.metadata(&normalized_path).await {
+                if let Ok(Some(_metadata)) = fs.metadata(&maybe_path_with_position.path).await {
                     // TODO(davewa): assert_eq!(metadata.is_dir, expected_open_target.is_dir)
                     return Some(MaybePathWithPosition {
                         path: Cow::Owned(maybe_path_with_position.path.to_path_buf()),

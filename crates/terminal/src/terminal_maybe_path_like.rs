@@ -2,10 +2,6 @@
 //!
 //! # Possible future improvements
 //!
-//! - Support hyperlink-like paths.
-//! Currently if alacrity decides something is a link it will not be considered
-//! a maybe path unless it is a `file://` url. However, there could be a real file with a name that looks like
-//! a non-`file://` url.
 //! - Only match git diff if line starts with `+++ a/` and treat the whole rest of the line as the path
 //! - Support chunk line navigation in git diff output, e.g. `@@ <line>,<lines> @@`
 //! and `+ blah`.
@@ -46,9 +42,14 @@
 use super::WORD_REGEX;
 use crate::{terminal_settings::PathHyperlinkNavigation, HoveredWord, ZedListener};
 use alacritty_terminal::{index::Boundary, term::search::Match, Term};
-use log::{debug, trace};
+use log::{debug, info, trace};
 use regex::Regex;
-use std::{fmt::Display, ops::Range, sync::LazyLock};
+use std::{
+    borrow::Borrow,
+    fmt::Display,
+    ops::{Deref, Range},
+    sync::LazyLock,
+};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// These are valid in paths and are not matched by [WORD_REGEX].
@@ -209,24 +210,61 @@ const DEFAULT_PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 1] = [DEFAULT_PATH_ROW_
 const ADVANCED_PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 1] =
     [ADVANCED_PATH_ROW_COLUMN_DESC_REGEX];
 
+/// Used on user settings provided regexes
+pub fn load_path_hyperlink_regexes<'a, T>(regexes: &'a T) -> Vec<Regex>
+where
+    &'a T: IntoIterator<
+        Item: Deref<Target: Borrow<str>> + std::fmt::Debug,
+        IntoIter: ExactSizeIterator,
+    >,
+{
+    // Common prefix for diagnostic log messages
+    macro_rules! error_prefix {
+        ($regex:expr) => {
+            format!(
+                "Failed to load a path hyperlink regex, {:?}
+, specified in 'terminal.path_hyperlink_regexes' setting, ",
+                $regex
+            )
+        };
+    }
+
+    let regexes = regexes.into_iter();
+    let mut loaded_regexes = Vec::<Regex>::with_capacity(regexes.len());
+    for regex in regexes {
+        let Ok(regex) = Regex::new(regex.deref().borrow())
+            .inspect_err(|err| info!("{} error was: {err:?}", error_prefix!(regex)))
+        else {
+            continue;
+        };
+
+        if regex
+            .capture_names()
+            .flatten()
+            .find(|&name| name == "path")
+            .is_none()
+        {
+            info!(
+                "{} missing required `path` named capture group.",
+                error_prefix!(regex)
+            );
+            continue;
+        }
+
+        loaded_regexes.push(regex);
+    }
+
+    loaded_regexes
+}
+
 /// Returns a list of the preapproved path hyperlink regexes
 pub fn preapproved_path_hyperlink_regexes(
     path_hyperlink_navigation: PathHyperlinkNavigation,
 ) -> &'static Vec<Regex> {
-    static DEFAULT_PREAPPROVED_MAYBE_PATH_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-        let mut regexes = Vec::new();
-        for regex in DEFAULT_PREAPPROVED_PATH_HYPERLINK_REGEXES {
-            regexes.push(Regex::new(regex).unwrap());
-        }
-        regexes
-    });
-    static ADVANCED_PREAPPROVED_MAYBE_PATH_REGEXES: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-        let mut regexes = Vec::new();
-        for regex in ADVANCED_PREAPPROVED_PATH_HYPERLINK_REGEXES {
-            regexes.push(Regex::new(regex).unwrap());
-        }
-        regexes
-    });
+    static DEFAULT_PREAPPROVED_MAYBE_PATH_REGEXES: LazyLock<Vec<Regex>> =
+        LazyLock::new(|| load_path_hyperlink_regexes(&DEFAULT_PREAPPROVED_PATH_HYPERLINK_REGEXES));
+    static ADVANCED_PREAPPROVED_MAYBE_PATH_REGEXES: LazyLock<Vec<Regex>> =
+        LazyLock::new(|| load_path_hyperlink_regexes(&ADVANCED_PREAPPROVED_PATH_HYPERLINK_REGEXES));
 
     if path_hyperlink_navigation == PathHyperlinkNavigation::Default {
         &DEFAULT_PREAPPROVED_MAYBE_PATH_REGEXES
@@ -241,7 +279,6 @@ pub enum PathRegexSearchMode {
     ReturnAllMatches,
 }
 
-/// If `hovered_word_range` overlaps the regex match, returns the matched range
 pub fn path_regex_match<'a>(
     maybe_path: &'a str,
     path_regex_search_mode: PathRegexSearchMode,
@@ -253,9 +290,9 @@ pub fn path_regex_match<'a>(
             let Some(captures) = regex.captures(&maybe_path) else {
                 return None;
             };
-            // Note: Do NOT use captures[CUSTOM_PATH_HYPERLINK_REGEX_CAPTURE_NAME] here because
-            // it can panic. This is extra paranoid because we don't load path regexes that do not
-            // contain a path named capture group in the first place (see [init_path_regexes]).
+            // Note: Do NOT use captures["path"] here because it can panic. This is extra
+            // paranoid because we don't load path regexes that do not contain a path
+            // named capture group in the first place (see [init_path_hyperlink_regexes]).
             let Some(path_capture) = captures.name("path") else {
                 debug!("'path' capture not matched in regex: {:#?}", regex.as_str());
                 return None;

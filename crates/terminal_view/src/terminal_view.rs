@@ -18,6 +18,7 @@ use project::Entry;
 use project::{search::SearchQuery, terminals::TerminalKind, Fs, Metadata, Project};
 use regex::Regex;
 use schemars::JsonSchema;
+use terminal::terminal_maybe_path_like::load_path_hyperlink_regexes;
 use terminal::terminal_settings::PathHyperlinkNavigation;
 use terminal::{
     alacritty_terminal::{
@@ -54,7 +55,6 @@ use settings::{Settings, SettingsStore};
 use smol::Timer;
 use zed_actions::assistant::InlineAssist;
 
-use std::ops::Deref;
 use std::time::Instant;
 use std::{
     borrow::Cow,
@@ -216,13 +216,9 @@ impl TerminalView {
             hover_target_tooltip: None,
             maybe_path_open_target: None,
             path_hyperlink_navigation: TerminalSettings::get_global(cx).path_hyperlink_navigation,
-            path_hyperlink_regexes: Arc::new(
-                TerminalSettings::get_global(cx)
-                    .path_hyperlink_regexes
-                    .iter()
-                    .map(|regex| Regex::new(regex).unwrap())
-                    .collect_vec(),
-            ),
+            path_hyperlink_regexes: Arc::new(load_path_hyperlink_regexes(
+                &TerminalSettings::get_global(cx).path_hyperlink_regexes,
+            )),
             path_hyperlink_timeout: Duration::from_millis(
                 TerminalSettings::get_global(cx).path_hyperlink_timeout,
             ),
@@ -863,20 +859,22 @@ impl TerminalView {
     fn update_maybe_path_open_target(
         &mut self,
         path_like_target: &PathLikeTarget,
-        open_target: Option<&OpenTarget>,
+        open_target: Option<OpenTarget>,
         cx: &mut Context<Self>,
     ) {
         self.terminal.update(cx, |term, cx| {
             term.confirm_path_like_target(
                 path_like_target,
-                open_target.map(|open_target| open_target.path().hyperlink_range()),
+                open_target
+                    .as_ref()
+                    .map(|open_target| open_target.path().hyperlink_range()),
                 cx,
             )
         });
 
         self.maybe_path_open_target = open_target.map(|open_target| MaybePathOpenTarget {
             path_like_target: path_like_target.clone(),
-            open_target: open_target.clone(),
+            open_target,
         });
     }
 }
@@ -932,8 +930,9 @@ fn subscribe_for_terminal_events(
                                         this.path_hyperlink_navigation, this.path_hyperlink_timeout, cx
                                     );
                                 let open_target = smol::block_on(open_target_task);
-                                this.update_maybe_path_open_target(path_like_target, open_target.as_ref(), cx);
-                                open_target.map(|open_target| path_like_target.maybe_path_like.text_at(&open_target.path().hyperlink_range()).to_string())
+                                let hover_tooltip = open_target.as_ref().map(|open_target| path_like_target.maybe_path_like.text_at(&open_target.path().hyperlink_range()).to_string());
+                                this.update_maybe_path_open_target(path_like_target, open_target, cx);
+                                hover_tooltip
                             }
                         });
                 cx.notify()
@@ -1034,8 +1033,8 @@ fn subscribe_for_terminal_events(
 
                         if newly_confirmed_maybe_path {
                             terminal_view.update(&mut cx, |this, cx| {
-                                this.update_maybe_path_open_target(&path_like_target, Some(&open_target), cx);
                                 this.hover_target_tooltip = Some(path_like_target.maybe_path_like.text_at(&open_target.path().hyperlink_range()).to_string());
+                                this.update_maybe_path_open_target(&path_like_target, Some(open_target), cx);
                             })?;
                         }
 
@@ -1096,7 +1095,7 @@ fn possible_open_target(
         return Task::ready(None);
     };
 
-    // We can be on FS remote part, without real FS, so cannot check for existence the path right away.
+    // We can be on FS remote part, without real FS, so cannot check the path for existence right away.
     let worktree_candidates = workspace
         .read(cx)
         .worktrees(cx)
@@ -1187,7 +1186,7 @@ fn possible_open_target_from_fs(
         let mut checked_variations = 0;
         for maybe_path_variant in maybe_path_variants {
             for maybe_path_with_position in
-                maybe_path_variant.absolutized_variations(roots.iter().map(Deref::deref), home_dir)
+                maybe_path_variant.absolutized_variations(roots, home_dir)
             {
                 if timed_out() {
                     return (None, checked_variations);
@@ -1271,12 +1270,12 @@ fn possible_open_target_from_fs(
             ($log_level:ident, $message:literal) => {{
                 let duration = Instant::now()
                     .saturating_duration_since(search_start_time)
-                    .as_millis();
+                    .as_micros();
                 $log_level!(
                     concat!(
                         "{:?} maybe path search for real file ",
                         $message,
-                        " after {}ms ({} variations checked)"
+                        " after {}µs ({} variations checked)"
                     ),
                     path_hyperlink_navigation,
                     duration,
