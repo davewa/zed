@@ -1018,7 +1018,7 @@ impl Terminal {
                     cx,
                 ) {
                     if *open {
-                        debug!("Terminal: Opening target: {target:?}",);
+                        debug!("Opening {target:?}");
                         cx.emit(Event::Open(target));
                     } else if is_new_target {
                         cx.emit(Event::NewNavigationTarget(Some(target)));
@@ -1105,12 +1105,12 @@ impl Terminal {
     ) {
         let Some(last_path_like_target) = self.last_content.last_hovered_path_like_target.as_ref()
         else {
-            trace!("Terminal: Confirmed path hyperlink: Ignoring");
+            trace!("Confirmed path hyperlink: Ignoring");
             return;
         };
 
         if last_path_like_target.id != path_like_target.id {
-            trace!("Terminal: Confirmed path hyperlink: Ignoring");
+            trace!("Confirmed path hyperlink: Ignoring");
             return;
         } else if path_like_target.maybe_path_like != last_path_like_target.maybe_path_like {
             debug_panic!("id's matched, but path_like_targets did not");
@@ -1119,10 +1119,10 @@ impl Terminal {
 
         let Some(confirmed_hyperlink_range) = confirmed_hyperlink_range else {
             if self.last_content.last_hovered_word.is_none() {
-                trace!("Terminal: Confirmed path hyperlink: Noop");
+                trace!("Confirmed path hyperlink: Noop");
                 return;
             } else {
-                trace!("Terminal: Confirmed path hyperlink: Clearing");
+                trace!("Confirmed path hyperlink: Clearing");
                 self.last_content.last_hovered_word = None;
                 cx.notify();
                 return;
@@ -1141,12 +1141,12 @@ impl Terminal {
 
         if let Some(last_hovered_word) = self.last_content.last_hovered_word.as_ref() {
             if last_hovered_word == &confirmed_hovered_word {
-                trace!("Terminal: Confirmed path hyperlink: Noop");
+                trace!("Confirmed path hyperlink: Noop");
                 return;
             }
         }
 
-        trace!("Terminal: Confirmed path hyperlink: Updating");
+        trace!("Confirmed path hyperlink: Updating");
         self.last_content.last_hovered_word = Some(confirmed_hovered_word);
         cx.notify()
     }

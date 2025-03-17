@@ -1202,7 +1202,7 @@ fn possible_open_target_from_fs(
                     .flatten()
                 {
                     debug!(
-                        "Terminal: MaybePath found absolutized variation: {:?}",
+                        "MaybePath found absolutized variation: {:?}",
                         maybe_path_with_position.path
                     );
                     return (
@@ -1214,7 +1214,7 @@ fn possible_open_target_from_fs(
                     );
                 } else {
                     trace!(
-                        "Terminal: MaybePath skipping absolutized variation: {:?}",
+                        "MaybePath skipping absolutized variation: {:?}",
                         maybe_path_with_position.path
                     );
                 }
@@ -1274,7 +1274,7 @@ fn possible_open_target_from_fs(
                     .as_millis();
                 $log_level!(
                     concat!(
-                        "TerminalView: {:?} maybe path search for real file ",
+                        "{:?} maybe path search for real file ",
                         $message,
                         " after {}ms ({} variations checked)"
                     ),
@@ -1290,7 +1290,7 @@ fn possible_open_target_from_fs(
         } else if open_target.is_some() {
             search_log_message!(debug, "succeeded");
         } else {
-            search_log_message!(trace, "did not find a real file");
+            search_log_message!(debug, "did not find a real file");
         }
 
         open_target

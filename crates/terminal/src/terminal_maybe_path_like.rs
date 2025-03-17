@@ -46,7 +46,7 @@
 use super::WORD_REGEX;
 use crate::{terminal_settings::PathHyperlinkNavigation, HoveredWord, ZedListener};
 use alacritty_terminal::{index::Boundary, term::search::Match, Term};
-use log::debug;
+use log::{debug, trace};
 use regex::Regex;
 use std::{fmt::Display, ops::Range, sync::LazyLock};
 use unicode_segmentation::UnicodeSegmentation;
@@ -251,14 +251,13 @@ pub fn path_regex_match<'a>(
         .iter()
         .filter_map(move |regex| {
             let Some(captures) = regex.captures(&maybe_path) else {
-                debug!("Regex should succeed if RegexSearch succeeded already");
                 return None;
             };
             // Note: Do NOT use captures[CUSTOM_PATH_HYPERLINK_REGEX_CAPTURE_NAME] here because
             // it can panic. This is extra paranoid because we don't load path regexes that do not
             // contain a path named capture group in the first place (see [init_path_regexes]).
             let Some(path_capture) = captures.name("path") else {
-                debug!("'path' capture not matched in regex");
+                debug!("'path' capture not matched in regex: {:#?}", regex.as_str());
                 return None;
             };
 
@@ -359,8 +358,8 @@ impl MaybePathLike {
             longest_surrounding_symbols_match(&self.line, &self.word_range)
         {
             let stripped_range = surrounding_range.start + 1..surrounding_range.end - 1;
-            debug!(
-                "Terminal: path heuristic 'longest surrounding symbols' match: {:?}",
+            trace!(
+                "Maybe path heuristic 'longest surrounding symbols' match: {:?}",
                 self.text_at(&stripped_range)
             );
             Some(HoveredWord {
@@ -368,8 +367,8 @@ impl MaybePathLike {
                 word_match: self.match_from_text_range(term, &stripped_range),
             })
         } else if self.looks_like_a_path_match() {
-            debug!(
-                "Terminal: path heuristic 'looks like a path' match: {:?}",
+            trace!(
+                "Maybe path heuristic 'looks like a path' match: {:?}",
                 &self.line[self.word_range.clone()]
             );
             Some(HoveredWord {
@@ -383,8 +382,8 @@ impl MaybePathLike {
         )
         .nth(0)
         {
-            debug!(
-                "Terminal: path heuristic 'path regex' match: {:?}",
+            trace!(
+                "Maybe path heuristic 'path regex' match: {:?}",
                 self.text_at(&path_range)
             );
             Some(HoveredWord {

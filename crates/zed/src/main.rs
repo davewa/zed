@@ -27,7 +27,7 @@ use prompt_store::PromptBuilder;
 use reqwest_client::ReqwestClient;
 
 use assets::Assets;
-use logger::init_logger;
+use logger::{init_logger, init_stdout_logger};
 use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
 use project::project_settings::ProjectSettings;
@@ -189,11 +189,11 @@ fn main() {
         return;
     }
 
-    // if stdout_is_a_pty() {
-    //     init_stdout_logger();
-    // } else {
-    init_logger();
-    // }
+    if stdout_is_a_pty() {
+        init_stdout_logger();
+    } else {
+        init_logger();
+    }
 
     log::info!("========== starting zed ==========");
 

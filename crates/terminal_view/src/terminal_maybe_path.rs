@@ -34,8 +34,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
 };
-#[cfg(doc)]
-use terminal::terminal_settings::PathHyperlinkNavigation;
 use terminal::{
     terminal_maybe_path_like::{
         longest_surrounding_symbols_match, path_regex_match, preapproved_path_hyperlink_regexes,
