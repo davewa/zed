@@ -903,6 +903,9 @@ mod tests {
         };
     }
 
+    const PATH_LINE_COLUMN_REGEX_PYTHON: &str =
+        "\"(?<path>[^\"]+)\"((?<suffix>(, line (?<line>[0-9]+))))?";
+
     // <https://github.com/zed-industries/zed/issues/16004>
     #[cfg(not(target_os = "windows"))]
     #[gpui::test]
@@ -1032,9 +1035,6 @@ mod tests {
                 .into_iter(),
             ),
         );
-
-        const PATH_LINE_COLUMN_REGEX_PYTHON: &str =
-            "\"(?<path>[^,]+)\"((?<suffix>(, line (?<line>[0-9]+))))?";
 
         let path_regexes = Arc::new(Vec::from_iter([
             Regex::new(PATH_LINE_COLUMN_REGEX_PYTHON).unwrap()
@@ -1308,9 +1308,6 @@ mod tests {
             ),
         );
 
-        const PATH_LINE_COLUMN_REGEX_PYTHON: &str =
-            "\"(?<path>[^,]+)\"((?<suffix>(, line (?<line>[0-9]+))))?";
-
         let path_regexes = Arc::new(Vec::from_iter([
             Regex::new(PATH_LINE_COLUMN_REGEX_PYTHON).unwrap()
         ]));
@@ -1554,9 +1551,13 @@ mod tests {
             ),
         );
 
+        let path_regexes = Arc::new(Vec::from_iter([
+            Regex::new(PATH_LINE_COLUMN_REGEX_PYTHON).unwrap()
+        ]));
+
         test_maybe_paths(
             Arc::clone(&fs),
-            Arc::new(Vec::new()),
+            Arc::clone(&path_regexes),
             &Path::new(abs!("/root")),
             rel!("# ./app/services/opensearch/contacts/create_service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'"),
             Some(1),
@@ -1676,7 +1677,7 @@ mod tests {
 
         test_maybe_paths(
             Arc::clone(&fs),
-            Arc::new(Vec::new()),
+            Arc::clone(&path_regexes),
             &Path::new(abs!("/root")),
             rel!("# ./app/services/open search/contacts/create service.rb:9:in 'Opensearch::Contacts::CreateService#validate_field_keys'"),
             Some(2),
