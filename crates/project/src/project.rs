@@ -3,13 +3,13 @@ mod color_extractor;
 pub mod connection_manager;
 pub mod debounced_delay;
 pub mod debugger;
-pub mod git;
+pub mod git_store;
 pub mod image_store;
 pub mod lsp_command;
 pub mod lsp_store;
+mod manifest_tree;
 pub mod prettier_store;
 pub mod project_settings;
-mod project_tree;
 pub mod search;
 mod task_inventory;
 pub mod task_store;
@@ -24,20 +24,21 @@ mod direnv;
 mod environment;
 use buffer_diff::BufferDiff;
 pub use environment::{EnvironmentErrorMessage, ProjectEnvironmentEvent};
-use git::Repository;
+use git_store::{Repository, RepositoryId};
 pub mod search_history;
 mod yarn;
 
-use crate::git::GitStore;
+use crate::git_store::GitStore;
+pub use git_store::git_traversal::{ChildEntriesGitIter, GitEntry, GitEntryRef, GitTraversal};
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use buffer_store::{BufferStore, BufferStoreEvent};
 use client::{
-    proto, Client, Collaborator, PendingEntitySubscription, ProjectId, TypedEnvelope, UserStore,
+    Client, Collaborator, PendingEntitySubscription, ProjectId, TypedEnvelope, UserStore, proto,
 };
 use clock::ReplicaId;
 
-use dap::{client::DebugAdapterClient, DebugAdapterConfig};
+use dap::{DapRegistry, DebugAdapterConfig, client::DebugAdapterClient};
 
 use collections::{BTreeSet, HashMap, HashSet};
 use debounced_delay::DebouncedDelay;
@@ -48,23 +49,23 @@ use debugger::{
 };
 pub use environment::ProjectEnvironment;
 use futures::{
+    StreamExt,
     channel::mpsc::{self, UnboundedReceiver},
     future::try_join_all,
-    StreamExt,
 };
 pub use image_store::{ImageItem, ImageStore};
 use image_store::{ImageItemEvent, ImageStoreEvent};
 
-use ::git::{blame::Blame, repository::GitRepository, status::FileStatus};
+use ::git::{blame::Blame, status::FileStatus};
 use gpui::{
     AnyEntity, App, AppContext, AsyncApp, BorrowAppContext, Context, Entity, EventEmitter, Hsla,
     SharedString, Task, WeakEntity, Window,
 };
 use itertools::Itertools;
 use language::{
-    language_settings::InlayHintKind, proto::split_operations, Buffer, BufferEvent, Capability,
-    CodeLabel, File as _, Language, LanguageName, LanguageRegistry, PointUtf16, ToOffset,
-    ToPointUtf16, Toolchain, ToolchainList, Transaction, Unclipped,
+    Buffer, BufferEvent, Capability, CodeLabel, Language, LanguageName, LanguageRegistry,
+    PointUtf16, ToOffset, ToPointUtf16, Toolchain, ToolchainList, Transaction, Unclipped,
+    language_settings::InlayHintKind, proto::split_operations,
 };
 use lsp::{
     CodeActionKind, CompletionContext, CompletionItemKind, DocumentHighlightKind, LanguageServerId,
@@ -72,14 +73,15 @@ use lsp::{
 };
 use lsp_command::*;
 use lsp_store::{CompletionDocumentation, LspFormatTarget, OpenLspBufferHandle};
+pub use manifest_tree::ManifestProviders;
 use node_runtime::NodeRuntime;
 use parking_lot::Mutex;
 pub use prettier_store::PrettierStore;
 use project_settings::{ProjectSettings, SettingsObserver, SettingsObserverEvent};
 use remote::{SshConnectionOptions, SshRemoteClient};
 use rpc::{
-    proto::{FromProto, LanguageServerPromptResponse, ToProto, SSH_PROJECT_ID},
     AnyProtoClient, ErrorCode,
+    proto::{FromProto, LanguageServerPromptResponse, SSH_PROJECT_ID, ToProto},
 };
 use search::{SearchInputKind, SearchQuery, SearchResult};
 use search_history::SearchHistory;
@@ -102,14 +104,13 @@ use terminals::Terminals;
 use text::{Anchor, BufferId};
 use toolchain_store::EmptyToolchainStore;
 use util::{
-    maybe,
-    paths::{compare_paths, SanitizedPath},
-    ResultExt as _,
+    ResultExt as _, maybe,
+    paths::{SanitizedPath, compare_paths},
 };
 use worktree::{CreatedEntry, Snapshot, Traversal};
 pub use worktree::{
-    Entry, EntryKind, File, LocalWorktree, PathChange, ProjectEntryId, UpdatedEntriesSet,
-    UpdatedGitRepositoriesSet, Worktree, WorktreeId, WorktreeSettings, FS_WATCH_LATENCY,
+    Entry, EntryKind, FS_WATCH_LATENCY, File, LocalWorktree, PathChange, ProjectEntryId,
+    UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId, WorktreeSettings,
 };
 use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 
@@ -161,7 +162,9 @@ pub struct Project {
     active_entry: Option<ProjectEntryId>,
     buffer_ordered_messages_tx: mpsc::UnboundedSender<BufferOrderedMessage>,
     languages: Arc<LanguageRegistry>,
+    debug_adapters: Arc<DapRegistry>,
     dap_store: Entity<DapStore>,
+
     breakpoint_store: Entity<BreakpointStore>,
     client: Arc<client::Client>,
     join_project_response_message_id: u32,
@@ -268,7 +271,6 @@ pub enum Event {
     WorktreeOrderChanged,
     WorktreeRemoved(WorktreeId),
     WorktreeUpdatedEntries(WorktreeId, UpdatedEntriesSet),
-    WorktreeUpdatedGitRepositories(WorktreeId),
     DiskBasedDiagnosticsStarted {
         language_server_id: LanguageServerId,
     },
@@ -388,6 +390,8 @@ pub struct Completion {
     pub documentation: Option<CompletionDocumentation>,
     /// Completion data source which it was constructed from.
     pub source: CompletionSource,
+    /// A path to an icon for this completion that is shown in the menu.
+    pub icon_path: Option<SharedString>,
     /// An optional callback to invoke when this completion is confirmed.
     /// Returns, whether new completions should be retriggered after the current one.
     /// If `true` is returned, the editor will show a new completion menu after this completion is confirmed.
@@ -655,6 +659,15 @@ pub struct Symbol {
     pub signature: [u8; 32],
 }
 
+#[derive(Clone, Debug)]
+pub struct DocumentSymbol {
+    pub name: String,
+    pub kind: lsp::SymbolKind,
+    pub range: Range<Unclipped<PointUtf16>>,
+    pub selection_range: Range<Unclipped<PointUtf16>>,
+    pub children: Vec<DocumentSymbol>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct HoverBlock {
     pub text: String,
@@ -804,6 +817,7 @@ impl Project {
         node: NodeRuntime,
         user_store: Entity<UserStore>,
         languages: Arc<LanguageRegistry>,
+        debug_adapters: Arc<DapRegistry>,
         fs: Arc<dyn Fs>,
         env: Option<HashMap<String, String>>,
         cx: &mut App,
@@ -840,6 +854,7 @@ impl Project {
                     node.clone(),
                     fs.clone(),
                     languages.clone(),
+                    debug_adapters.clone(),
                     environment.clone(),
                     toolchain_store.read(cx).as_language_toolchain_store(),
                     breakpoint_store.clone(),
@@ -925,6 +940,7 @@ impl Project {
                 active_entry: None,
                 snippets,
                 languages,
+                debug_adapters,
                 client,
                 task_store,
                 user_store,
@@ -933,6 +949,7 @@ impl Project {
                 ssh_client: None,
                 breakpoint_store,
                 dap_store,
+
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
@@ -1044,13 +1061,7 @@ impl Project {
             });
 
             let git_store = cx.new(|cx| {
-                GitStore::ssh(
-                    &worktree_store,
-                    buffer_store.clone(),
-                    environment.clone(),
-                    ssh_proto.clone(),
-                    cx,
-                )
+                GitStore::ssh(&worktree_store, buffer_store.clone(), ssh_proto.clone(), cx)
             });
 
             cx.subscribe(&ssh, Self::on_ssh_event).detach();
@@ -1087,6 +1098,7 @@ impl Project {
                 active_entry: None,
                 snippets,
                 languages,
+                debug_adapters: Arc::new(DapRegistry::default()),
                 client,
                 task_store,
                 user_store,
@@ -1224,7 +1236,6 @@ impl Project {
 
         let breakpoint_store =
             cx.new(|_| BreakpointStore::remote(remote_id, client.clone().into()))?;
-
         let dap_store = cx.new(|_cx| {
             DapStore::new_remote(remote_id, client.clone().into(), breakpoint_store.clone())
         })?;
@@ -1311,6 +1322,7 @@ impl Project {
                 collaborators: Default::default(),
                 join_project_response_message_id: response.message_id,
                 languages,
+                debug_adapters: Arc::new(DapRegistry::default()),
                 user_store: user_store.clone(),
                 task_store,
                 snippets,
@@ -1430,18 +1442,18 @@ impl Project {
         }
     }
 
+    pub fn queue_debug_session(&mut self, config: DebugAdapterConfig, cx: &mut Context<Self>) {
+        if config.locator.is_none() {
+            self.start_debug_session(config, cx).detach_and_log_err(cx);
+        }
+    }
+
     pub fn start_debug_session(
         &mut self,
         config: DebugAdapterConfig,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Session>>> {
-        let worktree = maybe!({
-            if let Some(cwd) = &config.cwd {
-                Some(self.find_worktree(cwd.as_path(), cx)?.0)
-            } else {
-                self.worktrees(cx).next()
-            }
-        });
+        let worktree = maybe!({ self.worktrees(cx).next() });
 
         let Some(worktree) = &worktree else {
             return Task::ready(Err(anyhow!("Failed to find a worktree")));
@@ -1455,14 +1467,51 @@ impl Project {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    pub fn fake_debug_session(
+        &mut self,
+        request: task::DebugRequestType,
+        caps: Option<dap::Capabilities>,
+        fails: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Session>>> {
+        use dap::{Capabilities, FakeAdapter};
+        use task::DebugRequestDisposition;
+
+        let worktree = maybe!({ self.worktrees(cx).next() });
+
+        let Some(worktree) = &worktree else {
+            return Task::ready(Err(anyhow!("Failed to find a worktree")));
+        };
+        let config = DebugAdapterConfig {
+            label: "test config".into(),
+            adapter: FakeAdapter::ADAPTER_NAME.into(),
+            request: DebugRequestDisposition::UserConfigured(request),
+            initialize_args: None,
+            tcp_connection: None,
+            locator: None,
+            stop_on_entry: None,
+        };
+        let caps = caps.unwrap_or(Capabilities {
+            supports_step_back: Some(false),
+            ..Default::default()
+        });
+        self.dap_store
+            .update(cx, |dap_store, cx| {
+                dap_store.new_fake_session(config, worktree, None, caps, fails, cx)
+            })
+            .1
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn example(
         root_paths: impl IntoIterator<Item = &Path>,
         cx: &mut AsyncApp,
     ) -> Entity<Project> {
         use clock::FakeSystemClock;
 
-        let fs = Arc::new(RealFs::default());
+        let fs = Arc::new(RealFs::new(None, cx.background_executor().clone()));
         let languages = LanguageRegistry::test(cx.background_executor().clone());
+        let debug_adapters = DapRegistry::default().into();
         let clock = Arc::new(FakeSystemClock::new());
         let http_client = http_client::FakeHttpClient::with_404_response();
         let client = cx
@@ -1476,6 +1525,7 @@ impl Project {
                     node_runtime::NodeRuntime::unavailable(),
                     user_store,
                     Arc::new(languages),
+                    debug_adapters,
                     fs,
                     None,
                     cx,
@@ -1506,6 +1556,7 @@ impl Project {
         use clock::FakeSystemClock;
 
         let languages = LanguageRegistry::test(cx.executor());
+        let debug_adapters = DapRegistry::fake();
         let clock = Arc::new(FakeSystemClock::new());
         let http_client = http_client::FakeHttpClient::with_404_response();
         let client = cx.update(|cx| client::Client::new(clock, http_client.clone(), cx));
@@ -1516,6 +1567,7 @@ impl Project {
                 node_runtime::NodeRuntime::unavailable(),
                 user_store,
                 Arc::new(languages),
+                Arc::new(debug_adapters),
                 fs,
                 None,
                 cx,
@@ -1559,6 +1611,10 @@ impl Project {
         &self.languages
     }
 
+    pub fn debug_adapters(&self) -> &Arc<DapRegistry> {
+        &self.debug_adapters
+    }
+
     pub fn client(&self) -> Arc<Client> {
         self.client.clone()
     }
@@ -1590,13 +1646,13 @@ impl Project {
     pub fn shell_environment_errors<'a>(
         &'a self,
         cx: &'a App,
-    ) -> impl Iterator<Item = (&'a WorktreeId, &'a EnvironmentErrorMessage)> {
+    ) -> impl Iterator<Item = (&'a Arc<Path>, &'a EnvironmentErrorMessage)> {
         self.environment.read(cx).environment_errors()
     }
 
-    pub fn remove_environment_error(&mut self, worktree_id: WorktreeId, cx: &mut Context<Self>) {
+    pub fn remove_environment_error(&mut self, abs_path: &Path, cx: &mut Context<Self>) {
         self.environment.update(cx, |environment, cx| {
-            environment.remove_environment_error(worktree_id, cx);
+            environment.remove_environment_error(abs_path, cx);
         });
     }
 
@@ -1764,8 +1820,9 @@ impl Project {
         project_path: &ProjectPath,
         cx: &App,
     ) -> Option<FileStatus> {
-        self.worktree_for_id(project_path.worktree_id, cx)
-            .and_then(|worktree| worktree.read(cx).status_for_file(&project_path.path))
+        self.git_store
+            .read(cx)
+            .project_path_git_status(project_path, cx)
     }
 
     pub fn visibility_for_paths(
@@ -2022,6 +2079,11 @@ impl Project {
         self.worktree_store.update(cx, |worktree_store, cx| {
             worktree_store.send_project_updates(cx);
         });
+        if let Some(remote_id) = self.remote_id() {
+            self.git_store.update(cx, |git_store, cx| {
+                git_store.shared(remote_id, self.client.clone().into(), cx)
+            });
+        }
         cx.emit(Event::Reshared);
         Ok(())
     }
@@ -2774,12 +2836,11 @@ impl Project {
                     .report_discovered_project_events(*worktree_id, changes);
                 cx.emit(Event::WorktreeUpdatedEntries(*worktree_id, changes.clone()))
             }
-            WorktreeStoreEvent::WorktreeUpdatedGitRepositories(worktree_id) => {
-                cx.emit(Event::WorktreeUpdatedGitRepositories(*worktree_id))
-            }
             WorktreeStoreEvent::WorktreeDeletedEntry(worktree_id, id) => {
                 cx.emit(Event::DeletedEntry(*worktree_id, *id))
             }
+            // Listen to the GitStore instead.
+            WorktreeStoreEvent::WorktreeUpdatedGitRepositories(_, _) => {}
         }
     }
 
@@ -2904,29 +2965,31 @@ impl Project {
     }
 
     fn recalculate_buffer_diffs(&mut self, cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| loop {
-            let task = this
-                .update(cx, |this, cx| {
-                    let buffers = this
-                        .buffers_needing_diff
-                        .drain()
-                        .filter_map(|buffer| buffer.upgrade())
-                        .collect::<Vec<_>>();
-                    if buffers.is_empty() {
-                        None
-                    } else {
-                        Some(this.git_store.update(cx, |git_store, cx| {
-                            git_store.recalculate_buffer_diffs(buffers, cx)
-                        }))
-                    }
-                })
-                .ok()
-                .flatten();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let task = this
+                    .update(cx, |this, cx| {
+                        let buffers = this
+                            .buffers_needing_diff
+                            .drain()
+                            .filter_map(|buffer| buffer.upgrade())
+                            .collect::<Vec<_>>();
+                        if buffers.is_empty() {
+                            None
+                        } else {
+                            Some(this.git_store.update(cx, |git_store, cx| {
+                                git_store.recalculate_buffer_diffs(buffers, cx)
+                            }))
+                        }
+                    })
+                    .ok()
+                    .flatten();
 
-            if let Some(task) = task {
-                task.await;
-            } else {
-                break;
+                if let Some(task) = task {
+                    task.await;
+                } else {
+                    break;
+                }
             }
         })
     }
@@ -2949,6 +3012,16 @@ impl Project {
     ) {
         self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.restart_language_servers_for_buffers(buffers, cx)
+        })
+    }
+
+    pub fn stop_language_servers_for_buffers(
+        &mut self,
+        buffers: Vec<Entity<Buffer>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.stop_language_servers_for_buffers(buffers, cx)
         })
     }
 
@@ -2981,7 +3054,7 @@ impl Project {
 
     pub fn available_toolchains(
         &self,
-        worktree_id: WorktreeId,
+        path: ProjectPath,
         language_name: LanguageName,
         cx: &App,
     ) -> Task<Option<ToolchainList>> {
@@ -2990,7 +3063,7 @@ impl Project {
                 cx.update(|cx| {
                     toolchain_store
                         .read(cx)
-                        .list_toolchains(worktree_id, language_name, cx)
+                        .list_toolchains(path, language_name, cx)
                 })
                 .ok()?
                 .await
@@ -3014,20 +3087,18 @@ impl Project {
 
     pub fn activate_toolchain(
         &self,
-        worktree_id: WorktreeId,
+        path: ProjectPath,
         toolchain: Toolchain,
         cx: &mut App,
     ) -> Task<Option<()>> {
         let Some(toolchain_store) = self.toolchain_store.clone() else {
             return Task::ready(None);
         };
-        toolchain_store.update(cx, |this, cx| {
-            this.activate_toolchain(worktree_id, toolchain, cx)
-        })
+        toolchain_store.update(cx, |this, cx| this.activate_toolchain(path, toolchain, cx))
     }
     pub fn active_toolchain(
         &self,
-        worktree_id: WorktreeId,
+        path: ProjectPath,
         language_name: LanguageName,
         cx: &App,
     ) -> Task<Option<Toolchain>> {
@@ -3036,7 +3107,7 @@ impl Project {
         };
         toolchain_store
             .read(cx)
-            .active_toolchain(worktree_id, language_name, cx)
+            .active_toolchain(path, language_name, cx)
     }
     pub fn language_server_statuses<'a>(
         &'a self,
@@ -3211,6 +3282,19 @@ impl Project {
     ) -> Task<Result<Vec<DocumentHighlight>>> {
         let position = position.to_point_utf16(buffer.read(cx));
         self.document_highlights_impl(buffer, position, cx)
+    }
+
+    pub fn document_symbols(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<DocumentSymbol>>> {
+        self.request_lsp(
+            buffer.clone(),
+            LanguageServerToQuery::FirstCapable,
+            GetDocumentSymbols,
+            cx,
+        )
     }
 
     pub fn symbols(&self, query: &str, cx: &mut Context<Self>) -> Task<Result<Vec<Symbol>>> {
@@ -3683,7 +3767,7 @@ impl Project {
         &mut self,
         source: WorktreeId,
         destination: WorktreeId,
-        cx: &mut Context<'_, Self>,
+        cx: &mut Context<Self>,
     ) -> Result<()> {
         self.worktree_store.update(cx, |worktree_store, cx| {
             worktree_store.move_worktree(source, destination, cx)
@@ -4029,26 +4113,11 @@ impl Project {
     }
 
     pub fn project_path_for_absolute_path(&self, abs_path: &Path, cx: &App) -> Option<ProjectPath> {
-        self.find_local_worktree(abs_path, cx)
+        self.find_worktree(abs_path, cx)
             .map(|(worktree, relative_path)| ProjectPath {
                 worktree_id: worktree.read(cx).id(),
                 path: relative_path.into(),
             })
-    }
-
-    pub fn find_local_worktree(
-        &self,
-        abs_path: &Path,
-        cx: &App,
-    ) -> Option<(Entity<Worktree>, PathBuf)> {
-        let trees = self.worktrees(cx);
-
-        for tree in trees {
-            if let Some(relative_path) = abs_path.strip_prefix(tree.read(cx).abs_path()).ok() {
-                return Some((tree.clone(), relative_path.into()));
-            }
-        }
-        None
     }
 
     pub fn get_workspace_root(&self, project_path: &ProjectPath, cx: &App) -> Option<PathBuf> {
@@ -4060,19 +4129,13 @@ impl Project {
         )
     }
 
-    pub fn get_first_worktree_root_repo(&self, cx: &App) -> Option<Arc<dyn GitRepository>> {
-        let worktree = self.visible_worktrees(cx).next()?.read(cx).as_local()?;
-        let root_entry = worktree.root_git_entry()?;
-        worktree.get_local_repo(&root_entry)?.repo().clone().into()
-    }
-
     pub fn blame_buffer(
         &self,
         buffer: &Entity<Buffer>,
         version: Option<clock::Global>,
         cx: &App,
     ) -> Task<Result<Option<Blame>>> {
-        self.buffer_store.read(cx).blame_buffer(buffer, version, cx)
+        self.git_store.read(cx).blame_buffer(buffer, version, cx)
     }
 
     pub fn get_permalink_to_line(
@@ -4081,7 +4144,7 @@ impl Project {
         selection: Range<u32>,
         cx: &App,
     ) -> Task<Result<url::Url>> {
-        self.buffer_store
+        self.git_store
             .read(cx)
             .get_permalink_to_line(buffer, selection, cx)
     }
@@ -4521,7 +4584,7 @@ impl Project {
             ProjectClientState::Shared { .. } | ProjectClientState::Local => {
                 return Task::ready(Err(anyhow!(
                     "can't synchronize remote buffers on a local project"
-                )))
+                )));
             }
         };
 
@@ -4660,17 +4723,46 @@ impl Project {
         buffer: &Buffer,
         name: &str,
         cx: &mut App,
-    ) -> Option<LanguageServerId> {
-        self.lsp_store.update(cx, |this, cx| {
-            this.language_servers_for_local_buffer(buffer, cx)
-                .find_map(|(adapter, server)| {
-                    if adapter.name.0 == name {
-                        Some(server.server_id())
-                    } else {
-                        None
-                    }
-                })
-        })
+    ) -> Task<Option<LanguageServerId>> {
+        if self.is_local() {
+            Task::ready(self.lsp_store.update(cx, |lsp_store, cx| {
+                lsp_store
+                    .language_servers_for_local_buffer(buffer, cx)
+                    .find_map(|(adapter, server)| {
+                        if adapter.name.0 == name {
+                            Some(server.server_id())
+                        } else {
+                            None
+                        }
+                    })
+            }))
+        } else if let Some(project_id) = self.remote_id() {
+            let request = self.client.request(proto::LanguageServerIdForName {
+                project_id,
+                buffer_id: buffer.remote_id().to_proto(),
+                name: name.to_string(),
+            });
+            cx.background_spawn(async move {
+                let response = request.await.log_err()?;
+                response.server_id.map(LanguageServerId::from_proto)
+            })
+        } else if let Some(ssh_client) = self.ssh_client.as_ref() {
+            let request =
+                ssh_client
+                    .read(cx)
+                    .proto_client()
+                    .request(proto::LanguageServerIdForName {
+                        project_id: SSH_PROJECT_ID,
+                        buffer_id: buffer.remote_id().to_proto(),
+                        name: name.to_string(),
+                    });
+            cx.background_spawn(async move {
+                let response = request.await.log_err()?;
+                response.server_id.map(LanguageServerId::from_proto)
+            })
+        } else {
+            Task::ready(None)
+        }
     }
 
     pub fn has_language_servers_for(&self, buffer: &Buffer, cx: &mut App) -> bool {
@@ -4704,7 +4796,7 @@ impl Project {
         self.git_store.read(cx).active_repository()
     }
 
-    pub fn repositories<'a>(&self, cx: &'a App) -> &'a HashMap<ProjectEntryId, Entity<Repository>> {
+    pub fn repositories<'a>(&self, cx: &'a App) -> &'a HashMap<RepositoryId, Entity<Repository>> {
         self.git_store.read(cx).repositories()
     }
 
@@ -4921,7 +5013,7 @@ impl ProjectItem for Buffer {
     }
 
     fn project_path(&self, cx: &App) -> Option<ProjectPath> {
-        File::from_dyn(self.file()).map(|file| ProjectPath {
+        self.file().map(|file| ProjectPath {
             worktree_id: file.worktree_id(cx),
             path: file.path().clone(),
         })

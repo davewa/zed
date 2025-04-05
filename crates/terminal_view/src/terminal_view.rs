@@ -5,48 +5,48 @@ pub mod terminal_panel;
 pub mod terminal_scrollbar;
 pub mod terminal_tab_tooltip;
 
-use editor::{actions::SelectAll, scroll::ScrollbarAutoHide, Editor, EditorSettings};
+use editor::{Editor, EditorSettings, actions::SelectAll, scroll::ScrollbarAutoHide};
 use fancy_regex::Regex;
 use gpui::{
-    anchored, deferred, div, impl_actions, AnyElement, App, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    Pixels, Render, ScrollWheelEvent, Stateful, Styled, Subscription, Task, WeakEntity,
+    AnyElement, App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, KeyContext,
+    KeyDownEvent, Keystroke, MouseButton, MouseDownEvent, Pixels, Render, ScrollWheelEvent,
+    Stateful, Styled, Subscription, Task, WeakEntity, anchored, deferred, div, impl_actions,
 };
 use itertools::Itertools;
 use log::{debug, info, trace};
 use persistence::TERMINAL_DB;
-use project::Entry;
-use project::{search::SearchQuery, terminals::TerminalKind, Fs, Metadata, Project};
+use project::{Entry, Fs, Metadata, Project, search::SearchQuery, terminals::TerminalKind};
 use schemars::JsonSchema;
 use terminal::terminal_maybe_path_like::load_path_hyperlink_regexes;
 use terminal::terminal_settings::PathHyperlinkNavigation;
 use terminal::{
+    Clear, Copy, Event, MaybeNavigationTarget, Paste, ScrollLineDown, ScrollLineUp, ScrollPageDown,
+    ScrollPageUp, ScrollToBottom, ScrollToTop, ShowCharacterPalette, TaskState, TaskStatus,
+    Terminal, TerminalBounds, ToggleViMode,
     alacritty_terminal::{
         index::Point,
-        term::{search::RegexSearch, TermMode},
+        term::{TermMode, search::RegexSearch},
     },
     terminal_settings::{self, CursorShape, TerminalBlink, TerminalSettings, WorkingDirectory},
-    Clear, Copy, Event, MaybeNavigationTarget, Paste, PathLikeTarget, RowColumn, ScrollLineDown,
-    ScrollLineUp, ScrollPageDown, ScrollPageUp, ScrollToBottom, ScrollToTop, ShowCharacterPalette,
-    TaskState, TaskStatus, Terminal, TerminalBounds, ToggleViMode,
 };
-use terminal_element::{is_blank, TerminalElement};
+use terminal::{PathLikeTarget, RowColumn};
+use terminal_element::{TerminalElement, is_blank};
 use terminal_maybe_path::{MaybePath, MaybePathVariant, MaybePathWithPosition};
 use terminal_panel::TerminalPanel;
 use terminal_scrollbar::TerminalScrollHandle;
 use terminal_tab_tooltip::TerminalTooltip;
 use ui::{
-    h_flex, prelude::*, ContextMenu, Icon, IconName, Label, Scrollbar, ScrollbarState, Tooltip,
+    ContextMenu, Icon, IconName, Label, Scrollbar, ScrollbarState, Tooltip, h_flex, prelude::*,
 };
-use util::{debug_panic, paths, ResultExt};
+use util::{ResultExt, debug_panic, paths};
 use workspace::{
+    CloseActiveItem, NewCenterTerminal, NewTerminal, OpenOptions, OpenVisible, ToolbarItemLocation,
+    Workspace, WorkspaceId,
     item::{
         BreadcrumbText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
     register_serializable_item,
     searchable::{Direction, SearchEvent, SearchOptions, SearchableItem, SearchableItemHandle},
-    CloseActiveItem, NewCenterTerminal, NewTerminal, OpenOptions, OpenVisible, ToolbarItemLocation,
-    Workspace, WorkspaceId,
 };
 
 use anyhow::Context as _;
@@ -615,6 +615,10 @@ impl TerminalView {
         let mut dispatch_context = KeyContext::new_with_defaults();
         dispatch_context.add("Terminal");
 
+        if self.terminal.read(cx).vi_mode_enabled() {
+            dispatch_context.add("vi_mode");
+        }
+
         let mode = self.terminal.read(cx).last_content.mode;
         dispatch_context.set(
             "screen",
@@ -1050,6 +1054,15 @@ fn subscribe_for_terminal_events(
                 window.invalidate_character_coordinates();
                 cx.emit(SearchEvent::ActiveMatchChanged)
             }
+            Event::TaskLocatorReady { task_id, success } => {
+                if *success {
+                    workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.debug_task_ready(task_id, cx);
+                        })
+                        .log_err();
+                }
+            }
         },
     );
     vec![terminal_subscription, terminal_events_subscription]
@@ -1147,7 +1160,10 @@ fn possible_open_target(
                     .traverse_from_path(true, true, false, "".as_ref())
                 {
                     if entry.path.ends_with(&maybe_path_with_position.path) {
-                        trace!("Terminal View: MaybePath found for worktree: {worktree_root:?}, entry: {:?}", entry.path);
+                        trace!(
+                            "Terminal View: MaybePath found for worktree: {worktree_root:?}, entry: {:?}",
+                            entry.path
+                        );
                         return Task::ready(Some(OpenTarget::Worktree(
                             maybe_path_with_position
                                 .into_owned_with_path(Cow::Owned(worktree_root.join(&entry.path))),

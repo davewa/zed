@@ -5,14 +5,14 @@ use super::{
 use anyhow::Result;
 use collections::HashMap;
 use dap::OutputEvent;
-use editor::{CompletionProvider, Editor, EditorElement, EditorStyle};
+use editor::{CompletionProvider, Editor, EditorElement, EditorStyle, ExcerptId};
 use fuzzy::StringMatchCandidate;
 use gpui::{Context, Entity, Render, Subscription, Task, TextStyle, WeakEntity};
 use language::{Buffer, CodeLabel};
 use menu::Confirm;
 use project::{
-    debugger::session::{CompletionsQuery, OutputToken, Session},
     Completion,
+    debugger::session::{CompletionsQuery, OutputToken, Session},
 };
 use settings::Settings;
 use std::{cell::RefCell, rc::Rc, usize};
@@ -85,14 +85,9 @@ impl Console {
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn editor(&self) -> &Entity<Editor> {
+    #[cfg(test)]
+    pub(crate) fn editor(&self) -> &Entity<Editor> {
         &self.console
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn query_bar(&self) -> &Entity<Editor> {
-        &self.query_bar
     }
 
     fn is_local(&self, cx: &Context<Self>) -> bool {
@@ -246,6 +241,7 @@ struct ConsoleQueryBarCompletionProvider(WeakEntity<Console>);
 impl CompletionProvider for ConsoleQueryBarCompletionProvider {
     fn completions(
         &self,
+        _excerpt_id: ExcerptId,
         buffer: &Entity<Buffer>,
         buffer_position: language::Anchor,
         _trigger: editor::CompletionContext,
@@ -367,6 +363,7 @@ impl ConsoleQueryBarCompletionProvider {
                                 text: format!("{} {}", string_match.string.clone(), variable_value),
                                 runs: Vec::new(),
                             },
+                            icon_path: None,
                             documentation: None,
                             confirm: None,
                             source: project::CompletionSource::Custom,
@@ -408,6 +405,7 @@ impl ConsoleQueryBarCompletionProvider {
                             text: completion.label.clone(),
                             runs: Vec::new(),
                         },
+                        icon_path: None,
                         documentation: None,
                         confirm: None,
                         source: project::CompletionSource::Custom,

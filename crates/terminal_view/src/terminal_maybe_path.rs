@@ -35,9 +35,9 @@ use std::{
 };
 use terminal::{
     terminal_maybe_path_like::{
-        has_common_surrounding_symbols, longest_surrounding_symbols_match,
-        path_with_position_regex_match, preapproved_path_hyperlink_regexes, MaybePathLike,
-        RowColumn, MAIN_SEPARATORS,
+        MAIN_SEPARATORS, MaybePathLike, RowColumn, has_common_surrounding_symbols,
+        longest_surrounding_symbols_match, path_with_position_regex_match,
+        preapproved_path_hyperlink_regexes,
     },
     terminal_settings::PathHyperlinkNavigation,
 };
@@ -520,13 +520,15 @@ mod tests {
         expected: &ExpectedMap<'a>,
     ) {
         let maybe_paths = if let Some(word_index) = word_index {
-            vec![word_regex()
-                .find_iter(&line)
-                .map(Result::<_, _>::ok)
-                .flatten()
-                .map(|match_| match_.range())
-                .nth(word_index)
-                .unwrap()]
+            vec![
+                word_regex()
+                    .find_iter(&line)
+                    .map(Result::<_, _>::ok)
+                    .flatten()
+                    .map(|match_| match_.range())
+                    .nth(word_index)
+                    .unwrap(),
+            ]
         } else {
             word_regex()
                 .find_iter(&line)
@@ -580,9 +582,7 @@ mod tests {
         maybe_path_with_position: &MaybePathWithPosition,
         rel_or_abs: Option<&str>,
     ) -> String {
-        let MaybePathWithPosition {
-            ref path, position, ..
-        } = maybe_path_with_position;
+        let MaybePathWithPosition { path, position, .. } = maybe_path_with_position;
         let mut components = path.components();
         if path.is_absolute() {
             if cfg!(target_os = "windows") {

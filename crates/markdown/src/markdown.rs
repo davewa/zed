@@ -9,20 +9,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    actions, point, quad, AnyElement, App, Bounds, ClipboardItem, CursorStyle, DispatchPhase,
-    Edges, Entity, FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla,
-    KeyContext, Length, MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Point, Render,
-    Stateful, StrikethroughStyle, StyleRefinement, StyledText, Task, TextLayout, TextRun,
-    TextStyle, TextStyleRefinement,
+    AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
+    FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, KeyContext,
+    Length, MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Point, Render, Stateful,
+    StrikethroughStyle, StyleRefinement, StyledText, Task, TextLayout, TextRun, TextStyle,
+    TextStyleRefinement, actions, point, quad,
 };
 use language::{Language, LanguageRegistry, Rope};
-use parser::{parse_links_only, parse_markdown, MarkdownEvent, MarkdownTag, MarkdownTagEnd};
+use parser::{MarkdownEvent, MarkdownTag, MarkdownTagEnd, parse_links_only, parse_markdown};
 use pulldown_cmark::Alignment;
 use theme::SyntaxTheme;
-use ui::{prelude::*, Tooltip};
+use ui::{Tooltip, prelude::*};
 use util::{ResultExt, TryFutureExt};
 
 use crate::parser::CodeBlockKind;
+
+/// A callback function that can be used to customize the style of links based on the destination URL.
+/// If the callback returns `None`, the default link style will be used.
+type LinkStyleCallback = Rc<dyn Fn(&str, &App) -> Option<TextStyleRefinement>>;
 
 #[derive(Clone)]
 pub struct MarkdownStyle {
@@ -32,6 +36,7 @@ pub struct MarkdownStyle {
     pub inline_code: TextStyleRefinement,
     pub block_quote: TextStyleRefinement,
     pub link: TextStyleRefinement,
+    pub link_callback: Option<LinkStyleCallback>,
     pub rule_color: Hsla,
     pub block_quote_border_color: Hsla,
     pub syntax: Arc<SyntaxTheme>,
@@ -49,6 +54,7 @@ impl Default for MarkdownStyle {
             inline_code: Default::default(),
             block_quote: Default::default(),
             link: Default::default(),
+            link_callback: None,
             rule_color: Default::default(),
             block_quote_border_color: Default::default(),
             syntax: Arc::new(SyntaxTheme::default()),
@@ -294,11 +300,7 @@ impl Selection {
     }
 
     fn tail(&self) -> usize {
-        if self.reversed {
-            self.end
-        } else {
-            self.start
-        }
+        if self.reversed { self.end } else { self.start }
     }
 }
 
@@ -353,6 +355,7 @@ impl MarkdownElement {
                     self.style.selection_background_color,
                     Edges::default(),
                     Hsla::transparent_black(),
+                    BorderStyle::default(),
                 ));
             } else {
                 window.paint_quad(quad(
@@ -364,6 +367,7 @@ impl MarkdownElement {
                     self.style.selection_background_color,
                     Edges::default(),
                     Hsla::transparent_black(),
+                    BorderStyle::default(),
                 ));
 
                 if end_position.y > start_position.y + start_line_height {
@@ -376,6 +380,7 @@ impl MarkdownElement {
                         self.style.selection_background_color,
                         Edges::default(),
                         Hsla::transparent_black(),
+                        BorderStyle::default(),
                     ));
                 }
 
@@ -388,6 +393,7 @@ impl MarkdownElement {
                     self.style.selection_background_color,
                     Edges::default(),
                     Hsla::transparent_black(),
+                    BorderStyle::default(),
                 ));
             }
         }
@@ -407,9 +413,9 @@ impl MarkdownElement {
                 .is_some();
 
         if is_hovering_link {
-            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+            window.set_cursor_style(CursorStyle::PointingHand, Some(hitbox));
         } else {
-            window.set_cursor_style(CursorStyle::IBeam, hitbox);
+            window.set_cursor_style(CursorStyle::IBeam, Some(hitbox));
         }
 
         self.on_mouse_event(window, cx, {
@@ -531,7 +537,7 @@ impl MarkdownElement {
         window: &mut Window,
         _cx: &mut App,
         mut f: impl 'static
-            + FnMut(&mut Markdown, &T, DispatchPhase, &mut Window, &mut Context<Markdown>),
+        + FnMut(&mut Markdown, &T, DispatchPhase, &mut Window, &mut Context<Markdown>),
     ) {
         window.on_mouse_event({
             let markdown = self.markdown.downgrade();
@@ -679,7 +685,13 @@ impl Element for MarkdownElement {
                         MarkdownTag::Link { dest_url, .. } => {
                             if builder.code_block_stack.is_empty() {
                                 builder.push_link(dest_url.clone(), range.clone());
-                                builder.push_text_style(self.style.link.clone())
+                                let style = self
+                                    .style
+                                    .link_callback
+                                    .as_ref()
+                                    .and_then(|callback| callback(dest_url, cx))
+                                    .unwrap_or_else(|| self.style.link.clone());
+                                builder.push_text_style(style)
                             }
                         }
                         MarkdownTag::MetadataBlock(_) => {}

@@ -2,36 +2,36 @@ use anyhow::Result;
 use assistant_settings::AssistantSettings;
 use assistant_slash_command::{SlashCommand, SlashCommandOutputSection, SlashCommandWorkingSet};
 use assistant_slash_commands::{
-    selections_creases, DefaultSlashCommand, DocsSlashCommand, DocsSlashCommandArgs,
-    FileSlashCommand,
+    DefaultSlashCommand, DocsSlashCommand, DocsSlashCommandArgs, FileSlashCommand,
+    selections_creases,
 };
 use client::{proto, zed_urls};
-use collections::{hash_map, BTreeSet, HashMap, HashSet};
+use collections::{BTreeSet, HashMap, HashSet, hash_map};
 use editor::{
+    Anchor, Editor, EditorEvent, MenuInlineCompletionsPolicy, ProposedChangeLocation,
+    ProposedChangesEditor, RowExt, ToOffset as _, ToPoint,
     actions::{FoldAt, MoveToEndOfLine, Newline, ShowCompletions, UnfoldAt},
     display_map::{
         BlockContext, BlockId, BlockPlacement, BlockProperties, BlockStyle, Crease, CreaseMetadata,
         CustomBlockId, FoldId, RenderBlock, ToDisplayPoint,
     },
-    scroll::{Autoscroll, AutoscrollStrategy},
-    Anchor, Editor, EditorEvent, MenuInlineCompletionsPolicy, ProposedChangeLocation,
-    ProposedChangesEditor, RowExt, ToOffset as _, ToPoint,
+    scroll::Autoscroll,
 };
-use editor::{display_map::CreaseId, FoldPlaceholder};
+use editor::{FoldPlaceholder, display_map::CreaseId};
 use fs::Fs;
 use futures::FutureExt;
 use gpui::{
-    actions, div, img, impl_internal_actions, percentage, point, prelude::*, pulsating_between,
-    size, Animation, AnimationExt, AnyElement, AnyView, App, AsyncWindowContext, ClipboardEntry,
+    Animation, AnimationExt, AnyElement, AnyView, App, AsyncWindowContext, ClipboardEntry,
     ClipboardItem, CursorStyle, Empty, Entity, EventEmitter, FocusHandle, Focusable, FontWeight,
     Global, InteractiveElement, IntoElement, ParentElement, Pixels, Render, RenderImage,
     SharedString, Size, StatefulInteractiveElement, Styled, Subscription, Task, Transformation,
-    WeakEntity,
+    WeakEntity, actions, div, img, impl_internal_actions, percentage, point, prelude::*,
+    pulsating_between, size,
 };
 use indexed_docs::IndexedDocsStore;
 use language::{
-    language_settings::{all_language_settings, SoftWrap},
     BufferSnapshot, LspAdapterDelegate, ToOffset,
+    language_settings::{SoftWrap, all_language_settings},
 };
 use language_model::{
     LanguageModelImage, LanguageModelProvider, LanguageModelProviderTosView, LanguageModelRegistry,
@@ -46,29 +46,32 @@ use project::lsp_store::LocalLspAdapterDelegate;
 use project::{Project, Worktree};
 use rope::Point;
 use serde::{Deserialize, Serialize};
-use settings::{update_settings_file, Settings, SettingsStore};
+use settings::{Settings, SettingsStore, update_settings_file};
 use std::{any::TypeId, borrow::Cow, cmp, ops::Range, path::PathBuf, sync::Arc, time::Duration};
 use text::SelectionGoal;
 use ui::{
-    prelude::*, ButtonLike, Disclosure, ElevationIndex, KeyBinding, PopoverMenuHandle, TintColor,
-    Tooltip,
+    ButtonLike, Disclosure, ElevationIndex, KeyBinding, PopoverMenuHandle, TintColor, Tooltip,
+    prelude::*,
 };
-use util::{maybe, ResultExt};
+use util::{ResultExt, maybe};
 use workspace::searchable::{Direction, SearchableItemHandle};
 use workspace::{
+    Save, ShowConfiguration, Toast, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
+    Workspace,
     item::{self, FollowableItem, Item, ItemHandle},
     notifications::NotificationId,
     pane::{self, SaveIntent},
     searchable::{SearchEvent, SearchableItem},
-    Save, ShowConfiguration, Toast, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
-    Workspace,
 };
 
-use crate::{slash_command::SlashCommandCompletionProvider, slash_command_picker};
 use crate::{
     AssistantContext, AssistantPatch, AssistantPatchStatus, CacheStatus, Content, ContextEvent,
     ContextId, InvokedSlashCommandId, InvokedSlashCommandStatus, Message, MessageId,
     MessageMetadata, MessageStatus, ParsedSlashCommand, PendingSlashCommandStatus, RequestType,
+};
+use crate::{
+    ThoughtProcessOutputSection, slash_command::SlashCommandCompletionProvider,
+    slash_command_picker,
 };
 
 actions!(
@@ -118,6 +121,11 @@ enum AssistError {
     PaymentRequired,
     MaxMonthlySpendReached,
     Message(SharedString),
+}
+
+pub enum ThoughtProcessStatus {
+    Pending,
+    Completed,
 }
 
 pub trait AssistantPanelDelegate {
@@ -178,6 +186,7 @@ pub struct ContextEditor {
     project: Entity<Project>,
     lsp_adapter_delegate: Option<Arc<dyn LspAdapterDelegate>>,
     editor: Entity<Editor>,
+    pending_thought_process: Option<(CreaseId, language::Anchor)>,
     blocks: HashMap<MessageId, (MessageHeader, CustomBlockId)>,
     image_blocks: HashSet<CustomBlockId>,
     scroll_position: Option<ScrollPosition>,
@@ -253,7 +262,8 @@ impl ContextEditor {
             cx.observe_global_in::<SettingsStore>(window, Self::settings_changed),
         ];
 
-        let sections = context.read(cx).slash_command_output_sections().to_vec();
+        let slash_command_sections = context.read(cx).slash_command_output_sections().to_vec();
+        let thought_process_sections = context.read(cx).thought_process_output_sections().to_vec();
         let patch_ranges = context.read(cx).patch_ranges().collect::<Vec<_>>();
         let slash_commands = context.read(cx).slash_commands().clone();
         let mut this = Self {
@@ -265,6 +275,7 @@ impl ContextEditor {
             image_blocks: Default::default(),
             scroll_position: None,
             remote_id: None,
+            pending_thought_process: None,
             fs: fs.clone(),
             workspace,
             project,
@@ -294,7 +305,14 @@ impl ContextEditor {
         };
         this.update_message_headers(cx);
         this.update_image_blocks(cx);
-        this.insert_slash_command_output_sections(sections, false, window, cx);
+        this.insert_slash_command_output_sections(slash_command_sections, false, window, cx);
+        this.insert_thought_process_output_sections(
+            thought_process_sections
+                .into_iter()
+                .map(|section| (section, ThoughtProcessStatus::Completed)),
+            window,
+            cx,
+        );
         this.patches_updated(&Vec::new(), &patch_ranges, window, cx);
         this
     }
@@ -366,7 +384,9 @@ impl ContextEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let provider = LanguageModelRegistry::read_global(cx).active_provider();
+        let provider = LanguageModelRegistry::read_global(cx)
+            .default_model()
+            .map(|default| default.provider);
         if provider
             .as_ref()
             .map_or(false, |provider| provider.must_accept_terms(cx))
@@ -396,12 +416,9 @@ impl ContextEditor {
                 cursor..cursor
             };
             self.editor.update(cx, |editor, cx| {
-                editor.change_selections(
-                    Some(Autoscroll::Strategy(AutoscrollStrategy::Fit)),
-                    window,
-                    cx,
-                    |selections| selections.select_ranges([new_selection]),
-                );
+                editor.change_selections(Some(Autoscroll::fit()), window, cx, |selections| {
+                    selections.select_ranges([new_selection])
+                });
             });
             // Avoid scrolling to the new cursor position so the assistant's output is stable.
             cx.defer_in(window, |this, _, _| this.scroll_position = None);
@@ -598,6 +615,47 @@ impl ContextEditor {
                 self.context.update(cx, |context, cx| {
                     context.save(Some(Duration::from_millis(500)), self.fs.clone(), cx);
                 });
+            }
+            ContextEvent::StartedThoughtProcess(range) => {
+                let creases = self.insert_thought_process_output_sections(
+                    [(
+                        ThoughtProcessOutputSection {
+                            range: range.clone(),
+                        },
+                        ThoughtProcessStatus::Pending,
+                    )],
+                    window,
+                    cx,
+                );
+                self.pending_thought_process = Some((creases[0], range.start));
+            }
+            ContextEvent::EndedThoughtProcess(end) => {
+                if let Some((crease_id, start)) = self.pending_thought_process.take() {
+                    self.editor.update(cx, |editor, cx| {
+                        let multi_buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+                        let (excerpt_id, _, _) = multi_buffer_snapshot.as_singleton().unwrap();
+                        let start_anchor = multi_buffer_snapshot
+                            .anchor_in_excerpt(*excerpt_id, start)
+                            .unwrap();
+
+                        editor.display_map.update(cx, |display_map, cx| {
+                            display_map.unfold_intersecting(
+                                vec![start_anchor..start_anchor],
+                                true,
+                                cx,
+                            );
+                        });
+                        editor.remove_creases(vec![crease_id], cx);
+                    });
+                    self.insert_thought_process_output_sections(
+                        [(
+                            ThoughtProcessOutputSection { range: start..*end },
+                            ThoughtProcessStatus::Completed,
+                        )],
+                        window,
+                        cx,
+                    );
+                }
             }
             ContextEvent::StreamedCompletion => {
                 self.editor.update(cx, |editor, cx| {
@@ -944,6 +1002,62 @@ impl ContextEditor {
         }
 
         self.update_active_patch(window, cx);
+    }
+
+    fn insert_thought_process_output_sections(
+        &mut self,
+        sections: impl IntoIterator<
+            Item = (
+                ThoughtProcessOutputSection<language::Anchor>,
+                ThoughtProcessStatus,
+            ),
+        >,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<CreaseId> {
+        self.editor.update(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx).snapshot(cx);
+            let excerpt_id = *buffer.as_singleton().unwrap().0;
+            let mut buffer_rows_to_fold = BTreeSet::new();
+            let mut creases = Vec::new();
+            for (section, status) in sections {
+                let start = buffer
+                    .anchor_in_excerpt(excerpt_id, section.range.start)
+                    .unwrap();
+                let end = buffer
+                    .anchor_in_excerpt(excerpt_id, section.range.end)
+                    .unwrap();
+                let buffer_row = MultiBufferRow(start.to_point(&buffer).row);
+                buffer_rows_to_fold.insert(buffer_row);
+                creases.push(
+                    Crease::inline(
+                        start..end,
+                        FoldPlaceholder {
+                            render: render_thought_process_fold_icon_button(
+                                cx.entity().downgrade(),
+                                status,
+                            ),
+                            merge_adjacent: false,
+                            ..Default::default()
+                        },
+                        render_slash_command_output_toggle,
+                        |_, _, _, _| Empty.into_any_element(),
+                    )
+                    .with_metadata(CreaseMetadata {
+                        icon: IconName::Ai,
+                        label: "Thinking Process".into(),
+                    }),
+                );
+            }
+
+            let creases = editor.insert_creases(creases, cx);
+
+            for buffer_row in buffer_rows_to_fold.into_iter().rev() {
+                editor.fold_at(&FoldAt { buffer_row }, window, cx);
+            }
+
+            creases
+        })
     }
 
     fn insert_slash_command_output_sections(
@@ -2283,13 +2397,13 @@ impl ContextEditor {
             None => (ButtonStyle::Filled, None),
         };
 
-        let provider = LanguageModelRegistry::read_global(cx).active_provider();
+        let model = LanguageModelRegistry::read_global(cx).default_model();
 
         let has_configuration_error = configuration_error(cx).is_some();
         let needs_to_accept_terms = self.show_accept_terms
-            && provider
+            && model
                 .as_ref()
-                .map_or(false, |provider| provider.must_accept_terms(cx));
+                .map_or(false, |model| model.provider.must_accept_terms(cx));
         let disabled = has_configuration_error || needs_to_accept_terms;
 
         ButtonLike::new("send_button")
@@ -2342,7 +2456,9 @@ impl ContextEditor {
             None => (ButtonStyle::Filled, None),
         };
 
-        let provider = LanguageModelRegistry::read_global(cx).active_provider();
+        let provider = LanguageModelRegistry::read_global(cx)
+            .default_model()
+            .map(|default| default.provider);
 
         let has_configuration_error = configuration_error(cx).is_some();
         let needs_to_accept_terms = self.show_accept_terms
@@ -2388,7 +2504,9 @@ impl ContextEditor {
     }
 
     fn render_language_model_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_model = LanguageModelRegistry::read_global(cx).active_model();
+        let active_model = LanguageModelRegistry::read_global(cx)
+            .default_model()
+            .map(|default| default.model);
         let focus_handle = self.editor().focus_handle(cx).clone();
         let model_name = match active_model {
             Some(model) => model.name().0,
@@ -2652,6 +2770,52 @@ fn find_surrounding_code_block(snapshot: &BufferSnapshot, offset: usize) -> Opti
     None
 }
 
+fn render_thought_process_fold_icon_button(
+    editor: WeakEntity<Editor>,
+    status: ThoughtProcessStatus,
+) -> Arc<dyn Send + Sync + Fn(FoldId, Range<Anchor>, &mut App) -> AnyElement> {
+    Arc::new(move |fold_id, fold_range, _cx| {
+        let editor = editor.clone();
+
+        let button = ButtonLike::new(fold_id).layer(ElevationIndex::ElevatedSurface);
+        let button = match status {
+            ThoughtProcessStatus::Pending => button
+                .child(
+                    Icon::new(IconName::Brain)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new("Thinking…").color(Color::Muted).with_animation(
+                        "pulsating-label",
+                        Animation::new(Duration::from_secs(2))
+                            .repeat()
+                            .with_easing(pulsating_between(0.4, 0.8)),
+                        |label, delta| label.alpha(delta),
+                    ),
+                ),
+            ThoughtProcessStatus::Completed => button
+                .style(ButtonStyle::Filled)
+                .child(Icon::new(IconName::Brain).size(IconSize::Small))
+                .child(Label::new("Thought Process").single_line()),
+        };
+
+        button
+            .on_click(move |_, window, cx| {
+                editor
+                    .update(cx, |editor, cx| {
+                        let buffer_start = fold_range
+                            .start
+                            .to_point(&editor.buffer().read(cx).read(cx));
+                        let buffer_row = MultiBufferRow(buffer_start.row);
+                        editor.unfold_at(&UnfoldAt { buffer_row }, window, cx);
+                    })
+                    .ok();
+            })
+            .into_any_element()
+    })
+}
+
 fn render_fold_icon_button(
     editor: WeakEntity<Editor>,
     icon: IconName,
@@ -2862,7 +3026,9 @@ impl EventEmitter<SearchEvent> for ContextEditor {}
 
 impl Render for ContextEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let provider = LanguageModelRegistry::read_global(cx).active_provider();
+        let provider = LanguageModelRegistry::read_global(cx)
+            .default_model()
+            .map(|default| default.provider);
         let accept_terms = if self.show_accept_terms {
             provider.as_ref().and_then(|provider| {
                 provider.render_accept_terms(LanguageModelProviderTosView::PromptEditorPopup, cx)
@@ -3255,7 +3421,7 @@ impl ContextEditorToolbarItem {
 pub fn render_remaining_tokens(
     context_editor: &Entity<ContextEditor>,
     cx: &App,
-) -> Option<impl IntoElement> {
+) -> Option<impl IntoElement + use<>> {
     let context = &context_editor.read(cx).context;
 
     let (token_count_color, token_count, max_token_count, tooltip) = match token_state(context, cx)?
@@ -3458,7 +3624,9 @@ enum TokenState {
 fn token_state(context: &Entity<AssistantContext>, cx: &App) -> Option<TokenState> {
     const WARNING_TOKEN_THRESHOLD: f32 = 0.8;
 
-    let model = LanguageModelRegistry::read_global(cx).active_model()?;
+    let model = LanguageModelRegistry::read_global(cx)
+        .default_model()?
+        .model;
     let token_count = context.read(cx).token_count()?;
     let max_token_count = model.max_token_count();
 
@@ -3511,16 +3679,16 @@ pub enum ConfigurationError {
 }
 
 fn configuration_error(cx: &App) -> Option<ConfigurationError> {
-    let provider = LanguageModelRegistry::read_global(cx).active_provider();
-    let is_authenticated = provider
+    let model = LanguageModelRegistry::read_global(cx).default_model();
+    let is_authenticated = model
         .as_ref()
-        .map_or(false, |provider| provider.is_authenticated(cx));
+        .map_or(false, |model| model.provider.is_authenticated(cx));
 
-    if provider.is_some() && is_authenticated {
+    if model.is_some() && is_authenticated {
         return None;
     }
 
-    if provider.is_none() {
+    if model.is_none() {
         return Some(ConfigurationError::NoProvider);
     }
 
@@ -3545,6 +3713,18 @@ pub fn humanize_token_count(count: usize) -> String {
                 format!("{}.{}k", thousands, hundreds)
             }
         }
+        1_000_000..=9_999_999 => {
+            let millions = count / 1_000_000;
+            let hundred_thousands = (count % 1_000_000 + 50_000) / 100_000;
+            if hundred_thousands == 0 {
+                format!("{}M", millions)
+            } else if hundred_thousands == 10 {
+                format!("{}M", millions + 1)
+            } else {
+                format!("{}.{}M", millions, hundred_thousands)
+            }
+        }
+        10_000_000.. => format!("{}M", (count + 500_000) / 1_000_000),
         _ => format!("{}k", (count + 500) / 1000),
     }
 }

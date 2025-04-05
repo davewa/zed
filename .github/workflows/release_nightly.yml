@@ -182,12 +182,8 @@ jobs:
             runner: buildjet-16vcpu-ubuntu-2204
             install_nix: true
           - os: arm Mac
-            # TODO: once other macs are provisioned for nix, remove that constraint from the runner
-            runner: [macOS, ARM64, nix]
+            runner: [macOS, ARM64, test]
             install_nix: false
-          - os: arm Linux
-            runner: buildjet-16vcpu-ubuntu-2204-arm
-            install_nix: true
     if: github.repository_owner == 'zed-industries'
     runs-on: ${{ matrix.system.runner }}
     needs: tests
@@ -220,7 +216,8 @@ jobs:
           name: zed-industries
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
       - run: nix build
-      - run: nix-collect-garbage -d
+      - name: Limit /nix/store to 50GB
+        run: '[ $(du -sm /nix/store | cut -f1) -gt 50000 ] && nix-collect-garbage -d'
 
   update-nightly-tag:
     name: Update nightly tag

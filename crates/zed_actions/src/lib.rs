@@ -188,7 +188,7 @@ pub mod assistant {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
-    actions!(assistant, [ToggleFocus, DeployPromptLibrary]);
+    actions!(assistant, [ToggleFocus, OpenPromptLibrary]);
 
     #[derive(Clone, Default, Deserialize, PartialEq, JsonSchema)]
     #[serde(deny_unknown_fields)]
@@ -227,6 +227,12 @@ pub enum Spawn {
     /// Spawns a task by the name given.
     ByName {
         task_name: String,
+        #[serde(default)]
+        reveal_target: Option<RevealTarget>,
+    },
+    /// Spawns a task by the name given.
+    ByTag {
+        task_tag: String,
         #[serde(default)]
         reveal_target: Option<RevealTarget>,
     },
@@ -275,7 +281,7 @@ impl_actions!(task, [Spawn, Rerun]);
 pub mod outline {
     use std::sync::OnceLock;
 
-    use gpui::{action_as, AnyView, App, Window};
+    use gpui::{AnyView, App, Window, action_as};
 
     action_as!(outline, ToggleOutline as Toggle);
     /// A pointer to outline::toggle function, exposed here to sewer the breadcrumbs <-> outline dependency.

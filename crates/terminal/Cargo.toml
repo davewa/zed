@@ -35,6 +35,8 @@ theme.workspace = true
 thiserror.workspace = true
 util.workspace = true
 unicode-segmentation.workspace = true
+regex.workspace = true
+workspace-hack.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
