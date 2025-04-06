@@ -41,7 +41,7 @@
 #[cfg(doc)]
 use super::WORD_REGEX;
 use crate::{HoveredWord, ZedListener};
-use alacritty_terminal::{index::Boundary, term::search::Match, Term};
+use alacritty_terminal::{Term, index::Boundary, term::search::Match};
 use fancy_regex::{Captures, Regex};
 use itertools::Itertools;
 use log::{debug, info, trace};
@@ -66,13 +66,79 @@ pub const MAIN_SEPARATORS: [char; 2] = ['\\', '/'];
 pub const COMMON_PATH_SURROUNDING_SYMBOLS: &[(char, char)] =
     &[('"', '"'), ('\'', '\''), ('[', ']'), ('(', ')')];
 
-pub fn has_common_surrounding_symbols(maybe_path: &str) -> bool {
+pub fn has_common_suffix_or_surrounding_symbols(maybe_path: &str) -> Option<Range<usize>> {
+    // FIrst, strip any suffixes. Currently these are `:`, and `,` so that we handle cases like:
+    // Error at ([hello.rs], "blah blah")
+    // Error at ([hello.rs]: "blah blah")
+    const COMMON_PATH_SUFFIX_SYMBOLS: [char; 2] = [':', ','];
+    let stripped_path = maybe_path.trim_end_matches(COMMON_PATH_SUFFIX_SYMBOLS);
+
+    let mut start_symbol = None;
+    let mut end_symbol = None;
     for (start, end) in COMMON_PATH_SURROUNDING_SYMBOLS {
-        if maybe_path.starts_with(*start) && maybe_path.ends_with(*end) {
-            return true;
+        if stripped_path.starts_with(*start) {
+            start_symbol = Some(start);
+        }
+        if stripped_path.ends_with(*end) {
+            end_symbol = Some(end);
         }
     }
-    false
+
+    // This is necessary to find the inner most matching surrounding symbols
+    // when there are mismatched surrounding symbols, e.g.
+    // Error at ([hello.rs] "blah blah")
+    //          ||        |
+    // Should succeeded in finding surrounding symbols `[` and `]`
+
+    if let (Some(start_symbol), Some(end_symbol)) = (start_symbol, end_symbol) {
+        if COMMON_PATH_SURROUNDING_SYMBOLS
+            .iter()
+            .find(|(start, end)| *start == *start_symbol && *end == *end_symbol)
+            .is_some()
+        {
+            return Some(1..stripped_path.len() - 1);
+        } else {
+            // We found surrounding symbols, but they don't match, check if the inner most
+            // symbols match.
+            if let Some(start_index) = stripped_path.find(|c: char| {
+                COMMON_PATH_SURROUNDING_SYMBOLS
+                    .iter()
+                    .find(|(start, _)| c == *start)
+                    .is_none()
+            }) {
+                if start_index > 1 && start_index < stripped_path.len() - 1 {
+                    let start_index = start_index - 1;
+                    if let Some(end_index) = stripped_path.rfind(|c: char| {
+                        COMMON_PATH_SURROUNDING_SYMBOLS
+                            .iter()
+                            .find(|(_, end)| c == *end)
+                            .is_none()
+                    }) {
+                        if end_index < stripped_path.len() - 1 && end_index >= start_index {
+                            let end_index = end_index + 1;
+                            // We know that all our prefix and suffix chars are ascii bytes.
+                            let start_symbol = stripped_path.as_bytes()[start_index] as char;
+                            let end_symbol = stripped_path.as_bytes()[end_index] as char;
+                            if COMMON_PATH_SURROUNDING_SYMBOLS
+                                .iter()
+                                .find(|(start, end)| *start == start_symbol && *end == end_symbol)
+                                .is_some()
+                            {
+                                return Some(start_index + 1..end_index);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // We didn't find matching surrounding symbols. If a suffix was stripped, return that.
+    if stripped_path.len() < maybe_path.len() {
+        Some(0..stripped_path.len())
+    } else {
+        None
+    }
 }
 
 /// Returns the longest range of matching surrounding symbols on `line` which contains `word_range`
@@ -154,23 +220,35 @@ macro_rules! row_column_desc_regex_msbuild {
     };
 }
 
+macro_rules! python_row_column_desc_regex {
+    ($path_char_regex:ident) => {
+        concat!(
+            r#"\"(?<path>"#,
+            $path_char_regex!(),
+            r#"+)(?<suffix>(\", line (?<line>[0-9]+)))"#
+        )
+    };
+}
+
 // If there is a word on the line that contains a colon that word up to (but not including)
 // its last colon, it is treated as a maybe path.
 // e.g., Ruby (see https://github.com/zed-industries/zed/issues/25086)
 const PATH_ROW_COLUMN_DESC_REGEX: &str = row_column_desc_regex!(path_char);
 const PATH_ROW_COLUMN_DESC_REGEX_MSBUILD: &str = row_column_desc_regex_msbuild!(path_char_msbuild);
+const PATH_LINE_COLUMN_REGEX_PYTHON: &str = python_row_column_desc_regex!(path_char);
 
-const PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 2] = [
+const PREAPPROVED_PATH_HYPERLINK_REGEXES: [&str; 3] = [
     PATH_ROW_COLUMN_DESC_REGEX,
     PATH_ROW_COLUMN_DESC_REGEX_MSBUILD,
+    PATH_LINE_COLUMN_REGEX_PYTHON,
 ];
 
 pub fn load_path_hyperlink_regexes<'a, T>(regexes: &'a T) -> Vec<Regex>
 where
     &'a T: IntoIterator<
-        Item: Deref<Target: Borrow<str>> + std::fmt::Debug,
-        IntoIter: ExactSizeIterator,
-    >,
+            Item: Deref<Target: Borrow<str>> + std::fmt::Debug,
+            IntoIter: ExactSizeIterator,
+        >,
 {
     // Common prefix for diagnostic log messages
     macro_rules! error_prefix {
@@ -365,17 +443,10 @@ impl MaybePathLike {
         position: &Option<RowColumn>,
         range: &Range<usize>,
     ) -> Range<usize> {
-        match position.as_ref() {
-            Some(RowColumn { suffix_length, .. })
-                if range.start > 0 && range.end < self.line.len() =>
-            {
-                if has_common_surrounding_symbols(&self.line[range.start - 1..range.end + 1]) {
-                    range.start - 1..range.end + 1 + suffix_length
-                } else {
-                    range.start..range.end + suffix_length
-                }
-            }
-            Some(_) | None => range.clone(),
+        if let Some(RowColumn { suffix_length, .. }) = position {
+            range.start..range.end + suffix_length
+        } else {
+            range.clone()
         }
     }
 
