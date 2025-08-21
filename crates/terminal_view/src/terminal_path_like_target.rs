@@ -115,8 +115,10 @@ fn possible_open_target(
     }
 
     // If we won't find paths "easily", we can traverse the entire worktree to look what ends with the potential path suffix.
-    // That will be slow, though, so do the fast checks first.
-    let mut worktree_paths_to_check = Vec::new();
+    // That will be slow, though, so do the fast checks first. let mut worktree_paths_to_check = Vec::new();
+    let mut worktree_root_match = None::<OpenTarget>;
+    let mut entry_for_path_exact_match = None::<OpenTarget>;
+    let project_is_local = workspace.read(cx).project().read(cx).is_local();
     for worktree in &worktree_candidates {
         let worktree_root = worktree.read(cx).abs_path();
         let mut paths_to_check = Vec::with_capacity(potential_paths.len());
@@ -128,15 +130,20 @@ fn possible_open_target(
                     row: path_with_position.row,
                     column: path_with_position.column,
                 };
-                match worktree.read(cx).root_entry() {
-                    Some(root_entry) => {
-                        return Task::ready(Some(OpenTarget::Worktree(
-                            root_path_with_position,
-                            root_entry.clone(),
-                        )));
+                if let Some(root_entry) = worktree.read(cx).root_entry() {
+                    let possible_worktree_open_target = Some(OpenTarget::Worktree(
+                        root_path_with_position.clone(),
+                        root_entry.clone(),
+                    ));
+
+                    if project_is_local {
+                        worktree_root_match = possible_worktree_open_target;
+                    } else {
+                        return Task::ready(possible_worktree_open_target);
                     }
-                    None => root_path_with_position,
                 }
+
+                root_path_with_position
             } else {
                 PathWithPosition {
                     path: path_with_position
@@ -152,14 +159,20 @@ fn possible_open_target(
             if path_to_check.path.is_relative()
                 && let Some(entry) = worktree.read(cx).entry_for_path(&path_to_check.path)
             {
-                return Task::ready(Some(OpenTarget::Worktree(
+                let possible_worktree_open_target = Some(OpenTarget::Worktree(
                     PathWithPosition {
                         path: worktree_root.join(&entry.path),
                         row: path_to_check.row,
                         column: path_to_check.column,
                     },
                     entry.clone(),
-                )));
+                ));
+
+                if project_is_local {
+                    entry_for_path_exact_match = possible_worktree_open_target;
+                } else {
+                    return Task::ready(possible_worktree_open_target);
+                }
             }
 
             paths_to_check.push(path_to_check);
@@ -171,7 +184,7 @@ fn possible_open_target(
     }
 
     // Before entire worktree traversal(s), make an attempt to do FS checks if available.
-    let fs_paths_to_check = if workspace.read(cx).project().read(cx).is_local() {
+    let fs_paths_to_check = if project_is_local {
         potential_paths
             .into_iter()
             .flat_map(|path_to_check| {
@@ -193,27 +206,33 @@ fn possible_open_target(
                         });
                     }
                 } else {
-                    paths_to_check.push(PathWithPosition {
-                        path: maybe_path.clone(),
-                        row: path_to_check.row,
-                        column: path_to_check.column,
-                    });
                     if maybe_path.is_relative() {
-                        if let Some(cwd) = &cwd {
+                        if let Some(cwd) = cwd {
                             paths_to_check.push(PathWithPosition {
                                 path: cwd.join(maybe_path),
                                 row: path_to_check.row,
                                 column: path_to_check.column,
                             });
                         }
+
                         for worktree in &worktree_candidates {
-                            paths_to_check.push(PathWithPosition {
-                                path: worktree.read(cx).abs_path().join(maybe_path),
-                                row: path_to_check.row,
-                                column: path_to_check.column,
-                            });
+                            if !worktree.read(cx).is_single_file()
+                                && let worktree_root = worktree.read(cx).abs_path().as_ref()
+                                && cwd.map_or(true, |cwd| cwd != worktree_root)
+                            {
+                                paths_to_check.push(PathWithPosition {
+                                    path: worktree_root.join(maybe_path),
+                                    row: path_to_check.row,
+                                    column: path_to_check.column,
+                                });
+                            }
                         }
                     }
+                    paths_to_check.push(PathWithPosition {
+                        path: maybe_path.clone(),
+                        row: path_to_check.row,
+                        column: path_to_check.column,
+                    });
                 }
                 paths_to_check
             })
@@ -222,49 +241,75 @@ fn possible_open_target(
         Vec::new()
     };
 
-    let worktree_check_task = cx.spawn(async move |cx| {
+    let fs_check_task = if !fs_paths_to_check.is_empty() {
+        let fs = workspace.read(cx).project().read(cx).fs().clone();
+        Some(cx.background_spawn(async move {
+            println!(
+                "Checking {:#?}",
+                fs_paths_to_check
+                    .iter()
+                    .map(|p| p.path.to_string_lossy())
+                    .collect::<Vec<_>>()
+            );
+            for mut path_to_check in fs_paths_to_check {
+                if let Some(fs_path_to_check) = fs.canonicalize(&path_to_check.path).await.ok()
+                    && let Some(metadata) = fs.metadata(&fs_path_to_check).await.ok().flatten()
+                {
+                    path_to_check.path = fs_path_to_check;
+                    return Some(OpenTarget::File(path_to_check, metadata));
+                }
+            }
+
+            None
+        }))
+    } else {
+        None
+    };
+
+    cx.spawn(async move |cx| {
+        if let Some(fs_check_task) = fs_check_task
+            && let fs_open_target = fs_check_task.await
+            && fs_open_target.is_some()
+        {
+            return fs_open_target;
+        }
+
+        if worktree_root_match.is_some() {
+            return worktree_root_match;
+        }
+
+        if entry_for_path_exact_match.is_some() {
+            return entry_for_path_exact_match;
+        }
+
         for (worktree, worktree_paths_to_check) in worktree_paths_to_check {
-            let found_entry = worktree
-                .update(cx, |worktree, _| {
-                    let worktree_root = worktree.abs_path();
-                    let traversal = worktree.traverse_from_path(true, true, false, "".as_ref());
-                    for entry in traversal {
-                        if let Some(path_in_worktree) = worktree_paths_to_check
-                            .iter()
-                            .find(|path_to_check| entry.path.ends_with(&path_to_check.path))
-                        {
-                            return Some(OpenTarget::Worktree(
-                                PathWithPosition {
-                                    path: worktree_root.join(&entry.path),
-                                    row: path_in_worktree.row,
-                                    column: path_in_worktree.column,
-                                },
-                                entry.clone(),
-                            ));
-                        }
+            let found_entry: Result<Option<OpenTarget>, _> = worktree.update(cx, |worktree, _| {
+                let worktree_root = worktree.abs_path();
+                let traversal = worktree.traverse_from_path(true, true, false, "".as_ref());
+                for entry in traversal {
+                    if let Some(path_in_worktree) = worktree_paths_to_check
+                        .iter()
+                        .find(|path_to_check| entry.path.ends_with(&path_to_check.path))
+                    {
+                        return Some(OpenTarget::Worktree(
+                            PathWithPosition {
+                                path: worktree_root.join(&entry.path),
+                                row: path_in_worktree.row,
+                                column: path_in_worktree.column,
+                            },
+                            entry.clone(),
+                        ));
                     }
-                    None
-                })
-                .ok()?;
+                }
+                None
+            });
+
+            let found_entry = found_entry.ok()?;
             if let Some(found_entry) = found_entry {
                 return Some(found_entry);
             }
         }
         None
-    });
-
-    let fs = workspace.read(cx).project().read(cx).fs().clone();
-    cx.background_spawn(async move {
-        for mut path_to_check in fs_paths_to_check {
-            if let Some(fs_path_to_check) = fs.canonicalize(&path_to_check.path).await.ok()
-                && let Some(metadata) = fs.metadata(&fs_path_to_check).await.ok().flatten()
-            {
-                path_to_check.path = fs_path_to_check;
-                return Some(OpenTarget::File(path_to_check, metadata));
-            }
-        }
-
-        worktree_check_task.await
     })
 }
 
@@ -657,7 +702,6 @@ mod tests {
         }
 
         // https://github.com/zed-industries/zed/issues/28407
-        // See https://github.com/zed-industries/zed/issues/34027
         // See https://github.com/zed-industries/zed/issues/33498
         #[gpui::test]
         #[should_panic(expected = "Tooltip mismatch")]
@@ -687,7 +731,6 @@ mod tests {
 
                     test!("src/main.rs", "/project/src/main.rs", "/project");
                     test!("src/main.rs", "/project/src/main.rs", "/project/src");
-                    // Failing currently
                     test!("src/main.rs", "/project/lib/src/main.rs", "/project/lib");
                     // Failing currently
                     test!(
@@ -769,7 +812,6 @@ mod tests {
 
         // https://github.com/zed-industries/zed/issues/34027
         #[gpui::test]
-        #[should_panic(expected = "Tooltip mismatch")]
         async fn issue_34027(cx: &mut TestAppContext) {
             test_path_likes!(
                 cx,
@@ -796,7 +838,6 @@ mod tests {
 
         // https://github.com/zed-industries/zed/issues/34027
         #[gpui::test]
-        #[should_panic(expected = "Tooltip mismatch")]
         async fn issue_34027_non_worktree_file(cx: &mut TestAppContext) {
             test_path_likes!(
                 cx,
