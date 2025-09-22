@@ -42,6 +42,7 @@ workspace-hack.workspace = true
 itertools.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+base64.workspace = true
 windows.workspace = true
 
 [dev-dependencies]

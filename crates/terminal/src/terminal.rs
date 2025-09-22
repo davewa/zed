@@ -26,6 +26,8 @@ use alacritty_terminal::{
     },
 };
 use anyhow::{Context as _, Result, bail};
+#[cfg(windows)]
+use base64::Engine;
 
 use futures::{
     FutureExt,
@@ -397,10 +399,37 @@ impl TerminalBuilder {
                 program,
                 args,
                 title_override,
-            } => Some(ShellParams {
-                program,
-                args: Some(args),
-                title_override,
+            } => Some({
+                #[cfg(windows)]
+                {
+                    ShellParams {
+                        program: util::get_windows_system_shell(),
+                        args: {
+                            let mut args = args;
+                            args.insert(0, program);
+                            Some(vec![
+                                "-EncodedCommand".to_string(),
+                                base64::prelude::BASE64_STANDARD.encode(
+                                    args.join(" ")
+                                        .encode_utf16()
+                                        .chain([0])
+                                        .flat_map(u16::to_le_bytes)
+                                        .collect::<Vec<_>>()
+                                        .as_slice(),
+                                ),
+                            ])
+                        },
+                        title_override,
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    ShellParams {
+                        program,
+                        args: Some(args),
+                        title_override,
+                    }
+                }
             }),
         };
         let terminal_title_override = shell_params.as_ref().and_then(|e| e.title_override.clone());
@@ -428,7 +457,7 @@ impl TerminalBuilder {
                 drain_on_exit: true,
                 env: env.clone().into_iter().collect(),
                 #[cfg(windows)]
-                escape_args: true,
+                escape_args: false,
             }
         };
 
