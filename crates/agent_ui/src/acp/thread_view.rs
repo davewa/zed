@@ -9,7 +9,7 @@ use agent_client_protocol::{self as acp, PromptCapabilities};
 use agent_servers::{AgentServer, AgentServerDelegate};
 use agent_settings::{AgentProfileId, AgentSettings, CompletionMode};
 use agent2::{DbThreadMetadata, HistoryEntry, HistoryEntryId, HistoryStore, NativeAgentServer};
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use arrayvec::ArrayVec;
 use audio::{Audio, Sound};
 use buffer_diff::BufferDiff;
@@ -381,8 +381,8 @@ impl AcpThreadView {
         });
 
         let subscriptions = [
-            cx.observe_global_in::<SettingsStore>(window, Self::agent_font_size_changed),
-            cx.observe_global_in::<AgentFontSize>(window, Self::agent_font_size_changed),
+            cx.observe_global_in::<SettingsStore>(window, Self::agent_ui_font_size_changed),
+            cx.observe_global_in::<AgentFontSize>(window, Self::agent_ui_font_size_changed),
             cx.subscribe_in(&message_editor, window, Self::handle_message_editor_event),
             cx.subscribe_in(&entry_view_state, window, Self::handle_entry_view_event),
         ];
@@ -1012,11 +1012,13 @@ impl AcpThreadView {
             };
 
             let connection = thread.read(cx).connection().clone();
-            if !connection
-                .auth_methods()
-                .iter()
-                .any(|method| method.id.0.as_ref() == "claude-login")
-            {
+            let auth_methods = connection.auth_methods();
+            let has_supported_auth = auth_methods.iter().any(|method| {
+                let id = method.id.0.as_ref();
+                id == "claude-login" || id == "spawn-gemini-cli"
+            });
+            let can_login = has_supported_auth || auth_methods.is_empty() || self.login.is_some();
+            if !can_login {
                 return;
             };
             let this = cx.weak_entity();
@@ -1038,10 +1040,7 @@ impl AcpThreadView {
             return;
         }
 
-        let contents = self
-            .message_editor
-            .update(cx, |message_editor, cx| message_editor.contents(cx));
-        self.send_impl(contents, window, cx)
+        self.send_impl(self.message_editor.clone(), window, cx)
     }
 
     fn stop_current_and_send_new_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1051,15 +1050,11 @@ impl AcpThreadView {
 
         let cancelled = thread.update(cx, |thread, cx| thread.cancel(cx));
 
-        let contents = self
-            .message_editor
-            .update(cx, |message_editor, cx| message_editor.contents(cx));
-
         cx.spawn_in(window, async move |this, cx| {
             cancelled.await;
 
             this.update_in(cx, |this, window, cx| {
-                this.send_impl(contents, window, cx);
+                this.send_impl(this.message_editor.clone(), window, cx);
             })
             .ok();
         })
@@ -1068,10 +1063,23 @@ impl AcpThreadView {
 
     fn send_impl(
         &mut self,
-        contents: Task<Result<(Vec<acp::ContentBlock>, Vec<Entity<Buffer>>)>>,
+        message_editor: Entity<MessageEditor>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let full_mention_content = self.as_native_thread(cx).is_some_and(|thread| {
+            // Include full contents when using minimal profile
+            let thread = thread.read(cx);
+            AgentSettings::get_global(cx)
+                .profiles
+                .get(thread.profile())
+                .is_some_and(|profile| profile.tools.is_empty())
+        });
+
+        let contents = message_editor.update(cx, |message_editor, cx| {
+            message_editor.contents(full_mention_content, cx)
+        });
+
         let agent_telemetry_id = self.agent.telemetry_id();
 
         self.thread_error.take();
@@ -1200,10 +1208,8 @@ impl AcpThreadView {
             thread
                 .update(cx, |thread, cx| thread.rewind(user_message_id, cx))?
                 .await?;
-            let contents =
-                message_editor.update(cx, |message_editor, cx| message_editor.contents(cx))?;
             this.update_in(cx, |this, window, cx| {
-                this.send_impl(contents, window, cx);
+                this.send_impl(message_editor, window, cx);
             })?;
             anyhow::Ok(())
         })
@@ -1575,31 +1581,20 @@ impl AcpThreadView {
             return Task::ready(Ok(()));
         };
         let project = workspace.read(cx).project().clone();
-        let cwd = project.read(cx).first_project_directory(cx);
-        let shell = project.read(cx).terminal_settings(&cwd, cx).shell.clone();
 
         window.spawn(cx, async move |cx| {
             let mut task = login.clone();
-            task.command = task
-                .command
-                .map(|command| anyhow::Ok(shlex::try_quote(&command)?.to_string()))
-                .transpose()?;
-            task.args = task
-                .args
-                .iter()
-                .map(|arg| {
-                    Ok(shlex::try_quote(arg)
-                        .context("Failed to quote argument")?
-                        .to_string())
-                })
-                .collect::<Result<Vec<_>>>()?;
+            task.shell = task::Shell::WithArguments {
+                program: task.command.take().expect("login command should be set"),
+                args: std::mem::take(&mut task.args),
+                title_override: None
+            };
             task.full_label = task.label.clone();
             task.id = task::TaskId(format!("external-agent-{}-login", task.label));
             task.command_label = task.label.clone();
             task.use_new_terminal = true;
             task.allow_concurrent_runs = true;
             task.hide = task::HideStrategy::Always;
-            task.shell = shell;
 
             let terminal = terminal_panel.update_in(cx, |terminal_panel, window, cx| {
                 terminal_panel.spawn_task(&task, window, cx)
@@ -2075,27 +2070,6 @@ impl AcpThreadView {
         let has_location = tool_call.locations.len() == 1;
         let card_header_id = SharedString::from("inner-tool-call-header");
 
-        let tool_icon = if tool_call.kind == acp::ToolKind::Edit && has_location {
-            FileIcons::get_icon(&tool_call.locations[0].path, cx)
-                .map(Icon::from_path)
-                .unwrap_or(Icon::new(IconName::ToolPencil))
-        } else {
-            Icon::new(match tool_call.kind {
-                acp::ToolKind::Read => IconName::ToolSearch,
-                acp::ToolKind::Edit => IconName::ToolPencil,
-                acp::ToolKind::Delete => IconName::ToolDeleteFile,
-                acp::ToolKind::Move => IconName::ArrowRightLeft,
-                acp::ToolKind::Search => IconName::ToolSearch,
-                acp::ToolKind::Execute => IconName::ToolTerminal,
-                acp::ToolKind::Think => IconName::ToolThink,
-                acp::ToolKind::Fetch => IconName::ToolWeb,
-                acp::ToolKind::SwitchMode => IconName::ArrowRightLeft,
-                acp::ToolKind::Other => IconName::ToolHammer,
-            })
-        }
-        .size(IconSize::Small)
-        .color(Color::Muted);
-
         let failed_or_canceled = match &tool_call.status {
             ToolCallStatus::Rejected | ToolCallStatus::Canceled | ToolCallStatus::Failed => true,
             _ => false,
@@ -2105,40 +2079,15 @@ impl AcpThreadView {
             tool_call.status,
             ToolCallStatus::WaitingForConfirmation { .. }
         );
+        let is_terminal_tool = matches!(tool_call.kind, acp::ToolKind::Execute);
         let is_edit =
             matches!(tool_call.kind, acp::ToolKind::Edit) || tool_call.diffs().next().is_some();
-        let use_card_layout = needs_confirmation || is_edit;
+
+        let use_card_layout = needs_confirmation || is_edit || is_terminal_tool;
 
         let is_collapsible = !tool_call.content.is_empty() && !needs_confirmation;
 
         let is_open = needs_confirmation || self.expanded_tool_calls.contains(&tool_call.id);
-
-        let gradient_overlay = {
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .w_12()
-                .h_full()
-                .map(|this| {
-                    if use_card_layout {
-                        this.bg(linear_gradient(
-                            90.,
-                            linear_color_stop(self.tool_card_header_bg(cx), 1.),
-                            linear_color_stop(self.tool_card_header_bg(cx).opacity(0.2), 0.),
-                        ))
-                    } else {
-                        this.bg(linear_gradient(
-                            90.,
-                            linear_color_stop(cx.theme().colors().panel_background, 1.),
-                            linear_color_stop(
-                                cx.theme().colors().panel_background.opacity(0.2),
-                                0.,
-                            ),
-                        ))
-                    }
-                })
-        };
 
         let tool_output_display =
             if is_open {
@@ -2224,102 +2173,200 @@ impl AcpThreadView {
                 }
             })
             .mr_5()
-            .child(
-                h_flex()
-                    .group(&card_header_id)
-                    .relative()
-                    .w_full()
-                    .gap_1()
-                    .justify_between()
-                    .when(use_card_layout, |this| {
-                        this.p_0p5()
-                            .rounded_t(rems_from_px(5.))
+            .map(|this| {
+                if is_terminal_tool {
+                    this.child(
+                        v_flex()
+                            .p_1p5()
+                            .gap_0p5()
+                            .text_ui_sm(cx)
                             .bg(self.tool_card_header_bg(cx))
-                    })
-                    .child(
+                            .child(
+                                Label::new("Run Command")
+                                    .buffer_font(cx)
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                MarkdownElement::new(
+                                    tool_call.label.clone(),
+                                    terminal_command_markdown_style(window, cx),
+                                )
+                                .code_block_renderer(
+                                    markdown::CodeBlockRenderer::Default {
+                                        copy_button: false,
+                                        copy_button_on_hover: false,
+                                        border: false,
+                                    },
+                                )
+                            ),
+                    )
+                } else {
+                   this.child(
                         h_flex()
+                            .group(&card_header_id)
                             .relative()
                             .w_full()
-                            .h(window.line_height() - px(2.))
-                            .text_size(self.tool_name_font_size())
-                            .gap_1p5()
-                            .when(has_location || use_card_layout, |this| this.px_1())
-                            .when(has_location, |this| {
-                                this.cursor(CursorStyle::PointingHand)
-                                    .rounded(rems_from_px(3.)) // Concentric border radius
-                                    .hover(|s| s.bg(cx.theme().colors().element_hover.opacity(0.5)))
+                            .gap_1()
+                            .justify_between()
+                            .when(use_card_layout, |this| {
+                                this.p_0p5()
+                                    .rounded_t(rems_from_px(5.))
+                                    .bg(self.tool_card_header_bg(cx))
                             })
-                            .overflow_hidden()
-                            .child(tool_icon)
-                            .child(if has_location {
-                                h_flex()
-                                    .id(("open-tool-call-location", entry_ix))
-                                    .w_full()
-                                    .map(|this| {
-                                        if use_card_layout {
-                                            this.text_color(cx.theme().colors().text)
-                                        } else {
-                                            this.text_color(cx.theme().colors().text_muted)
-                                        }
-                                    })
-                                    .child(self.render_markdown(
-                                        tool_call.label.clone(),
-                                        MarkdownStyle {
-                                            prevent_mouse_interaction: true,
-                                            ..default_markdown_style(false, true, window, cx)
-                                        },
-                                    ))
-                                    .tooltip(Tooltip::text("Jump to File"))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_tool_call_location(entry_ix, 0, window, cx);
-                                    }))
-                                    .into_any_element()
-                            } else {
-                                h_flex()
-                                    .w_full()
-                                    .child(self.render_markdown(
-                                        tool_call.label.clone(),
-                                        default_markdown_style(false, true, window, cx),
-                                    ))
-                                    .into_any()
-                            })
-                            .when(!has_location, |this| this.child(gradient_overlay)),
-                    )
-                    .when(is_collapsible || failed_or_canceled, |this| {
-                        this.child(
-                            h_flex()
-                                .px_1()
-                                .gap_px()
-                                .when(is_collapsible, |this| {
-                                    this.child(
-                                    Disclosure::new(("expand", entry_ix), is_open)
-                                        .opened_icon(IconName::ChevronUp)
-                                        .closed_icon(IconName::ChevronDown)
-                                        .visible_on_hover(&card_header_id)
-                                        .on_click(cx.listener({
-                                            let id = tool_call.id.clone();
-                                            move |this: &mut Self, _, _, cx: &mut Context<Self>| {
-                                                if is_open {
-                                                    this.expanded_tool_calls.remove(&id);
-                                                } else {
-                                                    this.expanded_tool_calls.insert(id.clone());
-                                                }
-                                                cx.notify();
-                                            }
-                                        })),
+                            .child(self.render_tool_call_label(
+                                entry_ix,
+                                tool_call,
+                                is_edit,
+                                use_card_layout,
+                                window,
+                                cx,
+                            ))
+                            .when(is_collapsible || failed_or_canceled, |this| {
+                                this.child(
+                                    h_flex()
+                                        .px_1()
+                                        .gap_px()
+                                        .when(is_collapsible, |this| {
+                                            this.child(
+                                            Disclosure::new(("expand", entry_ix), is_open)
+                                                .opened_icon(IconName::ChevronUp)
+                                                .closed_icon(IconName::ChevronDown)
+                                                .visible_on_hover(&card_header_id)
+                                                .on_click(cx.listener({
+                                                    let id = tool_call.id.clone();
+                                                    move |this: &mut Self, _, _, cx: &mut Context<Self>| {
+                                                        if is_open {
+                                                            this.expanded_tool_calls.remove(&id);
+                                                        } else {
+                                                            this.expanded_tool_calls.insert(id.clone());
+                                                        }
+                                                        cx.notify();
+                                                    }
+                                                })),
+                                        )
+                                        })
+                                        .when(failed_or_canceled, |this| {
+                                            this.child(
+                                                Icon::new(IconName::Close)
+                                                    .color(Color::Error)
+                                                    .size(IconSize::Small),
+                                            )
+                                        }),
                                 )
-                                })
-                                .when(failed_or_canceled, |this| {
-                                    this.child(
-                                        Icon::new(IconName::Close)
-                                            .color(Color::Error)
-                                            .size(IconSize::Small),
-                                    )
-                                }),
-                        )
-                    }),
-            )
+                            }),
+                    )
+                }
+            })
             .children(tool_output_display)
+    }
+
+    fn render_tool_call_label(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        is_edit: bool,
+        use_card_layout: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> Div {
+        let has_location = tool_call.locations.len() == 1;
+
+        let tool_icon = if tool_call.kind == acp::ToolKind::Edit && has_location {
+            FileIcons::get_icon(&tool_call.locations[0].path, cx)
+                .map(Icon::from_path)
+                .unwrap_or(Icon::new(IconName::ToolPencil))
+        } else {
+            Icon::new(match tool_call.kind {
+                acp::ToolKind::Read => IconName::ToolSearch,
+                acp::ToolKind::Edit => IconName::ToolPencil,
+                acp::ToolKind::Delete => IconName::ToolDeleteFile,
+                acp::ToolKind::Move => IconName::ArrowRightLeft,
+                acp::ToolKind::Search => IconName::ToolSearch,
+                acp::ToolKind::Execute => IconName::ToolTerminal,
+                acp::ToolKind::Think => IconName::ToolThink,
+                acp::ToolKind::Fetch => IconName::ToolWeb,
+                acp::ToolKind::SwitchMode => IconName::ArrowRightLeft,
+                acp::ToolKind::Other => IconName::ToolHammer,
+            })
+        }
+        .size(IconSize::Small)
+        .color(Color::Muted);
+
+        let gradient_overlay = {
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .w_12()
+                .h_full()
+                .map(|this| {
+                    if use_card_layout {
+                        this.bg(linear_gradient(
+                            90.,
+                            linear_color_stop(self.tool_card_header_bg(cx), 1.),
+                            linear_color_stop(self.tool_card_header_bg(cx).opacity(0.2), 0.),
+                        ))
+                    } else {
+                        this.bg(linear_gradient(
+                            90.,
+                            linear_color_stop(cx.theme().colors().panel_background, 1.),
+                            linear_color_stop(
+                                cx.theme().colors().panel_background.opacity(0.2),
+                                0.,
+                            ),
+                        ))
+                    }
+                })
+        };
+
+        h_flex()
+            .relative()
+            .w_full()
+            .h(window.line_height() - px(2.))
+            .text_size(self.tool_name_font_size())
+            .gap_1p5()
+            .when(has_location || use_card_layout, |this| this.px_1())
+            .when(has_location, |this| {
+                this.cursor(CursorStyle::PointingHand)
+                    .rounded(rems_from_px(3.)) // Concentric border radius
+                    .hover(|s| s.bg(cx.theme().colors().element_hover.opacity(0.5)))
+            })
+            .overflow_hidden()
+            .child(tool_icon)
+            .child(if has_location {
+                h_flex()
+                    .id(("open-tool-call-location", entry_ix))
+                    .w_full()
+                    .map(|this| {
+                        if use_card_layout {
+                            this.text_color(cx.theme().colors().text)
+                        } else {
+                            this.text_color(cx.theme().colors().text_muted)
+                        }
+                    })
+                    .child(self.render_markdown(
+                        tool_call.label.clone(),
+                        MarkdownStyle {
+                            prevent_mouse_interaction: true,
+                            ..default_markdown_style(false, true, window, cx)
+                        },
+                    ))
+                    .tooltip(Tooltip::text("Jump to File"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_tool_call_location(entry_ix, 0, window, cx);
+                    }))
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .w_full()
+                    .child(self.render_markdown(
+                        tool_call.label.clone(),
+                        default_markdown_style(false, true, window, cx),
+                    ))
+                    .into_any()
+            })
+            .when(!is_edit, |this| this.child(gradient_overlay))
     }
 
     fn render_tool_call_content(
@@ -3648,15 +3695,15 @@ impl AcpThreadView {
             |(index, (buffer, _diff))| {
                 let file = buffer.read(cx).file()?;
                 let path = file.path();
+                let path_style = file.path_style(cx);
+                let separator = file.path_style(cx).separator();
 
                 let file_path = path.parent().and_then(|parent| {
-                    let parent_str = parent.to_string_lossy();
-
-                    if parent_str.is_empty() {
+                    if parent.is_empty() {
                         None
                     } else {
                         Some(
-                            Label::new(format!("/{}{}", parent_str, std::path::MAIN_SEPARATOR_STR))
+                            Label::new(format!("{}{separator}", parent.display(path_style)))
                                 .color(Color::Muted)
                                 .size(LabelSize::XSmall)
                                 .buffer_font(cx),
@@ -3665,12 +3712,12 @@ impl AcpThreadView {
                 });
 
                 let file_name = path.file_name().map(|name| {
-                    Label::new(name.to_string_lossy().to_string())
+                    Label::new(name.to_string())
                         .size(LabelSize::XSmall)
                         .buffer_font(cx)
                 });
 
-                let file_icon = FileIcons::get_icon(path, cx)
+                let file_icon = FileIcons::get_icon(path.as_std_path(), cx)
                     .map(Icon::from_path)
                     .map(|icon| icon.color(Color::Muted).size(IconSize::Small))
                     .unwrap_or_else(|| {
@@ -4513,7 +4560,7 @@ impl AcpThreadView {
                 .read(cx)
                 .visible_worktrees(cx)
                 .next()
-                .map(|worktree| worktree.read(cx).root_name().to_string())
+                .map(|worktree| worktree.read(cx).root_name_str().to_string())
         });
 
         if let Some(screen_window) = cx
@@ -4855,9 +4902,9 @@ impl AcpThreadView {
         )
     }
 
-    fn agent_font_size_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn agent_ui_font_size_changed(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.entry_view_state.update(cx, |entry_view_state, cx| {
-            entry_view_state.agent_font_size_changed(cx);
+            entry_view_state.agent_ui_font_size_changed(cx);
         });
     }
 
@@ -5487,23 +5534,23 @@ fn default_markdown_style(
         }),
         code_block: StyleRefinement {
             padding: EdgesRefinement {
-                top: Some(DefiniteLength::Absolute(AbsoluteLength::Pixels(Pixels(8.)))),
-                left: Some(DefiniteLength::Absolute(AbsoluteLength::Pixels(Pixels(8.)))),
-                right: Some(DefiniteLength::Absolute(AbsoluteLength::Pixels(Pixels(8.)))),
-                bottom: Some(DefiniteLength::Absolute(AbsoluteLength::Pixels(Pixels(8.)))),
+                top: Some(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(8.)))),
+                left: Some(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(8.)))),
+                right: Some(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(8.)))),
+                bottom: Some(DefiniteLength::Absolute(AbsoluteLength::Pixels(px(8.)))),
             },
             margin: EdgesRefinement {
-                top: Some(Length::Definite(Pixels(8.).into())),
-                left: Some(Length::Definite(Pixels(0.).into())),
-                right: Some(Length::Definite(Pixels(0.).into())),
-                bottom: Some(Length::Definite(Pixels(12.).into())),
+                top: Some(Length::Definite(px(8.).into())),
+                left: Some(Length::Definite(px(0.).into())),
+                right: Some(Length::Definite(px(0.).into())),
+                bottom: Some(Length::Definite(px(12.).into())),
             },
             border_style: Some(BorderStyle::Solid),
             border_widths: EdgesRefinement {
-                top: Some(AbsoluteLength::Pixels(Pixels(1.))),
-                left: Some(AbsoluteLength::Pixels(Pixels(1.))),
-                right: Some(AbsoluteLength::Pixels(Pixels(1.))),
-                bottom: Some(AbsoluteLength::Pixels(Pixels(1.))),
+                top: Some(AbsoluteLength::Pixels(px(1.))),
+                left: Some(AbsoluteLength::Pixels(px(1.))),
+                right: Some(AbsoluteLength::Pixels(px(1.))),
+                bottom: Some(AbsoluteLength::Pixels(px(1.))),
             },
             border_color: Some(colors.border_variant),
             background: Some(colors.editor_background.into()),

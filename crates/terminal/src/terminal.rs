@@ -28,6 +28,7 @@ use alacritty_terminal::{
 use anyhow::{Context as _, Result, bail};
 #[cfg(windows)]
 use base64::Engine;
+use log::trace;
 
 use futures::{
     FutureExt,
@@ -46,7 +47,7 @@ use pty_info::PtyProcessInfo;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use smol::channel::{Receiver, Sender};
-use task::{HideStrategy, Shell, TaskId};
+use task::{HideStrategy, Shell, SpawnInTerminal};
 use terminal_hyperlinks::RegexSearches;
 use terminal_settings::{AlternateScroll, CursorShape, TerminalSettings};
 use theme::{ActiveTheme, Theme};
@@ -122,7 +123,7 @@ const DEBUG_CELL_WIDTH: Pixels = px(5.);
 const DEBUG_LINE_HEIGHT: Pixels = px(5.);
 
 ///Upward flowing events, for changing the title and such
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     TitleChanged,
     BreadcrumbsChanged,
@@ -135,7 +136,7 @@ pub enum Event {
     Open(MaybeNavigationTarget),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathLikeTarget {
     /// File system path, absolute or relative, existing or not.
     /// Might have line and column number(s) attached as `file.rs:1:23`
@@ -145,7 +146,7 @@ pub struct PathLikeTarget {
 }
 
 /// A string inside terminal, potentially useful as a URI that can be opened.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MaybeNavigationTarget {
     /// HTTP, git, etc. string determined by the `URL_REGEX` regex.
     Url(String),
@@ -340,6 +341,29 @@ pub struct TerminalBuilder {
 }
 
 impl TerminalBuilder {
+    pub fn new_display_only(
+        working_directory: Option<PathBuf>,
+        cursor_shape: CursorShape,
+        alternate_scroll: AlternateScroll,
+        max_scroll_history_lines: Option<usize>,
+        window_id: u64,
+        cx: &App,
+    ) -> Result<TerminalBuilder> {
+        Self::new(
+            working_directory,
+            None,
+            Shell::System,
+            HashMap::default(),
+            cursor_shape,
+            alternate_scroll,
+            max_scroll_history_lines,
+            false,
+            window_id,
+            None,
+            cx,
+            Vec::new(),
+        )
+    }
     pub fn new(
         working_directory: Option<PathBuf>,
         task: Option<TaskState>,
@@ -379,22 +403,35 @@ impl TerminalBuilder {
             title_override: Option<SharedString>,
         }
 
+        impl ShellParams {
+            fn new(
+                program: String,
+                args: Option<Vec<String>>,
+                title_override: Option<SharedString>,
+            ) -> Self {
+                log::info!("Using {program} as shell");
+                Self {
+                    program,
+                    args,
+                    title_override,
+                }
+            }
+        }
+
         let shell_params = match shell.clone() {
             Shell::System => {
                 #[cfg(target_os = "windows")]
                 {
-                    Some(ShellParams {
-                        program: util::get_windows_system_shell(),
-                        ..Default::default()
-                    })
+                    Some(ShellParams::new(
+                        util::shell::get_windows_system_shell(),
+                        None,
+                        None,
+                    ))
                 }
                 #[cfg(not(target_os = "windows"))]
                 None
             }
-            Shell::Program(program) => Some(ShellParams {
-                program,
-                ..Default::default()
-            }),
+            Shell::Program(program) => Some(ShellParams::new(program, None, None)),
             Shell::WithArguments {
                 program,
                 args,
@@ -768,17 +805,11 @@ struct CopyTemplate {
     window_id: u64,
 }
 
+#[derive(Debug)]
 pub struct TaskState {
-    pub id: TaskId,
-    pub full_label: String,
-    pub label: String,
-    pub command_label: String,
     pub status: TaskStatus,
     pub completion_rx: Receiver<Option<ExitStatus>>,
-    pub hide: HideStrategy,
-    pub show_summary: bool,
-    pub show_command: bool,
-    pub show_rerun: bool,
+    pub spawned_task: SpawnInTerminal,
 }
 
 /// A status of the current terminal tab's task.
@@ -900,6 +931,7 @@ impl Terminal {
     ) {
         match event {
             &InternalEvent::Resize(mut new_bounds) => {
+                trace!("Resizing: new_bounds={new_bounds:?}");
                 new_bounds.bounds.size.height =
                     cmp::max(new_bounds.line_height, new_bounds.height());
                 new_bounds.bounds.size.width = cmp::max(new_bounds.cell_width, new_bounds.width());
@@ -911,6 +943,7 @@ impl Terminal {
                 term.resize(new_bounds);
             }
             InternalEvent::Clear => {
+                trace!("Clearing");
                 // Clear back buffer
                 term.clear_screen(ClearMode::Saved);
 
@@ -943,6 +976,7 @@ impl Terminal {
                 cx.emit(Event::Wakeup);
             }
             InternalEvent::Scroll(scroll) => {
+                trace!("Scrolling: scroll={scroll:?}");
                 term.scroll_display(*scroll);
                 self.refresh_hovered_word(window);
 
@@ -984,6 +1018,7 @@ impl Terminal {
                 }
             }
             InternalEvent::SetSelection(selection) => {
+                trace!("Setting selection: selection={selection:?}");
                 term.selection = selection.as_ref().map(|(sel, _)| sel.clone());
 
                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -997,6 +1032,7 @@ impl Terminal {
                 cx.emit(Event::SelectionsChanged)
             }
             InternalEvent::UpdateSelection(position) => {
+                trace!("Updating selection: position={position:?}");
                 if let Some(mut selection) = term.selection.take() {
                     let (point, side) = grid_point_and_side(
                         *position,
@@ -1018,6 +1054,7 @@ impl Terminal {
             }
 
             InternalEvent::Copy(keep_selection) => {
+                trace!("Copying selection: keep_selection={keep_selection:?}");
                 if let Some(txt) = term.selection_to_string() {
                     cx.write_to_clipboard(ClipboardItem::new_string(txt));
                     if !keep_selection.unwrap_or_else(|| {
@@ -1029,21 +1066,26 @@ impl Terminal {
                 }
             }
             InternalEvent::ScrollToAlacPoint(point) => {
+                trace!("Scrolling to point: point={point:?}");
                 term.scroll_to_point(*point);
                 self.refresh_hovered_word(window);
             }
             InternalEvent::MoveViCursorToAlacPoint(point) => {
+                trace!("Move vi cursor to point: point={point:?}");
                 term.vi_goto_point(*point);
                 self.refresh_hovered_word(window);
             }
             InternalEvent::ToggleViMode => {
+                trace!("Toggling vi mode");
                 self.vi_mode_enabled = !self.vi_mode_enabled;
                 term.toggle_vi_mode();
             }
             InternalEvent::ViMotion(motion) => {
+                trace!("Performing vi motion: motion={motion:?}");
                 term.vi_motion(*motion);
             }
             InternalEvent::FindHyperlink(position, open) => {
+                trace!("Finding hyperlink at position: position={position:?}, open={open:?}");
                 let prev_hovered_word = self.last_content.last_hovered_word.take();
 
                 let point = grid_point(
@@ -1144,6 +1186,19 @@ impl Terminal {
     pub fn set_cursor_shape(&mut self, cursor_shape: CursorShape) {
         self.term_config.default_cursor_style = cursor_shape.into();
         self.term.lock().set_options(self.term_config.clone());
+    }
+
+    pub fn write_output(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        // Inject bytes directly into the terminal emulator and refresh the UI.
+        // This bypasses the PTY/event loop for display-only terminals.
+        let mut processor = alacritty_terminal::vte::ansi::Processor::<
+            alacritty_terminal::vte::ansi::StdSyncHandler,
+        >::new();
+        {
+            let mut term = self.term.lock();
+            processor.advance(&mut *term, bytes);
+        }
+        cx.emit(Event::Wakeup);
     }
 
     pub fn total_lines(&self) -> usize {
@@ -1868,9 +1923,9 @@ impl Terminal {
         match &self.task {
             Some(task_state) => {
                 if truncate {
-                    truncate_and_trailoff(&task_state.label, MAX_CHARS)
+                    truncate_and_trailoff(&task_state.spawned_task.label, MAX_CHARS)
                 } else {
-                    task_state.full_label.clone()
+                    task_state.spawned_task.full_label.clone()
                 }
             }
             None => self
@@ -1885,7 +1940,7 @@ impl Terminal {
                             let process_file = fpi
                                 .cwd
                                 .file_name()
-                                .map(|name| name.to_string_lossy().to_string())
+                                .map(|name| name.to_string_lossy().into_owned())
                                 .unwrap_or_default();
 
                             let argv = fpi.argv.as_slice();
@@ -1978,10 +2033,10 @@ impl Terminal {
 
         let (finished_successfully, task_line, command_line) = task_summary(task, error_code);
         let mut lines_to_show = Vec::new();
-        if task.show_summary {
+        if task.spawned_task.show_summary {
             lines_to_show.push(task_line.as_str());
         }
-        if task.show_command {
+        if task.spawned_task.show_command {
             lines_to_show.push(command_line.as_str());
         }
 
@@ -1993,7 +2048,7 @@ impl Terminal {
             unsafe { append_text_to_term(&mut self.term.lock(), &lines_to_show) };
         }
 
-        match task.hide {
+        match task.spawned_task.hide {
             HideStrategy::Never => {}
             HideStrategy::Always => {
                 cx.emit(Event::CloseTerminal);
@@ -2043,7 +2098,11 @@ pub fn row_to_string(row: &Row<Cell>) -> String {
 
 const TASK_DELIMITER: &str = "⏵ ";
 fn task_summary(task: &TaskState, error_code: Option<i32>) -> (bool, String, String) {
-    let escaped_full_label = task.full_label.replace("\r\n", "\r").replace('\n', "\r");
+    let escaped_full_label = task
+        .spawned_task
+        .full_label
+        .replace("\r\n", "\r")
+        .replace('\n', "\r");
     let (success, task_line) = match error_code {
         Some(0) => (
             true,
@@ -2060,7 +2119,11 @@ fn task_summary(task: &TaskState, error_code: Option<i32>) -> (bool, String, Str
             format!("{TASK_DELIMITER}Task `{escaped_full_label}` finished"),
         ),
     };
-    let escaped_command_label = task.command_label.replace("\r\n", "\r").replace('\n', "\r");
+    let escaped_command_label = task
+        .spawned_task
+        .command_label
+        .replace("\r\n", "\r")
+        .replace('\n', "\r");
     let command_line = format!("{TASK_DELIMITER}Command: {escaped_command_label}");
     (success, task_line, command_line)
 }
@@ -2225,6 +2288,8 @@ pub fn rgba_color(r: u8, g: u8, b: u8) -> Hsla {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::{
         IndexedCell, TerminalBounds, TerminalBuilder, TerminalContent, content_index_for_mouse,
@@ -2235,7 +2300,7 @@ mod tests {
         term::cell::Cell,
     };
     use collections::HashMap;
-    use gpui::{Pixels, Point, TestAppContext, bounds, point, size};
+    use gpui::{Pixels, Point, TestAppContext, bounds, point, size, smol_timeout};
     use rand::{Rng, distr, rngs::ThreadRng};
     use task::ShellBuilder;
 
@@ -2275,6 +2340,162 @@ mod tests {
         assert_eq!(
             terminal.update(cx, |term, _| term.get_content()).trim(),
             "hello"
+        );
+
+        // Inject additional output directly into the emulator (display-only path)
+        terminal.update(cx, |term, cx| {
+            term.write_output(b"\nfrom_injection", cx);
+        });
+
+        let content_after = terminal.update(cx, |term, _| term.get_content());
+        assert!(
+            content_after.contains("from_injection"),
+            "expected injected output to appear, got: {content_after}"
+        );
+    }
+
+    // TODO should be tested on Linux too, but does not work there well
+    #[cfg(target_os = "macos")]
+    #[gpui::test(iterations = 10)]
+    async fn test_terminal_eof(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let (completion_tx, completion_rx) = smol::channel::unbounded();
+        // Build an empty command, which will result in a tty shell spawned.
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new(
+                None,
+                None,
+                task::Shell::System,
+                HashMap::default(),
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                false,
+                0,
+                Some(completion_tx),
+                cx,
+                Vec::new(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        let (event_tx, event_rx) = smol::channel::unbounded::<Event>();
+        cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, e, _| {
+                event_tx.send_blocking(e.clone()).unwrap();
+            })
+        })
+        .detach();
+        cx.background_spawn(async move {
+            assert_eq!(
+                completion_rx.recv().await.unwrap(),
+                Some(ExitStatus::default()),
+                "EOF should result in the tty shell exiting successfully",
+            );
+        })
+        .detach();
+
+        let first_event = Event::Wakeup;
+        let wakeup = event_rx.recv().await.expect("No wakeup event received");
+        assert_eq!(wakeup, first_event, "Expected wakeup, got {wakeup:?}");
+
+        terminal.update(cx, |terminal, _| {
+            let success = terminal.try_keystroke(&Keystroke::parse("ctrl-c").unwrap(), false);
+            assert!(success, "Should have registered ctrl-c sequence");
+        });
+        terminal.update(cx, |terminal, _| {
+            let success = terminal.try_keystroke(&Keystroke::parse("ctrl-d").unwrap(), false);
+            assert!(success, "Should have registered ctrl-d sequence");
+        });
+
+        let mut all_events = vec![first_event];
+        while let Ok(Ok(new_event)) = smol_timeout(Duration::from_secs(1), event_rx.recv()).await {
+            all_events.push(new_event.clone());
+            if new_event == Event::CloseTerminal {
+                break;
+            }
+        }
+        assert!(
+            all_events.contains(&Event::CloseTerminal),
+            "EOF command sequence should have triggered a TTY terminal exit, but got events: {all_events:?}",
+        );
+    }
+
+    #[gpui::test(iterations = 10)]
+    async fn test_terminal_no_exit_on_spawn_failure(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let (completion_tx, completion_rx) = smol::channel::unbounded();
+        let (program, args) = ShellBuilder::new(None, &Shell::System)
+            .build(Some("asdasdasdasd".to_owned()), &["@@@@@".to_owned()]);
+        let terminal = cx.new(|cx| {
+            TerminalBuilder::new(
+                None,
+                None,
+                task::Shell::WithArguments {
+                    program,
+                    args,
+                    title_override: None,
+                },
+                HashMap::default(),
+                CursorShape::default(),
+                AlternateScroll::On,
+                None,
+                false,
+                0,
+                Some(completion_tx),
+                cx,
+                Vec::new(),
+            )
+            .unwrap()
+            .subscribe(cx)
+        });
+
+        let (event_tx, event_rx) = smol::channel::unbounded::<Event>();
+        cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, e, _| {
+                event_tx.send_blocking(e.clone()).unwrap();
+            })
+        })
+        .detach();
+        cx.background_spawn(async move {
+            #[cfg(target_os = "windows")]
+            {
+                let exit_status = completion_rx.recv().await.ok().flatten();
+                if let Some(exit_status) = exit_status {
+                    assert!(
+                        !exit_status.success(),
+                        "Wrong shell command should result in a failure"
+                    );
+                    assert_eq!(exit_status.code(), Some(1));
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let exit_status = completion_rx.recv().await.unwrap().unwrap();
+                assert!(
+                    !exit_status.success(),
+                    "Wrong shell command should result in a failure"
+                );
+                assert_eq!(exit_status.code(), None);
+            }
+        })
+        .detach();
+
+        let mut all_events = Vec::new();
+        while let Ok(Ok(new_event)) =
+            smol_timeout(Duration::from_millis(500), event_rx.recv()).await
+        {
+            all_events.push(new_event.clone());
+        }
+
+        assert!(
+            !all_events
+                .iter()
+                .any(|event| event == &Event::CloseTerminal),
+            "Wrong shell command should update the title but not should not close the terminal to show the error message, but got events: {all_events:?}",
         );
     }
 
