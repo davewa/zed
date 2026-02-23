@@ -14,7 +14,7 @@ use crate::{
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
     ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
     SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
-    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement,
+    TaffyLayoutEngine, Task, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
     TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
     point, prelude::*, px, rems, size, transparent_black,
@@ -59,7 +59,8 @@ mod prompts;
 use crate::util::atomic_incr_if_not_zero;
 pub use prompts::*;
 
-pub(crate) const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(864.));
+/// Default window size used when no explicit size is provided.
+pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(864.));
 
 /// A 6:5 aspect ratio minimum window size to be used for functional,
 /// additional-to-main-Zed windows, like the settings and rules library windows.
@@ -724,6 +725,7 @@ pub(crate) struct DeferredDraw {
     parent_node: DispatchNodeId,
     element_id_stack: SmallVec<[ElementId; 32]>,
     text_style_stack: Vec<TextStyleRefinement>,
+    rem_size: Pixels,
     element: Option<AnyElement>,
     absolute_offset: Point<Pixels>,
     prepaint_range: Range<PrepaintStateIndex>,
@@ -1154,6 +1156,7 @@ impl Window {
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        let last_frame_time = Rc::new(Cell::new(None));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1183,6 +1186,23 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
+                let thermal_state = handle
+                    .update(&mut cx, |_, _, cx| cx.thermal_state())
+                    .log_err();
+
+                if thermal_state == Some(ThermalState::Serious)
+                    || thermal_state == Some(ThermalState::Critical)
+                {
+                    let now = Instant::now();
+                    let last_frame_time = last_frame_time.replace(Some(now));
+
+                    if let Some(last_frame) = last_frame_time
+                        && now.duration_since(last_frame) < Duration::from_micros(16667)
+                    {
+                        return;
+                    }
+                }
+
                 let next_frame_callbacks = next_frame_callbacks.take();
                 if !next_frame_callbacks.is_empty() {
                     handle
@@ -1431,7 +1451,8 @@ impl Window {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DispatchEventResult {
+#[expect(missing_docs)]
+pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
 }
@@ -2041,10 +2062,22 @@ impl Window {
         element_id: ElementId,
         f: impl FnOnce(&GlobalElementId, &mut Self) -> R,
     ) -> R {
-        self.element_id_stack.push(element_id);
-        let global_id = GlobalElementId(Arc::from(&*self.element_id_stack));
+        self.with_id(element_id, |this| {
+            let global_id = GlobalElementId(Arc::from(&*this.element_id_stack));
 
-        let result = f(&global_id, self);
+            f(&global_id, this)
+        })
+    }
+
+    /// Calls the provided closure with the element ID pushed on the stack.
+    #[inline]
+    pub fn with_id<R>(
+        &mut self,
+        element_id: impl Into<ElementId>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.element_id_stack.push(element_id.into());
+        let result = f(self);
         self.element_id_stack.pop();
         result
     }
@@ -2208,9 +2241,8 @@ impl Window {
     }
 
     fn record_entities_accessed(&mut self, cx: &mut App) {
-        let mut entities_ref = cx.entities.accessed_entities.borrow_mut();
+        let mut entities_ref = cx.entities.accessed_entities.get_mut();
         let mut entities = mem::take(entities_ref.deref_mut());
-        drop(entities_ref);
         let handle = self.handle;
         cx.record_entities_accessed(
             handle,
@@ -2218,7 +2250,7 @@ impl Window {
             self.invalidator.clone(),
             &entities,
         );
-        let mut entities_ref = cx.entities.accessed_entities.borrow_mut();
+        let mut entities_ref = cx.entities.accessed_entities.get_mut();
         mem::swap(&mut entities, entities_ref.deref_mut());
     }
 
@@ -2398,8 +2430,13 @@ impl Window {
             let prepaint_start = self.prepaint_index();
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    window.with_absolute_element_offset(deferred_draw.absolute_offset, |window| {
-                        element.prepaint(window, cx)
+                    window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                        window.with_absolute_element_offset(
+                            deferred_draw.absolute_offset,
+                            |window| {
+                                element.prepaint(window, cx);
+                            },
+                        );
                     });
                 })
             } else {
@@ -2433,7 +2470,9 @@ impl Window {
             let paint_start = self.paint_index();
             if let Some(element) = deferred_draw.element.as_mut() {
                 self.with_rendered_view(deferred_draw.current_view, |window| {
-                    element.paint(window, cx);
+                    window.with_rem_size(Some(deferred_draw.rem_size), |window| {
+                        element.paint(window, cx);
+                    })
                 })
             } else {
                 self.reuse_paint(deferred_draw.paint_range.clone());
@@ -2496,6 +2535,7 @@ impl Window {
                     parent_node: reused_subtree.refresh_node_id(deferred_draw.parent_node),
                     element_id_stack: deferred_draw.element_id_stack.clone(),
                     text_style_stack: deferred_draw.text_style_stack.clone(),
+                    rem_size: deferred_draw.rem_size,
                     priority: deferred_draw.priority,
                     element: None,
                     absolute_offset: deferred_draw.absolute_offset,
@@ -2831,11 +2871,6 @@ impl Window {
         })
     }
 
-    /// Immediately push an element ID onto the stack. Useful for simplifying IDs in lists
-    pub fn with_id<R>(&mut self, id: impl Into<ElementId>, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.with_global_id(id.into(), |_, window| f(window))
-    }
-
     /// Use a piece of state that exists as long this element is being rendered in consecutive frames, without needing to specify a key
     ///
     /// NOTE: This method uses the location of the caller to generate an ID for this state.
@@ -2997,6 +3032,7 @@ impl Window {
             parent_node,
             element_id_stack: self.element_id_stack.clone(),
             text_style_stack: self.text_style_stack.clone(),
+            rem_size: self.rem_size(),
             priority,
             element: Some(element),
             absolute_offset,
@@ -3628,6 +3664,7 @@ impl Window {
         self.rendered_entity_stack.last().copied().unwrap()
     }
 
+    #[inline]
     pub(crate) fn with_rendered_view<R>(
         &mut self,
         id: EntityId,

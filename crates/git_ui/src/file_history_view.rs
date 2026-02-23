@@ -5,7 +5,7 @@ use git::{GitHostingProviderRegistry, GitRemote, parse_git_remote_url};
 use gpui::{
     AnyElement, AnyEntity, App, Asset, Context, Entity, EventEmitter, FocusHandle, Focusable,
     IntoElement, Render, ScrollStrategy, Task, UniformListScrollHandle, WeakEntity, Window,
-    actions, uniform_list,
+    uniform_list,
 };
 use project::{
     Project, ProjectPath,
@@ -23,16 +23,6 @@ use workspace::{
 };
 
 use crate::commit_view::CommitView;
-
-actions!(git, [ViewCommitFromHistory, LoadMoreHistory]);
-
-pub fn init(cx: &mut App) {
-    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        workspace.register_action(|_workspace, _: &ViewCommitFromHistory, _window, _cx| {});
-        workspace.register_action(|_workspace, _: &LoadMoreHistory, _window, _cx| {});
-    })
-    .detach();
-}
 
 const PAGE_SIZE: usize = 50;
 
@@ -283,6 +273,7 @@ impl FileHistoryView {
     fn render_commit_avatar(
         &self,
         sha: &SharedString,
+        author_email: Option<SharedString>,
         window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
@@ -290,7 +281,7 @@ impl FileHistoryView {
         let size = rems_from_px(20.);
 
         if let Some(remote) = remote {
-            let avatar_asset = CommitAvatarAsset::new(remote.clone(), sha.clone());
+            let avatar_asset = CommitAvatarAsset::new(remote.clone(), sha.clone(), author_email);
             if let Some(Some(url)) = window.use_asset::<CommitAvatarAsset>(&avatar_asset, cx) {
                 Avatar::new(url.to_string()).size(size)
             } else {
@@ -349,7 +340,12 @@ impl FileHistoryView {
                             .flex_none()
                             .child(Chip::new(pr_number)),
                     )
-                    .child(self.render_commit_avatar(&entry.sha, window, cx))
+                    .child(self.render_commit_avatar(
+                        &entry.sha,
+                        Some(entry.author_email.clone()),
+                        window,
+                        cx,
+                    ))
                     .child(
                         h_flex()
                             .min_w_0()
@@ -395,6 +391,7 @@ impl FileHistoryView {
 #[derive(Clone, Debug)]
 struct CommitAvatarAsset {
     sha: SharedString,
+    author_email: Option<SharedString>,
     remote: GitRemote,
 }
 
@@ -406,8 +403,12 @@ impl std::hash::Hash for CommitAvatarAsset {
 }
 
 impl CommitAvatarAsset {
-    fn new(remote: GitRemote, sha: SharedString) -> Self {
-        Self { remote, sha }
+    fn new(remote: GitRemote, sha: SharedString, author_email: Option<SharedString>) -> Self {
+        Self {
+            remote,
+            sha,
+            author_email,
+        }
     }
 }
 
@@ -428,6 +429,7 @@ impl Asset for CommitAvatarAsset {
                     &source.remote.owner,
                     &source.remote.repo,
                     source.sha.clone(),
+                    source.author_email.clone(),
                     client,
                 )
                 .await
@@ -540,7 +542,7 @@ impl Render for FileHistoryView {
 impl Item for FileHistoryView {
     type Event = ItemEvent;
 
-    fn to_item_events(event: &Self::Event, mut f: impl FnMut(ItemEvent)) {
+    fn to_item_events(event: &Self::Event, f: &mut dyn FnMut(ItemEvent)) {
         f(*event)
     }
 
@@ -627,11 +629,7 @@ impl Item for FileHistoryView {
         false
     }
 
-    fn breadcrumbs(
-        &self,
-        _theme: &theme::Theme,
-        _cx: &App,
-    ) -> Option<Vec<workspace::item::BreadcrumbText>> {
+    fn breadcrumbs(&self, _cx: &App) -> Option<Vec<workspace::item::BreadcrumbText>> {
         None
     }
 
