@@ -797,7 +797,10 @@ impl Deref for IndexedCell {
 pub struct TerminalContent {
     pub cells: Vec<IndexedCell>,
     pub mode: TermMode,
+    pub total_lines: usize,
     pub display_offset: usize,
+    pub columns: usize,
+    pub screen_lines: usize,
     pub selection_text: Option<String>,
     pub selection: Option<SelectionRange>,
     pub cursor: RenderableCursor,
@@ -820,7 +823,10 @@ impl Default for TerminalContent {
         TerminalContent {
             cells: Default::default(),
             mode: Default::default(),
+            total_lines: Default::default(),
             display_offset: Default::default(),
+            columns: Default::default(),
+            screen_lines: Default::default(),
             selection_text: Default::default(),
             selection: Default::default(),
             cursor: RenderableCursor {
@@ -1082,7 +1088,7 @@ impl Terminal {
             InternalEvent::Scroll(scroll) => {
                 trace!("Scrolling: scroll={scroll:?}");
                 term.scroll_display(*scroll);
-                self.refresh_hovered_word(window);
+                self.refresh_hovered_word(window, cx);
 
                 if self.vi_mode_enabled {
                     match *scroll {
@@ -1172,12 +1178,12 @@ impl Terminal {
             InternalEvent::ScrollToAlacPoint(point) => {
                 trace!("Scrolling to point: point={point:?}");
                 term.scroll_to_point(*point);
-                self.refresh_hovered_word(window);
+                self.refresh_hovered_word(window, cx);
             }
             InternalEvent::MoveViCursorToAlacPoint(point) => {
                 trace!("Move vi cursor to point: point={point:?}");
                 term.vi_goto_point(*point);
-                self.refresh_hovered_word(window);
+                self.refresh_hovered_word(window, cx);
             }
             InternalEvent::ToggleViMode => {
                 trace!("Toggling vi mode");
@@ -1208,8 +1214,7 @@ impl Terminal {
                         self.process_hyperlink(hyperlink, *open, cx);
                     }
                     None => {
-                        self.last_content.last_hovered_word = None;
-                        cx.emit(Event::NewNavigationTarget(None));
+                        self.clear_hyperlink(cx);
                     }
                 }
             }
@@ -1253,6 +1258,12 @@ impl Terminal {
         } else {
             self.update_selected_word(prev_hovered_word, url_match, maybe_url_or_path, target, cx);
         }
+    }
+
+    fn clear_hyperlink(&mut self, cx: &mut Context<Self>) {
+        self.last_content.last_hovered_word = None;
+        cx.emit(Event::NewNavigationTarget(None));
+        cx.notify();
     }
 
     fn update_selected_word(
@@ -1597,8 +1608,7 @@ impl Terminal {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        self.schedule_find_hyperlink(*modifiers, window.mouse_position());
-        cx.notify();
+        self.schedule_find_hyperlink(*modifiers, window.mouse_position(), cx);
     }
 
     ///Paste text into the terminal
@@ -1620,67 +1630,70 @@ impl Terminal {
             self.process_terminal_event(&e, &mut terminal, window, cx)
         }
 
-        self.last_content = Self::make_content(&terminal, &self.last_content, cx);
-        self.refresh_hovered_word(window);
+        self.last_content = Self::make_content(&terminal, &self.last_content);
+        if self.last_content.last_hovered_word.is_none() {
+            // We were not able to reuse the last_hovered_word, or we didn't have one.
+            self.refresh_hovered_word(window, cx);
+        }
     }
 
     fn adjusted_last_hovered_word(
-        term: &Term<ZedListener>,
-        last_display_offset: usize,
-        last_hovered_word: Option<&HoveredWord>,
-        cx: &mut Context<Self>,
+        grid: &Grid<Cell>,
+        last_content: &TerminalContent,
     ) -> Option<HoveredWord> {
-        let grid = term.grid();
-        let new_start_line = Line(-(grid.display_offset() as i32) - 1);
-        let new_end_line = min(new_start_line + grid.screen_lines(), grid.bottommost_line());
+        let Some(last_hovered_word) = last_content.last_hovered_word.as_ref() else {
+            return None;
+        };
 
-        // Only use the existing last_hovered_word if the text at the range specified is still the same
-        last_hovered_word.and_then(
-            |HoveredWord {
-                 word,
-                 word_match,
-                 id,
-             }| {
-                let display_offset_delta =
-                    grid.display_offset() as i32 - last_display_offset as i32;
-                let adjusted_last_match_start = AlacPoint::new(
-                    word_match.start().line - display_offset_delta,
-                    word_match.start().column,
-                );
-                let adjusted_last_match_end = AlacPoint::new(
-                    word_match.end().line - display_offset_delta,
-                    word_match.end().column,
-                );
+        let grid_size_unchanged = grid.columns() == last_content.columns
+            && grid.screen_lines() == last_content.screen_lines;
 
-                let is_valid = |point: &AlacPoint| -> bool {
-                    (new_start_line..=new_end_line).contains(&point.line)
-                        && point.column < grid.columns()
-                };
+        let Some(total_lines_delta) = grid
+            .total_lines()
+            .checked_signed_diff(last_content.total_lines)
+        else {
+            return None;
+        };
 
-                if is_valid(&adjusted_last_match_start)
-                    && is_valid(&adjusted_last_match_end)
-                    && let adjusted_last_word =
-                        term.bounds_to_string(adjusted_last_match_start, adjusted_last_match_end)
-                    && adjusted_last_word.as_str() == word.as_str()
-                {
-                    return Some(HoveredWord {
-                        word: word.clone(),
-                        word_match: adjusted_last_match_start..=adjusted_last_match_end,
-                        id: *id,
-                    });
-                }
-                cx.emit(Event::NewNavigationTarget(None));
-                cx.notify();
+        let Some(display_offset_delta) = grid
+            .display_offset()
+            .checked_signed_diff(last_content.display_offset)
+        else {
+            return None;
+        };
+
+        let grid_visible_lines_unchanged = total_lines_delta == display_offset_delta;
+
+        if grid_size_unchanged && grid_visible_lines_unchanged {
+            if total_lines_delta == 0 {
+                // Viewport and content are the same, we can reuse existing match
+                Some(last_hovered_word.clone())
+            } else {
+                // Content is changed, but viewport is shifted the same, so we *could* still reuse
+                // the match, but need to shift the match lines by the same amount. Currently, this
+                // does not work because terminal_element only displays a link if terminal and
+                // terminal_view agree on the hovered_word during prepaint, so the best we can do
+                // for now is clear the hovered_word which will trigger a refresh.
+                //
+                // let mut adjusted_hovered_word = last_hovered_word.clone();
+                // adjusted_hovered_word.word_match = AlacPoint::new(
+                //     last_hovered_word.word_match.start().line - display_offset_delta as i32,
+                //     last_hovered_word.word_match.start().column,
+                // )
+                //     ..=AlacPoint::new(
+                //         last_hovered_word.word_match.end().line - display_offset_delta as i32,
+                //         last_hovered_word.word_match.end().column,
+                //     );
+                //
+                // Some(adjusted_hovered_word)
                 None
-            },
-        )
+            }
+        } else {
+            None
+        }
     }
 
-    fn make_content(
-        term: &Term<ZedListener>,
-        last_content: &TerminalContent,
-        cx: &mut Context<Self>,
-    ) -> TerminalContent {
+    fn make_content(term: &Term<ZedListener>, last_content: &TerminalContent) -> TerminalContent {
         let content = term.renderable_content();
 
         // Pre-allocate with estimated size to reduce reallocations
@@ -1698,21 +1711,20 @@ impl Terminal {
             None
         };
 
+        let grid = term.grid();
         TerminalContent {
             cells,
             mode: content.mode,
-            display_offset: content.display_offset,
+            total_lines: grid.total_lines(),
+            display_offset: grid.display_offset(),
+            columns: grid.columns(),
+            screen_lines: grid.screen_lines(),
             selection_text,
             selection: content.selection,
             cursor: content.cursor,
             cursor_char: term.grid()[content.cursor.point].c,
             terminal_bounds: last_content.terminal_bounds,
-            last_hovered_word: Self::adjusted_last_hovered_word(
-                term,
-                last_content.display_offset,
-                last_content.last_hovered_word.as_ref(),
-                cx,
-            ),
+            last_hovered_word: Self::adjusted_last_hovered_word(term.grid(), last_content),
             scrolled_to_top: content.display_offset == term.history_size(),
             scrolled_to_bottom: content.display_offset == 0,
         }
@@ -1830,17 +1842,22 @@ impl Terminal {
                 self.write_to_pty(bytes);
             }
         } else {
-            self.schedule_find_hyperlink(e.modifiers, e.position);
+            self.schedule_find_hyperlink(e.modifiers, e.position, cx);
         }
         cx.notify();
     }
 
-    fn schedule_find_hyperlink(&mut self, modifiers: Modifiers, position: Point<Pixels>) {
+    fn schedule_find_hyperlink(
+        &mut self,
+        modifiers: Modifiers,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.last_content.terminal_bounds.bounds.contains(&position)
             || self.selection_phase == SelectionPhase::Selecting
             || !modifiers.secondary()
         {
-            self.last_content.last_hovered_word = None;
+            self.clear_hyperlink(cx);
             return;
         }
 
@@ -2117,8 +2134,8 @@ impl Terminal {
         }
     }
 
-    fn refresh_hovered_word(&mut self, window: &Window) {
-        self.schedule_find_hyperlink(window.modifiers(), window.mouse_position());
+    fn refresh_hovered_word(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.schedule_find_hyperlink(window.modifiers(), window.mouse_position(), cx);
     }
 
     fn determine_scroll_lines(
@@ -2711,9 +2728,9 @@ mod tests {
 
         cx.run_until_parked();
 
-        terminal.update(cx, |terminal, cx| {
+        terminal.update(cx, |terminal, _cx| {
             let term_lock = terminal.term.lock();
-            terminal.last_content = Terminal::make_content(&term_lock, &terminal.last_content, cx);
+            terminal.last_content = Terminal::make_content(&term_lock, &terminal.last_content);
             drop(term_lock);
 
             let terminal_bounds = TerminalBounds::new(
@@ -2814,9 +2831,6 @@ mod tests {
             modifiers,
             ..default()
         };
-        // TODO: Currently there are no rednered_frame.listeners so simulated window
-        // events never make it to the terminal. Here we update the window and the
-        // terminal separately so that their state is consistent for tests.
         window.set_modifiers(modifiers);
         window.simulate_mouse_move(position, cx);
         terminal.mouse_move(&move_event, cx);
@@ -3222,9 +3236,9 @@ mod tests {
         });
 
         // Get the content by directly accessing the term
-        let content = terminal.update(cx, |terminal, cx| {
+        let content = terminal.update(cx, |terminal, _cx| {
             let term = terminal.term.lock_unfair();
-            Terminal::make_content(&term, &terminal.last_content, cx)
+            Terminal::make_content(&term, &terminal.last_content)
         });
 
         // If LF is properly converted to CRLF, each line should start at column 0
@@ -3270,9 +3284,9 @@ mod tests {
         });
 
         // Get the content by directly accessing the term
-        let content = terminal.update(cx, |terminal, cx| {
+        let content = terminal.update(cx, |terminal, _cx| {
             let term = terminal.term.lock_unfair();
-            Terminal::make_content(&term, &terminal.last_content, cx)
+            Terminal::make_content(&term, &terminal.last_content)
         });
 
         let cells = &content.cells;
@@ -3312,9 +3326,9 @@ mod tests {
         });
 
         // Get the content by directly accessing the term
-        let content = terminal.update(cx, |terminal, cx| {
+        let content = terminal.update(cx, |terminal, _cx| {
             let term = terminal.term.lock_unfair();
-            Terminal::make_content(&term, &terminal.last_content, cx)
+            Terminal::make_content(&term, &terminal.last_content)
         });
 
         let cells = &content.cells;
