@@ -7,8 +7,7 @@ use crate::project_diff::{self, BranchDiff, Diff, ProjectDiff};
 use crate::remote_output::{self, RemoteAction, SuccessMessage};
 use crate::{branch_picker, picker_prompt, render_remote_button};
 use crate::{
-    file_history_view::FileHistoryView, git_panel_settings::GitPanelSettings, git_status_icon,
-    repository_selector::RepositorySelector,
+    git_panel_settings::GitPanelSettings, git_status_icon, repository_selector::RepositorySelector,
 };
 use agent_settings::AgentSettings;
 use alacritty_terminal::vte::ansi;
@@ -1306,26 +1305,6 @@ impl GitPanel {
                 })
                 .ok();
             self.focus_handle.focus(window, cx);
-
-            Some(())
-        });
-    }
-
-    fn file_history(&mut self, _: &git::FileHistory, window: &mut Window, cx: &mut Context<Self>) {
-        maybe!({
-            let entry = self.entries.get(self.selected_entry?)?.status_entry()?;
-            let active_repo = self.active_repository.as_ref()?;
-            let repo_path = entry.repo_path.clone();
-            let git_store = self.project.read(cx).git_store();
-
-            FileHistoryView::open(
-                repo_path,
-                git_store.downgrade(),
-                active_repo.downgrade(),
-                self.workspace.clone(),
-                window,
-                cx,
-            );
 
             Some(())
         });
@@ -4343,6 +4322,18 @@ impl GitPanel {
             editor.max_point(cx).row().0 >= MAX_PANEL_EDITOR_LINES as u32
         });
 
+        let max_title_length = GitPanelSettings::get_global(cx).commit_title_max_length;
+        let title_exceeds_limit = if max_title_length > 0 {
+            self.commit_editor
+                .read(cx)
+                .text(cx)
+                .lines()
+                .next()
+                .is_some_and(|title| title.len() > max_title_length)
+        } else {
+            false
+        };
+
         let footer = v_flex()
             .child(PanelRepoFooter::new(
                 display_name,
@@ -4350,15 +4341,41 @@ impl GitPanel {
                 head_commit,
                 Some(git_panel),
             ))
+            .when(title_exceeds_limit, |this| {
+                this.child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .border_t_1()
+                        .border_color(cx.theme().status().warning_border)
+                        .bg(cx.theme().status().warning_background.opacity(0.5))
+                        .child(
+                            Icon::new(IconName::Warning)
+                                .size(IconSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                        .child(
+                            Label::new(format!(
+                                "Commit message title exceeds {max_title_length}-character limit."
+                            ))
+                            .size(LabelSize::Small),
+                        ),
+                )
+            })
             .child(
                 panel_editor_container(window, cx)
                     .id("commit-editor-container")
+                    .cursor_text()
                     .relative()
                     .w_full()
                     .h(max_height + footer_size)
                     .border_t_1()
-                    .border_color(cx.theme().colors().border)
-                    .cursor_text()
+                    .border_color(if title_exceeds_limit {
+                        cx.theme().status().warning_border
+                    } else {
+                        cx.theme().colors().border
+                    })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         window.focus(&this.commit_editor.focus_handle(cx), cx);
                     }))
@@ -5030,8 +5047,11 @@ impl GitPanel {
                 .separator()
                 .action("Open Diff", menu::Confirm.boxed_clone())
                 .action("Open File", menu::SecondaryConfirm.boxed_clone())
-                .separator()
-                .action_disabled_when(is_created, "View File History", Box::new(git::FileHistory))
+                .when(!is_created, |context_menu| {
+                    context_menu
+                        .separator()
+                        .action("View File History", Box::new(git::FileHistory))
+                })
         });
         self.selected_entry = Some(ix);
         self.set_context_menu(context_menu, position, window, cx);
@@ -5677,6 +5697,17 @@ impl GitPanel {
     }
 }
 
+impl GitPanel {
+    pub fn selected_file_history_target(&self) -> Option<(Entity<Repository>, RepoPath)> {
+        let entry = self.get_selected_entry()?.status_entry()?;
+        let repository = self.active_repository.clone()?;
+        if entry.status.is_created() {
+            return None;
+        }
+        Some((repository, entry.repo_path.clone()))
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 impl GitPanel {
     pub fn new_test(
@@ -5745,7 +5776,6 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::close_panel))
             .on_action(cx.listener(Self::open_diff))
             .on_action(cx.listener(Self::open_file))
-            .on_action(cx.listener(Self::file_history))
             .on_action(cx.listener(Self::focus_changes_list))
             .on_action(cx.listener(Self::focus_editor))
             .on_action(cx.listener(Self::expand_commit_editor))

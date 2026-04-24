@@ -136,14 +136,14 @@ fn detect_requires_poll_watcher_linux(path: &Path) -> bool {
 
     // Filesystem magic numbers where inotify does not deliver events.
     // These are defined in linux/magic.h and statfs(2).
-    const V9FS_MAGIC: i64 = 0x01021997; // Plan 9 / WSL2 interop (drvfs)
-    const NFS_SUPER_MAGIC: i64 = 0x6969;
-    const CIFS_MAGIC: i64 = 0xFF534D42u32 as i64; // CIFS/SMB
-    const SMB_SUPER_MAGIC: i64 = 0x517B;
-    const SMB2_MAGIC: i64 = 0xFE534D42u32 as i64;
-    const FUSE_SUPER_MAGIC: i64 = 0x65735546; // FUSE (includes sshfs)
+    const V9FS_MAGIC: u64 = 0x0102_1997; // Plan 9 / WSL2 interop (drvfs)
+    const NFS_SUPER_MAGIC: u64 = 0x0000_6969;
+    const CIFS_MAGIC: u64 = 0xFF53_4D42; // CIFS/SMB
+    const SMB_SUPER_MAGIC: u64 = 0x0000_517B;
+    const SMB2_MAGIC: u64 = 0xFE53_4D42;
+    const FUSE_SUPER_MAGIC: u64 = 0x6573_5546; // FUSE (includes sshfs)
 
-    let fs_type = stat.f_type;
+    let fs_type = (stat.f_type as u64) & 0xFFFF_FFFF;
     if fs_type == V9FS_MAGIC
         || fs_type == NFS_SUPER_MAGIC
         || fs_type == CIFS_MAGIC
@@ -1200,7 +1200,7 @@ impl Fs for RealFs {
         let use_poll = requires_poll_watcher(path);
         let watch_path = effective_watch_path(path);
 
-        let (tx, rx) = smol::channel::unbounded();
+        let (tx, rx) = async_channel::unbounded();
         let pending_paths: Arc<Mutex<Vec<PathEvent>>> = Default::default();
 
         let mode = if use_poll {
@@ -1449,8 +1449,8 @@ struct FakeFsState {
     root: FakeFsEntry,
     next_inode: u64,
     next_mtime: SystemTime,
-    git_event_tx: smol::channel::Sender<PathBuf>,
-    event_txs: Vec<(PathBuf, smol::channel::Sender<Vec<PathEvent>>)>,
+    git_event_tx: async_channel::Sender<PathBuf>,
+    event_txs: Vec<(PathBuf, async_channel::Sender<Vec<PathEvent>>)>,
     events_paused: bool,
     buffered_events: Vec<PathEvent>,
     metadata_call_count: usize,
@@ -1720,7 +1720,7 @@ impl FakeFs {
     const SYSTEMTIME_INTERVAL: Duration = Duration::from_nanos(100);
 
     pub fn new(executor: gpui::BackgroundExecutor) -> Arc<Self> {
-        let (tx, rx) = smol::channel::bounded::<PathBuf>(10);
+        let (tx, rx) = async_channel::bounded::<PathBuf>(10);
 
         let this = Arc::new_cyclic(|this| Self {
             this: this.clone(),
@@ -2714,7 +2714,7 @@ impl FakeFsEntry {
 
 #[cfg(feature = "test-support")]
 struct FakeWatcher {
-    tx: smol::channel::Sender<Vec<PathEvent>>,
+    tx: async_channel::Sender<Vec<PathEvent>>,
     original_path: PathBuf,
     fs_state: Arc<Mutex<FakeFsState>>,
     prefixes: Mutex<Vec<PathBuf>>,
@@ -3183,7 +3183,7 @@ impl Fs for FakeFs {
         Arc<dyn Watcher>,
     ) {
         self.simulate_random_delay().await;
-        let (tx, rx) = smol::channel::unbounded();
+        let (tx, rx) = async_channel::unbounded();
         let path = path.to_path_buf();
         self.state.lock().event_txs.push((path.clone(), tx.clone()));
         let executor = self.executor.clone();
